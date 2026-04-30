@@ -11,6 +11,7 @@ from __future__ import annotations
 import curses
 import ctypes
 import json
+import locale
 import os
 import platform
 import re
@@ -18,7 +19,8 @@ import shutil
 import socket
 import subprocess
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -26,6 +28,7 @@ REFRESH_SECONDS = 1.0
 PROCESS_REFRESH_SECONDS = 2.5
 SENSOR_REFRESH_SECONDS = 12.0
 COPYRIGHT_TEXT = "Copyright (c) DMS"
+HISTORY_SECONDS = 60
 THEMES = [
     {
         "name": "Aurora",
@@ -132,6 +135,29 @@ class SensorInfo:
     fan_rpm: int | None
     privileged_locked: bool
     raw_hint: str
+
+
+@dataclass
+class DiskInfo:
+    label: str
+    mount: str
+    total: int
+    used: int
+    free: int
+
+
+@dataclass
+class MetricHistory:
+    cpu: deque[float] = field(default_factory=lambda: deque(maxlen=HISTORY_SECONDS))
+    ram: deque[float] = field(default_factory=lambda: deque(maxlen=HISTORY_SECONDS))
+    net: deque[float] = field(default_factory=lambda: deque(maxlen=HISTORY_SECONDS))
+    disk: deque[float] = field(default_factory=lambda: deque(maxlen=HISTORY_SECONDS))
+
+    def add(self, cpu_pct: float, ram_pct: float, net_bps: float, disk_pct: float) -> None:
+        self.cpu.append(clamp(cpu_pct))
+        self.ram.append(clamp(ram_pct))
+        self.net.append(max(0.0, net_bps))
+        self.disk.append(clamp(disk_pct))
 
 
 def run_command(args: list[str], timeout: float = 2.0) -> str:
@@ -244,9 +270,12 @@ def parse_ioreg_int(raw: str, key: str) -> int | None:
     if not matches:
         return None
     try:
-        return int(matches[-1])
+        value = int(matches[-1])
     except ValueError:
         return None
+    if value >= 2**63:
+        value -= 2**64
+    return value
 
 
 def parse_ioreg_bool(raw: str, key: str) -> bool:
@@ -264,6 +293,14 @@ def apple_battery_temp(raw_value: int | None) -> float | None:
         return None
     if raw_value > 1000:
         return raw_value / 10.0 - 273.15
+    return raw_value / 10.0
+
+
+def apple_virtual_battery_temp(raw_value: int | None) -> float | None:
+    if raw_value is None:
+        return None
+    if raw_value > 1000:
+        return raw_value / 100.0
     return raw_value / 10.0
 
 
@@ -285,6 +322,76 @@ def parse_temp_value(raw: str, pattern: str) -> float | None:
         return float(match.group(1))
     except ValueError:
         return None
+
+
+def core_topology_counts(raw: str) -> dict[str, int]:
+    values = [int(value) for value in re.findall(r"\d+", raw)]
+    if not values:
+        return {}
+    if raw.startswith("proc") and len(values) >= 4:
+        total, efficiency, _, performance = values[:4]
+        return {
+            "total": total,
+            "efficiency": efficiency,
+            "performance": performance,
+        }
+    if len(values) >= 3 and values[0] == values[1] + values[2]:
+        return {
+            "total": values[0],
+            "performance": values[1],
+            "efficiency": values[2],
+        }
+    if len(values) == 1:
+        return {"total": values[0]}
+    return {}
+
+
+def format_core_topology(raw: str) -> str:
+    topology = core_topology_counts(raw)
+    if not topology:
+        return ""
+    total = topology.get("total")
+    performance = topology.get("performance", 0)
+    efficiency = topology.get("efficiency", 0)
+    if total and performance and efficiency:
+        return f"{total} cores ({performance}P/{efficiency}E)"
+    if total:
+        return f"{total} cores"
+    return raw
+
+
+def perflevel_clusters(topology: dict[str, int]) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    for index in range(4):
+        logical_raw = run_command(["sysctl", "-n", f"hw.perflevel{index}.logicalcpu"])
+        try:
+            logical = int(logical_raw)
+        except ValueError:
+            logical = 0
+        if logical <= 0:
+            continue
+        raw_name = run_command(["sysctl", "-n", f"hw.perflevel{index}.name"]) or f"Cluster {index}"
+        normalized = raw_name.strip().lower()
+        performance_count = topology.get("performance", 0)
+        efficiency_count = topology.get("efficiency", 0)
+        if "performance" in normalized or (performance_count and logical == performance_count and logical != efficiency_count):
+            code = "P"
+            label = "Performance"
+        elif "efficiency" in normalized or (efficiency_count and logical == efficiency_count and logical != performance_count):
+            code = "E"
+            label = "Efficiency"
+        else:
+            code = raw_name[:1].upper() if raw_name else "C"
+            label = raw_name.title()
+        clusters.append(
+            {
+                "code": code,
+                "label": label,
+                "logical": logical,
+                "source": raw_name,
+            }
+        )
+    return clusters
 
 
 class MacCpuSampler:
@@ -391,6 +498,7 @@ def collect_static_info() -> dict[str, Any]:
         "physical_cpu": run_command(["sysctl", "-n", "hw.physicalcpu"]),
         "logical_cpu": run_command(["sysctl", "-n", "hw.logicalcpu"]),
         "memory": "",
+        "cpu_clusters": [],
         "gpus": [],
     }
 
@@ -410,7 +518,12 @@ def collect_static_info() -> dict[str, Any]:
                 or info["chip"]
                 or "Unknown CPU"
             )
-            info["cpu_cores"] = hardware.get("number_cores") or ""
+            processor_topology = str(hardware.get("number_processors") or "")
+            info["cpu_cores"] = (
+                hardware.get("number_cores")
+                or format_core_topology(processor_topology)
+            )
+            info["cpu_clusters"] = perflevel_clusters(core_topology_counts(processor_topology))
             info["memory"] = hardware.get("physical_memory") or ""
 
             gpus: list[dict[str, str]] = []
@@ -428,6 +541,7 @@ def collect_static_info() -> dict[str, Any]:
                     or ""
                 )
                 metal = gpu.get("spdisplays_metalfamily") or gpu.get("spdisplays_metal") or ""
+                metal = metal or gpu.get("spdisplays_mtlgpufamilysupport") or ""
                 displays = gpu.get("spdisplays_ndrvs") or []
                 display_names = []
                 for display in displays if isinstance(displays, list) else []:
@@ -446,6 +560,8 @@ def collect_static_info() -> dict[str, Any]:
 
     if not info["chip"]:
         info["chip"] = "Apple Silicon" if platform.machine() == "arm64" else platform.processor()
+    if not info["cpu_clusters"]:
+        info["cpu_clusters"] = perflevel_clusters({})
     if not info["memory"]:
         total = run_command(["sysctl", "-n", "hw.memsize"])
         info["memory"] = human_bytes(float(total or 0))
@@ -478,11 +594,15 @@ def memory_stats() -> dict[str, float]:
 
     free_pages = pages.get("pages free", 0) + pages.get("pages speculative", 0)
     free = free_pages * page_size
-    used = max(0.0, total - free)
+    cached_pages = max(pages.get("file-backed pages", 0), pages.get("pages purgeable", 0))
+    cached = cached_pages * page_size
+    app = pages.get("anonymous pages", 0) * page_size
     compressed = pages.get("pages occupied by compressor", 0) * page_size
     wired = pages.get("pages wired down", 0) * page_size
     active = pages.get("pages active", 0) * page_size
     inactive = pages.get("pages inactive", 0) * page_size
+    used = min(total, max(0.0, app + wired + compressed))
+    available = min(total, max(0.0, free + cached))
 
     swap_raw = run_command(["sysctl", "vm.swapusage"])
     swap_total = swap_used = 0.0
@@ -494,7 +614,10 @@ def memory_stats() -> dict[str, float]:
     return {
         "total": total,
         "used": used,
+        "available": available,
         "free": free,
+        "cached": cached,
+        "app": app,
         "active": active,
         "inactive": inactive,
         "wired": wired,
@@ -516,7 +639,7 @@ def battery_info() -> BatteryInfo:
     if battery_match:
         percent = int(battery_match.group(1))
         state = battery_match.group(2).strip()
-        remaining = battery_match.group(3).strip()
+        remaining = re.sub(r"\s*present:\s*(true|false)\b", "", battery_match.group(3).strip(), flags=re.IGNORECASE)
     elif pmset_raw:
         remaining = pmset_raw.splitlines()[-1].strip()[:32]
 
@@ -538,7 +661,7 @@ def battery_info() -> BatteryInfo:
         design_cycles=parse_ioreg_int(ioreg_raw, "DesignCycleCount9C"),
         health_percent=health,
         temp_c=apple_battery_temp(parse_ioreg_int(ioreg_raw, "Temperature")),
-        virtual_temp_c=apple_battery_temp(parse_ioreg_int(ioreg_raw, "VirtualTemperature")),
+        virtual_temp_c=apple_virtual_battery_temp(parse_ioreg_int(ioreg_raw, "VirtualTemperature")),
         voltage_v=(voltage_mv / 1000.0 if voltage_mv is not None else None),
         amperage_a=(amperage_ma / 1000.0 if amperage_ma is not None else None),
         charger_watts=charger_watts,
@@ -601,6 +724,22 @@ def sensor_info() -> SensorInfo:
         privileged_locked=locked,
         raw_hint="sudo powermetrics" if locked else "powermetrics",
     )
+
+
+def disk_info() -> DiskInfo:
+    candidates = [
+        ("data", "/System/Volumes/Data"),
+        ("root", "/"),
+    ]
+    for label, mount in candidates:
+        if os.path.exists(mount):
+            try:
+                usage = shutil.disk_usage(mount)
+            except OSError:
+                continue
+            return DiskInfo(label=label, mount=mount, total=usage.total, used=usage.used, free=usage.free)
+    usage = shutil.disk_usage("/")
+    return DiskInfo(label="root", mount="/", total=usage.total, used=usage.used, free=usage.free)
 
 
 def network_bytes() -> tuple[int, int]:
@@ -713,6 +852,45 @@ def pulse_bar(percent: float, width: int, phase: int, label: str = "") -> str:
     return f"{label}[{''.join(body)}] {percent:5.1f}%"
 
 
+def spark_chars() -> list[str]:
+    encoding = locale.getpreferredencoding(False).upper()
+    if "UTF" not in encoding:
+        return list(" .:-=+*#")
+    return [chr(code) for code in range(0x2581, 0x2589)]
+
+
+def sparkline(values: deque[float] | list[float], width: int, max_value: float | None = 100.0) -> str:
+    width = max(1, width)
+    data = list(values)[-width:]
+    if not data:
+        return " " * width
+    chars = spark_chars()
+    if max_value is None:
+        scale = max(data) or 1.0
+    else:
+        scale = max(max_value, 1.0)
+    rendered = []
+    for value in data:
+        index = int(round(clamp(value / scale * 100.0) / 100.0 * (len(chars) - 1)))
+        rendered.append(chars[max(0, min(index, len(chars) - 1))])
+    return (" " * max(0, width - len(rendered))) + "".join(rendered)
+
+
+def cpu_total_percent(per_core: list[float]) -> float:
+    return sum(per_core) / len(per_core) if per_core else 0.0
+
+
+def ram_percent(mem: dict[str, float]) -> float:
+    total = mem.get("total", 0.0)
+    if total <= 0:
+        return 0.0
+    return mem.get("used", 0.0) / total * 100.0
+
+
+def disk_percent(disk: DiskInfo) -> float:
+    return disk.used / disk.total * 100.0 if disk.total else 0.0
+
+
 def comet(width: int, phase: int, density: float = 0.65) -> str:
     width = max(4, width)
     trail = ["."] * width
@@ -743,6 +921,63 @@ def temp_attr(value: float | None) -> int:
     if value >= 65:
         return curses.color_pair(3) | curses.A_BOLD
     return curses.color_pair(2)
+
+
+def cpu_groups(static: dict[str, Any], core_count: int) -> list[dict[str, Any]]:
+    clusters = static.get("cpu_clusters") or []
+    groups: list[dict[str, Any]] = []
+    start = 0
+    for cluster in clusters:
+        try:
+            count = int(cluster.get("logical", 0))
+        except (TypeError, ValueError):
+            count = 0
+        count = min(count, max(0, core_count - start))
+        if count <= 0:
+            continue
+        groups.append(
+            {
+                "code": str(cluster.get("code") or "C")[:1],
+                "label": str(cluster.get("label") or "Cluster"),
+                "start": start,
+                "count": count,
+            }
+        )
+        start += count
+    if start < core_count:
+        groups.append({"code": "W", "label": "Workers", "start": start, "count": core_count - start})
+    if not groups and core_count:
+        groups.append({"code": "W", "label": "Workers", "start": 0, "count": core_count})
+    return groups
+
+
+def cpu_group_columns(panel_width: int) -> int:
+    inner_width = max(1, panel_width - 4)
+    return max(1, inner_width // 13)
+
+
+def cpu_panel_required_height(panel_width: int, core_count: int, static: dict[str, Any]) -> int:
+    if core_count <= 0:
+        return 13
+    columns = cpu_group_columns(panel_width)
+    group_rows = 0
+    for group in cpu_groups(static, core_count):
+        group_rows += 1 + ((group["count"] + columns - 1) // columns)
+    return group_rows + 7
+
+
+def cpu_lane_text(label: str, index: int, percent: float, width: int, phase: int) -> str:
+    if width >= 20:
+        return pulse_bar(percent, max(4, width - 13), phase + index, f"{label} ")[: max(0, width)]
+    if width >= 11:
+        bar_width = max(1, width - 9)
+        filled = int(round(bar_width * clamp(percent) / 100.0))
+        body = ["#"] * filled + ["."] * (bar_width - filled)
+        if filled:
+            body[(phase + index) % filled] = "@"
+        short_pct = min(99, int(round(percent)))
+        return f"{label} [{''.join(body)}] {short_pct:2d}"[: max(0, width)]
+    return f"{label[-2:]} {percent:3.0f}%"[: max(0, width)]
 
 
 def draw_header(screen: curses.window, width: int, phase: int, static: dict[str, Any], config: HudConfig) -> int:
@@ -806,41 +1041,54 @@ def draw_cpu_panel(
     w: int,
     per_core: list[float],
     static: dict[str, Any],
+    history: MetricHistory,
     phase: int,
 ) -> None:
     draw_box(screen, y, x, h, w, "CPU WORKER CORES", curses.color_pair(5))
     if h < 5:
         return
-    total = sum(per_core) / len(per_core) if per_core else 0.0
+    total = cpu_total_percent(per_core)
     logical = static.get("logical_cpu") or str(len(per_core) or "?")
     physical = static.get("physical_cpu") or "?"
     core_line = static.get("cpu_cores") or f"{physical} physical / {logical} logical"
     safe_add(screen, y + 1, x + 2, f"{static.get('chip', 'CPU')}"[: w - 4], curses.color_pair(1) | curses.A_BOLD)
     safe_add(screen, y + 2, x + 2, f"cores: {core_line}"[: w - 4], curses.color_pair(1))
     safe_add(screen, y + 3, x + 2, pulse_bar(total, max(8, w - 18), phase, "total "), color_for_percent(total))
+    safe_add(screen, y + 4, x + 2, f"60s  {sparkline(history.cpu, max(8, w - 10), 100.0)}"[: w - 4], curses.color_pair(6))
 
-    lanes_start = y + 5
-    lanes_available = max(0, h - 6)
+    lanes_start = y + 6
+    lanes_available = max(0, h - 7)
     if not per_core or lanes_available <= 0:
-        safe_add(screen, y + 5, x + 2, "per-core stream unavailable", curses.color_pair(3))
+        safe_add(screen, y + 6, x + 2, "per-core stream unavailable", curses.color_pair(3))
         return
 
-    columns = 2 if w >= 64 and lanes_available * 2 >= len(per_core) else 1
-    if len(per_core) > lanes_available * columns and lanes_available > 1:
-        lanes_available -= 1
-        columns = 2 if w >= 64 and lanes_available * 2 >= len(per_core) else 1
+    groups = cpu_groups(static, len(per_core))
+    columns = cpu_group_columns(w)
     col_width = (w - 4) // columns
-    visible_count = min(len(per_core), lanes_available * columns)
-    for index in range(visible_count):
-        column = index // lanes_available
-        row = index % lanes_available
-        cx = x + 2 + column * col_width
-        cy = lanes_start + row
-        pct = per_core[index]
-        lane_label = f"W{index:02d} "
-        safe_add(screen, cy, cx, pulse_bar(pct, max(5, col_width - 13), phase + index, lane_label)[: col_width - 1], color_for_percent(pct))
-    if visible_count < len(per_core):
-        safe_add(screen, y + h - 2, x + 2, f"+{len(per_core) - visible_count} more workers hidden", curses.color_pair(3))
+    row_y = lanes_start
+    hidden = 0
+    for group in groups:
+        if row_y >= y + h - 1:
+            hidden += group["count"]
+            continue
+        label = f"{group['code']} cluster {group['count']}c"
+        safe_add(screen, row_y, x + 2, label[: w - 4], curses.color_pair(7) | curses.A_BOLD)
+        row_y += 1
+        for offset in range(group["count"]):
+            core_index = group["start"] + offset
+            column = offset % columns
+            group_row = offset // columns
+            cy = row_y + group_row
+            if cy >= y + h - 1:
+                hidden += 1
+                continue
+            cx = x + 2 + column * col_width
+            pct = per_core[core_index]
+            core_label = f"{group['code']}{offset:02d}"
+            safe_add(screen, cy, cx, cpu_lane_text(core_label, core_index, pct, max(1, col_width - 1), phase), color_for_percent(pct))
+        row_y += (group["count"] + columns - 1) // columns
+    if hidden:
+        safe_add(screen, y + h - 2, x + 2, f"+{hidden} workers hidden", curses.color_pair(3))
 
 
 def draw_system_panel(
@@ -869,22 +1117,36 @@ def draw_system_panel(
         safe_add(screen, y + index, x + 2, line[: w - 4], attr)
 
 
-def draw_memory_panel(screen: curses.window, y: int, x: int, h: int, w: int, mem: dict[str, float], phase: int = 0) -> None:
+def draw_memory_panel(
+    screen: curses.window,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    mem: dict[str, float],
+    history: MetricHistory,
+    phase: int = 0,
+) -> None:
     draw_box(screen, y, x, h, w, "MEMORY", curses.color_pair(5))
     total = mem.get("total", 0.0) or 1.0
     used = mem.get("used", 0.0)
+    available = mem.get("available", 0.0)
+    cached = mem.get("cached", 0.0)
+    app = mem.get("app", 0.0)
     swap_total = mem.get("swap_total", 0.0)
     swap_used = mem.get("swap_used", 0.0)
     used_pct = used / total * 100.0
     swap_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
     lines = [
         (pulse_bar(used_pct, max(8, w - 18), phase, "ram  "), color_for_percent(used_pct)),
-        (f"used {human_bytes(used)} / {human_bytes(total)}", curses.color_pair(1)),
-        (f"wired {human_bytes(mem.get('wired', 0.0))}  comp {human_bytes(mem.get('compressed', 0.0))}", curses.color_pair(1)),
-        (f"active {human_bytes(mem.get('active', 0.0))}  inactive {human_bytes(mem.get('inactive', 0.0))}", curses.color_pair(1)),
+        (f"60s  {sparkline(history.ram, max(8, w - 10), 100.0)}", curses.color_pair(6)),
+        (f"used {human_bytes(used)} / {human_bytes(total)}  avail {human_bytes(available)}", curses.color_pair(1)),
+        (f"app {human_bytes(app)}  wired {human_bytes(mem.get('wired', 0.0))}", curses.color_pair(1)),
+        (f"cache {human_bytes(cached)}  comp {human_bytes(mem.get('compressed', 0.0))}", curses.color_pair(1)),
         (pulse_bar(swap_pct, max(8, w - 18), phase + 4, "swap "), color_for_percent(swap_pct)),
-        (f"swap {human_bytes(swap_used)} / {human_bytes(swap_total)}", curses.color_pair(1)),
     ]
+    if h > 8:
+        lines.append((f"swap {human_bytes(swap_used)} / {human_bytes(swap_total)}", curses.color_pair(1)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
         safe_add(screen, y + index, x + 2, line[: w - 4], attr)
 
@@ -1057,21 +1319,27 @@ def draw_io_panel(
     x: int,
     h: int,
     w: int,
-    disk: shutil._ntuple_diskusage,
+    disk: DiskInfo,
     net_down: float,
     net_up: float,
+    history: MetricHistory,
     phase: int = 0,
 ) -> None:
     draw_box(screen, y, x, h, w, "I/O", curses.color_pair(5))
-    disk_pct = disk.used / disk.total * 100.0 if disk.total else 0.0
+    disk_pct = disk_percent(disk)
+    net_peak = max(history.net) if history.net else net_down + net_up
+    net_peak_text = f"pk {human_bytes(net_peak)}/s"
+    net_spark_width = max(6, w - len("net 60s  ") - len(net_peak_text) - 6)
     lines = [
         (pulse_bar(disk_pct, max(8, w - 18), phase, "disk "), color_for_percent(disk_pct)),
-        (f"root {human_bytes(disk.used)} / {human_bytes(disk.total)}  free {human_bytes(disk.free)}", curses.color_pair(1)),
-        (f"net down {human_bytes(net_down)}/s", curses.color_pair(2) | curses.A_BOLD),
-        (f"net up   {human_bytes(net_up)}/s", curses.color_pair(2) | curses.A_BOLD),
-        (f"rx {comet(max(8, w - 9), phase, min(1.0, net_down / 1_000_000 + 0.35))}", curses.color_pair(6)),
-        (f"tx {comet(max(8, w - 9), phase + 7, min(1.0, net_up / 1_000_000 + 0.35))}", curses.color_pair(2)),
+        (f"{disk.label} {human_bytes(disk.used)} / {human_bytes(disk.total)}  free {human_bytes(disk.free)}", curses.color_pair(1)),
+        (f"net d {human_bytes(net_down)}/s  u {human_bytes(net_up)}/s", curses.color_pair(2) | curses.A_BOLD),
+        (f"net 60s  {sparkline(history.net, net_spark_width, None)} {net_peak_text}", curses.color_pair(6)),
+        (f"disk 60s {sparkline(history.disk, max(8, w - 18), 100.0)}", curses.color_pair(2)),
     ]
+    if h > 8:
+        lines.append((f"rx {comet(max(8, w - 9), phase, min(1.0, net_down / 1_000_000 + 0.35))}", curses.color_pair(6)))
+        lines.append((f"tx {comet(max(8, w - 9), phase + 7, min(1.0, net_up / 1_000_000 + 0.35))}", curses.color_pair(2)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
         safe_add(screen, y + index, x + 2, line[: w - 4], attr)
 
@@ -1217,7 +1485,9 @@ def hud(screen: curses.window) -> None:
     battery = battery_info()
     sensor = sensor_info()
     last_sensor = time.monotonic()
-    disk = shutil.disk_usage("/")
+    disk = disk_info()
+    history = MetricHistory()
+    history.add(cpu_total_percent(per_core), ram_percent(mem), 0.0, disk_percent(disk))
 
     while True:
         now = time.monotonic()
@@ -1272,13 +1542,14 @@ def hud(screen: curses.window) -> None:
                 per_core = sampled
             mem = memory_stats()
             battery = battery_info()
-            disk = shutil.disk_usage("/")
+            disk = disk_info()
             current_net = network_bytes()
             elapsed = max(0.1, now - previous_net_time)
             net_down = max(0.0, (current_net[0] - previous_net[0]) / elapsed)
             net_up = max(0.0, (current_net[1] - previous_net[1]) / elapsed)
             previous_net = current_net
             previous_net_time = now
+            history.add(cpu_total_percent(per_core), ram_percent(mem), net_down + net_up, disk_percent(disk))
             last_stats = now
 
         if now - last_sensor >= SENSOR_REFRESH_SECONDS:
@@ -1308,7 +1579,8 @@ def hud(screen: curses.window) -> None:
             left_x = 1
             left_width = 38
             center_x = left_x + left_width + 1
-            center_width = 44
+            min_right_width = 48 if width >= 132 else 34
+            center_width = max(44, min(72, width - left_width - min_right_width - 4))
             right_x = center_x + center_width + 1
             right_width = width - right_x - 1
             body_y = header_h
@@ -1320,14 +1592,17 @@ def hud(screen: curses.window) -> None:
             draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery)
             draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
             draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
-            draw_io_panel(screen, body_y + system_h + power_h + thermal_h, left_x, io_h, left_width, disk, net_down, net_up, phase)
+            draw_io_panel(screen, body_y + system_h + power_h + thermal_h, left_x, io_h, left_width, disk, net_down, net_up, history, phase)
 
-            cpu_h = 16
-            gpu_h = 10
-            mem_h = max(8, body_height - cpu_h - gpu_h)
-            draw_cpu_panel(screen, body_y, center_x, cpu_h, center_width, per_core, static, phase)
+            min_gpu_h = 7
+            min_mem_h = 8
+            target_cpu_h = max(16, cpu_panel_required_height(center_width, len(per_core), static))
+            cpu_h = max(10, min(target_cpu_h, body_height - min_gpu_h - min_mem_h))
+            gpu_h = min(10, max(min_gpu_h, body_height - cpu_h - min_mem_h))
+            mem_h = max(min_mem_h, body_height - cpu_h - gpu_h)
+            draw_cpu_panel(screen, body_y, center_x, cpu_h, center_width, per_core, static, history, phase)
             draw_gpu_panel(screen, body_y + cpu_h, center_x, gpu_h, center_width, static, sensor, phase)
-            draw_memory_panel(screen, body_y + cpu_h + gpu_h, center_x, mem_h, center_width, mem, phase)
+            draw_memory_panel(screen, body_y + cpu_h + gpu_h, center_x, mem_h, center_width, mem, history, phase)
 
             proc_h = body_height
             process_scroll_max = max(0, len(rows) - max(0, proc_h - 4))
@@ -1352,7 +1627,7 @@ def hud(screen: curses.window) -> None:
 
             draw_system_panel(screen, header_h, left_x, sys_h, left_width, static, battery)
             draw_battery_panel(screen, header_h + sys_h, left_x, power_h, left_width, battery, phase)
-            draw_cpu_panel(screen, header_h, right_x, cpu_h, right_width, per_core, static, phase)
+            draw_cpu_panel(screen, header_h, right_x, cpu_h, right_width, per_core, static, history, phase)
             draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
             draw_gpu_panel(screen, header_h + top_height + thermal_h, left_x, gpu_h, left_width, static, sensor, phase)
 

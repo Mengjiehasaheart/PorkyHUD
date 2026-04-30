@@ -42,6 +42,14 @@ PorkyHUD handles this in two ways:
 
 If admin access has not been granted, PorkyHUD shows one unlock hint. If admin access is available but the Mac model still does not publish a value, PorkyHUD hides that field instead of inventing a reading.
 
+## Metric Notes
+
+- RAM follows the Activity Monitor-style split: app + wired + compressed count as used, while file-backed cache is shown separately as available cache.
+- Disk usage reports the writable APFS Data volume on modern macOS instead of the sealed read-only system volume.
+- CPU workers are logical cores sampled through macOS Mach host CPU counters.
+- CPU, RAM, network, and disk panels include compact 60-second sparklines.
+- Apple Silicon CPU workers are grouped by reported performance and efficiency clusters when macOS exposes `hw.perflevel` data.
+
 ## Requirements
 
 - macOS
@@ -52,3 +60,7 @@ If admin access has not been granted, PorkyHUD shows one unlock hint. If admin a
 ```bash
 chmod +x PorkyHUD.command porkyhud.py
 ```
+
+<p align="center">
+  <sub><em>Visit <a href="https://drmatchastudio.com">DMS</a>.</em></sub>
+</p>
