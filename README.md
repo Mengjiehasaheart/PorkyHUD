@@ -7,7 +7,7 @@ PorkyHUD is a portable, dependency free macOS terminal dashboard for system stat
 </p>
 
 <p align="center">
-  <sub>Demo profile. No live hostnames, paths, or process data are captured.</sub>
+  <sub>Demo profile.</sub>
 </p>
 
 ## Run
@@ -49,10 +49,6 @@ For packaging, debugging, and future GUI integration:
 ./porkyhud.py --snapshot
 ./porkyhud.py --json
 ```
-
-## README Demo GIF
-
-The README animation is generated from demo data so public screenshots do not leak machine names, file paths, or real process lists.
 
 ## macOS Sensor Access
 
