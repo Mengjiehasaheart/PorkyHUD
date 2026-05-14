@@ -8,8 +8,10 @@ Keys: q quit, m sort process list by CPU/MEM, arrows/page keys scroll.
 
 from __future__ import annotations
 
+import argparse
 import curses
 import ctypes
+import ctypes.util
 import json
 import locale
 import os
@@ -17,65 +19,90 @@ import platform
 import re
 import shutil
 import socket
+import struct
+import sys
 import subprocess
+import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable
 
 
 REFRESH_SECONDS = 1.0
 PROCESS_REFRESH_SECONDS = 2.5
 SENSOR_REFRESH_SECONDS = 12.0
+DISK_ACTIVITY_REFRESH_SECONDS = 4.0
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
+LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "compact", "cinema"]
+DARK_BG_RGB = "#05070d"
+DARK_FG_RGB = "#e6f7ff"
+DARK_CURSOR_RGB = "#5df2ff"
+KERNEL_INDEX_SMC = 2
+SMC_CMD_READ_BYTES = 5
+SMC_CMD_READ_INDEX = 8
+SMC_CMD_READ_KEYINFO = 9
+SMC_TEMP_KEY_CACHE: list[str] | None = None
 THEMES = [
     {
-        "name": "Aurora",
+        "name": "Neon Grid",
         "colors": {
-            1: curses.COLOR_WHITE,
-            2: curses.COLOR_CYAN,
-            3: curses.COLOR_YELLOW,
-            4: curses.COLOR_RED,
-            5: curses.COLOR_BLUE,
-            6: curses.COLOR_GREEN,
-            7: curses.COLOR_MAGENTA,
+            1: 231,
+            2: 51,
+            3: 220,
+            4: 196,
+            5: 39,
+            6: 46,
+            7: 201,
+            8: 45,
+            9: 171,
+            10: 214,
         },
     },
     {
-        "name": "Amber",
+        "name": "Catppuccin",
         "colors": {
-            1: curses.COLOR_WHITE,
-            2: curses.COLOR_YELLOW,
-            3: curses.COLOR_CYAN,
-            4: curses.COLOR_RED,
-            5: curses.COLOR_YELLOW,
-            6: curses.COLOR_GREEN,
-            7: curses.COLOR_WHITE,
+            1: 189,
+            2: 119,
+            3: 229,
+            4: 203,
+            5: 111,
+            6: 153,
+            7: 183,
+            8: 110,
+            9: 147,
+            10: 215,
         },
     },
     {
-        "name": "Violet",
+        "name": "Solar Circuit",
         "colors": {
-            1: curses.COLOR_WHITE,
-            2: curses.COLOR_MAGENTA,
-            3: curses.COLOR_YELLOW,
-            4: curses.COLOR_RED,
-            5: curses.COLOR_BLUE,
-            6: curses.COLOR_CYAN,
-            7: curses.COLOR_MAGENTA,
+            1: 255,
+            2: 82,
+            3: 226,
+            4: 202,
+            5: 33,
+            6: 118,
+            7: 208,
+            8: 87,
+            9: 165,
+            10: 220,
         },
     },
     {
-        "name": "Mono",
+        "name": "Graphite",
         "colors": {
-            1: curses.COLOR_WHITE,
-            2: curses.COLOR_WHITE,
-            3: curses.COLOR_WHITE,
-            4: curses.COLOR_RED,
-            5: curses.COLOR_WHITE,
-            6: curses.COLOR_WHITE,
-            7: curses.COLOR_WHITE,
+            1: 252,
+            2: 250,
+            3: 222,
+            4: 203,
+            5: 245,
+            6: 110,
+            7: 248,
+            8: 152,
+            9: 183,
+            10: 216,
         },
     },
 ]
@@ -85,6 +112,7 @@ THEMES = [
 class HudConfig:
     theme_index: int = 0
     animation_mode: int = 1
+    layout_index: int = 0
     show_help: bool = False
     message: str = ""
     message_until: float = 0.0
@@ -93,12 +121,17 @@ class HudConfig:
     def theme_name(self) -> str:
         return THEMES[self.theme_index % len(THEMES)]["name"]
 
+    @property
+    def layout_name(self) -> str:
+        return LAYOUTS[self.layout_index % len(LAYOUTS)]
+
 
 @dataclass
 class ProcessRow:
     pid: int
     cpu: float
     mem: float
+    gpu: float
     stat: str
     etime: str
     command: str
@@ -125,6 +158,23 @@ class BatteryInfo:
 
 
 @dataclass
+class FanReading:
+    name: str
+    rpm: int
+    minimum_rpm: int | None = None
+    maximum_rpm: int | None = None
+    target_rpm: int | None = None
+    mode: str = ""
+
+
+@dataclass
+class TempReading:
+    key: str
+    name: str
+    value_c: float
+
+
+@dataclass
 class SensorInfo:
     thermal_warning: str
     performance_warning: str
@@ -135,6 +185,24 @@ class SensorInfo:
     fan_rpm: int | None
     privileged_locked: bool
     raw_hint: str
+    ane_power_w: float | None = None
+    dram_power_w: float | None = None
+    gpu_sram_power_w: float | None = None
+    package_power_w: float | None = None
+    gpu_active_percent: float | None = None
+    gpu_freq_mhz: int | None = None
+    e_cluster_active: float | None = None
+    p_cluster_active: float | None = None
+    s_cluster_active: float | None = None
+    e_cluster_freq_mhz: int | None = None
+    p_cluster_freq_mhz: int | None = None
+    s_cluster_freq_mhz: int | None = None
+    dram_read_gbs: float | None = None
+    dram_write_gbs: float | None = None
+    fan_count: int = 0
+    fans: list[FanReading] = field(default_factory=list)
+    temp_sensors: list[TempReading] = field(default_factory=list)
+    sensor_sample_age_s: float = 0.0
 
 
 @dataclass
@@ -144,6 +212,14 @@ class DiskInfo:
     total: int
     used: int
     free: int
+
+
+@dataclass
+class DiskActivity:
+    bytes_per_sec: float = 0.0
+    iops: float = 0.0
+    sample_age: float = 0.0
+    source: str = "iostat"
 
 
 @dataclass
@@ -160,6 +236,44 @@ class MetricHistory:
         self.disk.append(clamp(disk_pct))
 
 
+class AsyncPoller:
+    """Runs slow collectors off the render loop and keeps the last good sample."""
+
+    def __init__(self, interval: float, collector: Callable[[], Any], initial: Any = None) -> None:
+        self.interval = interval
+        self.collector = collector
+        self.value = initial
+        self.error = ""
+        self.last_success = 0.0
+        self.last_start = 0.0
+        self._running = False
+        self._lock = threading.Lock()
+
+    def tick(self, now: float, force: bool = False) -> Any:
+        with self._lock:
+            due = force or self.last_start == 0.0 or now - self.last_start >= self.interval
+            if due and not self._running:
+                self._running = True
+                self.last_start = now
+                thread = threading.Thread(target=self._run, daemon=True)
+                thread.start()
+            return self.value
+
+    def _run(self) -> None:
+        try:
+            value = self.collector()
+            error = ""
+        except Exception as exc:
+            value = None
+            error = str(exc)
+        with self._lock:
+            if value is not None:
+                self.value = value
+                self.last_success = time.monotonic()
+            self.error = error
+            self._running = False
+
+
 def run_command(args: list[str], timeout: float = 2.0) -> str:
     try:
         return subprocess.check_output(
@@ -170,6 +284,436 @@ def run_command(args: list[str], timeout: float = 2.0) -> str:
         ).strip()
     except Exception:
         return ""
+
+
+def sysctl_value(name: str) -> str:
+    return run_command(["sysctl", "-n", name], timeout=1.0)
+
+
+def sysctl_int(name: str) -> int | None:
+    raw = sysctl_value(name)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def unicode_ok() -> bool:
+    return "UTF" in locale.getpreferredencoding(False).upper()
+
+
+def color_id(value: int) -> int:
+    if value <= 7:
+        return value
+    if curses.COLORS > value:
+        return value
+    fallback = {
+        196: curses.COLOR_RED,
+        203: curses.COLOR_RED,
+        202: curses.COLOR_RED,
+        220: curses.COLOR_YELLOW,
+        226: curses.COLOR_YELLOW,
+        214: curses.COLOR_YELLOW,
+        215: curses.COLOR_YELLOW,
+        46: curses.COLOR_GREEN,
+        82: curses.COLOR_GREEN,
+        118: curses.COLOR_GREEN,
+        119: curses.COLOR_GREEN,
+        33: curses.COLOR_BLUE,
+        39: curses.COLOR_BLUE,
+        45: curses.COLOR_CYAN,
+        51: curses.COLOR_CYAN,
+        87: curses.COLOR_CYAN,
+        110: curses.COLOR_CYAN,
+        147: curses.COLOR_MAGENTA,
+        165: curses.COLOR_MAGENTA,
+        171: curses.COLOR_MAGENTA,
+        183: curses.COLOR_MAGENTA,
+        201: curses.COLOR_MAGENTA,
+    }
+    return fallback.get(value, curses.COLOR_WHITE)
+
+
+def enforce_dark_terminal() -> None:
+    if not sys.stdout.isatty():
+        return
+    sequence = (
+        f"\033]10;{DARK_FG_RGB}\007"
+        f"\033]11;{DARK_BG_RGB}\007"
+        f"\033]12;{DARK_CURSOR_RGB}\007"
+        "\033[?5l"
+    )
+    try:
+        sys.stdout.write(sequence)
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+def apply_dark_screen(screen: curses.window) -> None:
+    try:
+        curses.init_pair(0, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    except curses.error:
+        pass
+    try:
+        screen.bkgd(" ", curses.color_pair(1))
+    except curses.error:
+        pass
+
+
+class SMCKeyDataVers(ctypes.Structure):
+    _fields_ = [
+        ("major", ctypes.c_char),
+        ("minor", ctypes.c_char),
+        ("build", ctypes.c_char),
+        ("reserved", ctypes.c_char),
+        ("release", ctypes.c_ushort),
+    ]
+
+
+class SMCKeyDataPLimit(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_ushort),
+        ("length", ctypes.c_ushort),
+        ("cpuPLimit", ctypes.c_uint32),
+        ("gpuPLimit", ctypes.c_uint32),
+        ("memPLimit", ctypes.c_uint32),
+    ]
+
+
+class SMCKeyDataKeyInfo(ctypes.Structure):
+    _fields_ = [
+        ("dataSize", ctypes.c_uint32),
+        ("dataType", ctypes.c_uint32),
+        ("dataAttributes", ctypes.c_ubyte),
+    ]
+
+
+class SMCKeyData(ctypes.Structure):
+    _fields_ = [
+        ("key", ctypes.c_uint32),
+        ("vers", SMCKeyDataVers),
+        ("pLimitData", SMCKeyDataPLimit),
+        ("keyInfo", SMCKeyDataKeyInfo),
+        ("result", ctypes.c_ubyte),
+        ("status", ctypes.c_ubyte),
+        ("data8", ctypes.c_ubyte),
+        ("data32", ctypes.c_uint32),
+        ("bytes", ctypes.c_ubyte * 32),
+    ]
+
+
+def smc_key_to_int(key: str) -> int:
+    raw = key.encode("ascii", errors="ignore")[:4].ljust(4, b" ")
+    return raw[0] << 24 | raw[1] << 16 | raw[2] << 8 | raw[3]
+
+
+def smc_int_to_key(value: int) -> str:
+    raw = bytes(
+        [
+            (value >> 24) & 0xFF,
+            (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF,
+        ]
+    )
+    return raw.decode("ascii", errors="ignore")
+
+
+def smc_type_to_string(value: int) -> str:
+    return smc_int_to_key(value)
+
+
+def decode_smc_value(data_type: str, data: bytes) -> float | int | None:
+    kind = data_type.strip()
+    try:
+        if data_type == "flt " and len(data) >= 4:
+            return float(struct.unpack("<f", data[:4])[0])
+        if kind == "fpe2" and len(data) >= 2:
+            return int.from_bytes(data[:2], "big", signed=False) / 4.0
+        if kind == "sp78" and len(data) >= 2:
+            return int.from_bytes(data[:2], "big", signed=True) / 256.0
+        if kind == "ui8" and data:
+            return int(data[0])
+        if kind == "ui16" and len(data) >= 2:
+            return int.from_bytes(data[:2], "big", signed=False)
+        if kind == "ui32" and len(data) >= 4:
+            return int.from_bytes(data[:4], "big", signed=False)
+        if kind == "si8" and data:
+            return int.from_bytes(data[:1], "big", signed=True)
+        if kind == "si16" and len(data) >= 2:
+            return int.from_bytes(data[:2], "big", signed=True)
+    except (ValueError, struct.error):
+        return None
+    return None
+
+
+def sensor_group_name(key: str, has_s_cores: bool) -> str:
+    if len(key) < 2:
+        return "Other"
+    if not key.startswith("T"):
+        if key.startswith("He"):
+            return "CPU E-Core"
+        if key.startswith("Hp"):
+            return "CPU P-Core"
+        if key.startswith("Hs"):
+            return "CPU S-Core"
+        if key.startswith("Hg"):
+            return "GPU"
+        if key.startswith("Nv"):
+            return "NVMe"
+        return "Other"
+    if len(key) >= 3:
+        if key[1] == "P" and key[2] in "DMS":
+            return "SoC Package"
+        if key[1] == "R" and key[2] == "D":
+            return "GPU"
+        if key[1] == "C" and key[2] in "MD":
+            return "CPU Die"
+    if key[1] == "s":
+        return "CPU S-Core" if has_s_cores else "SSD"
+    group_map = {
+        "p": "CPU P-Core",
+        "e": "CPU E-Core",
+        "f": "CPU P-Core",
+        "g": "GPU",
+        "C": "CPU Core",
+        "c": "CPU Core",
+        "m": "Memory",
+        "M": "Memory",
+        "S": "SSD",
+        "H": "NAND",
+        "N": "NAND",
+        "a": "Ambient",
+        "A": "Ambient",
+        "F": "Ambient",
+        "B": "Board",
+        "b": "Board",
+        "V": "VRM",
+        "P": "SoC Package",
+        "R": "GPU",
+        "T": "Thunderbolt",
+        "I": "Thunderbolt",
+        "w": "Wireless",
+        "W": "Wireless",
+        "D": "Display",
+        "d": "Display",
+        "L": "Display",
+    }
+    return group_map.get(key[1], "Other")
+
+
+class AppleSMCReader:
+    def __init__(self) -> None:
+        self.conn = ctypes.c_uint32(0)
+        self.available = False
+        try:
+            iokit_path = ctypes.util.find_library("IOKit")
+            system_path = ctypes.util.find_library("System")
+            if not iokit_path or not system_path:
+                return
+            self.iokit = ctypes.CDLL(iokit_path)
+            self.system = ctypes.CDLL(system_path)
+            self._configure()
+            self.available = self._open()
+        except Exception:
+            self.available = False
+
+    def _configure(self) -> None:
+        self.iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        self.iokit.IOServiceMatching.restype = ctypes.c_void_p
+        self.iokit.IOServiceGetMatchingServices.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        self.iokit.IOServiceGetMatchingServices.restype = ctypes.c_int
+        self.iokit.IOIteratorNext.argtypes = [ctypes.c_uint32]
+        self.iokit.IOIteratorNext.restype = ctypes.c_uint32
+        self.iokit.IOObjectRelease.argtypes = [ctypes.c_uint32]
+        self.iokit.IOObjectRelease.restype = ctypes.c_int
+        self.iokit.IOServiceOpen.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        self.iokit.IOServiceOpen.restype = ctypes.c_int
+        self.iokit.IOServiceClose.argtypes = [ctypes.c_uint32]
+        self.iokit.IOServiceClose.restype = ctypes.c_int
+        self.iokit.IOConnectCallStructMethod.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        self.iokit.IOConnectCallStructMethod.restype = ctypes.c_int
+
+    def _task_self(self) -> int:
+        try:
+            self.system.mach_task_self.restype = ctypes.c_uint32
+            return int(self.system.mach_task_self())
+        except Exception:
+            return int(ctypes.c_uint32.in_dll(self.system, "mach_task_self_").value)
+
+    def _open(self) -> bool:
+        iterator = ctypes.c_uint32(0)
+        matching = self.iokit.IOServiceMatching(b"AppleSMC")
+        if not matching:
+            return False
+        result = self.iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(iterator))
+        if result != 0 or not iterator.value:
+            return False
+        device = self.iokit.IOIteratorNext(iterator.value)
+        self.iokit.IOObjectRelease(iterator.value)
+        if not device:
+            return False
+        try:
+            result = self.iokit.IOServiceOpen(device, self._task_self(), 0, ctypes.byref(self.conn))
+        finally:
+            self.iokit.IOObjectRelease(device)
+        return result == 0 and bool(self.conn.value)
+
+    def close(self) -> None:
+        if self.available and self.conn.value:
+            try:
+                self.iokit.IOServiceClose(self.conn.value)
+            except Exception:
+                pass
+        self.available = False
+        self.conn = ctypes.c_uint32(0)
+
+    def __enter__(self) -> "AppleSMCReader":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _call(self, input_data: SMCKeyData) -> tuple[int, SMCKeyData]:
+        output = SMCKeyData()
+        output_size = ctypes.c_size_t(ctypes.sizeof(SMCKeyData))
+        result = self.iokit.IOConnectCallStructMethod(
+            self.conn.value,
+            KERNEL_INDEX_SMC,
+            ctypes.byref(input_data),
+            ctypes.sizeof(SMCKeyData),
+            ctypes.byref(output),
+            ctypes.byref(output_size),
+        )
+        return int(result), output
+
+    def read_key(self, key: str) -> tuple[float | int, str] | None:
+        if not self.available:
+            return None
+        input_data = SMCKeyData()
+        input_data.key = smc_key_to_int(key)
+        input_data.data8 = SMC_CMD_READ_KEYINFO
+        result, output = self._call(input_data)
+        if result != 0 or output.keyInfo.dataSize <= 0:
+            return None
+        size = min(int(output.keyInfo.dataSize), 32)
+        data_type = smc_type_to_string(int(output.keyInfo.dataType))
+        input_data.keyInfo.dataSize = output.keyInfo.dataSize
+        input_data.data8 = SMC_CMD_READ_BYTES
+        result, output = self._call(input_data)
+        if result != 0:
+            return None
+        decoded = decode_smc_value(data_type, bytes(output.bytes[:size]))
+        return (decoded, data_type) if decoded is not None else None
+
+    def read_number(self, key: str) -> float | None:
+        value = self.read_key(key)
+        if not value:
+            return None
+        decoded, _data_type = value
+        if isinstance(decoded, (int, float)):
+            return float(decoded)
+        return None
+
+    def key_count(self) -> int:
+        value = self.read_number("#KEY")
+        if value is None:
+            return 0
+        return max(0, int(value))
+
+    def key_at(self, index: int) -> str:
+        input_data = SMCKeyData()
+        input_data.data8 = SMC_CMD_READ_INDEX
+        input_data.data32 = index
+        result, output = self._call(input_data)
+        if result != 0:
+            return ""
+        return smc_int_to_key(int(output.key)).strip()
+
+    def temp_keys(self) -> list[str]:
+        global SMC_TEMP_KEY_CACHE
+        if SMC_TEMP_KEY_CACHE is not None:
+            return SMC_TEMP_KEY_CACHE
+        keys: list[str] = []
+        for index in range(self.key_count()):
+            key = self.key_at(index)
+            if len(key) == 4 and key.startswith("T"):
+                keys.append(key)
+        SMC_TEMP_KEY_CACHE = keys
+        return keys
+
+    def fan_readings(self) -> list[FanReading]:
+        fan_count = self.read_number("FNum")
+        if fan_count is None or fan_count <= 0:
+            return []
+        fans: list[FanReading] = []
+        for index in range(min(8, int(fan_count))):
+            rpm = self.read_number(f"F{index}Ac")
+            if rpm is None or rpm <= 0:
+                continue
+            minimum = self.read_number(f"F{index}Mn")
+            maximum = self.read_number(f"F{index}Mx")
+            target = self.read_number(f"F{index}Tg")
+            mode_value = self.read_number(f"F{index}Md")
+            if mode_value is None:
+                mode = ""
+            else:
+                mode = "manual" if mode_value >= 0.5 else "auto"
+            fans.append(
+                FanReading(
+                    name=f"Fan {index}",
+                    rpm=int(round(rpm)),
+                    minimum_rpm=int(round(minimum)) if minimum is not None and minimum > 0 else None,
+                    maximum_rpm=int(round(maximum)) if maximum is not None and maximum > 0 else None,
+                    target_rpm=int(round(target)) if target is not None and target > 0 else None,
+                    mode=mode,
+                )
+            )
+        return fans
+
+    def temperature_readings(self) -> list[TempReading]:
+        readings: list[TempReading] = []
+        seen: set[str] = set()
+        has_s_cores = bool(perflevel_counts().get("S"))
+        for key in self.temp_keys():
+            value = self.read_number(key)
+            if value is None or value != value or value < 5 or value > 130:
+                continue
+            group = sensor_group_name(key, has_s_cores)
+            dedupe_key = f"{key}:{value:.1f}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            readings.append(TempReading(key=key, name=f"{group} {key}", value_c=float(value)))
+        readings.sort(key=lambda item: item.value_c, reverse=True)
+        return readings[:48]
+
+
+def read_smc_sensors() -> tuple[list[FanReading], list[TempReading]]:
+    try:
+        with AppleSMCReader() as smc:
+            if not smc.available:
+                return [], []
+            return smc.fan_readings(), smc.temperature_readings()
+    except Exception:
+        return [], []
 
 
 def sudo_cached() -> bool:
@@ -259,6 +803,33 @@ def fan_text(sensor: "SensorInfo") -> str:
     return "admin locked" if sensor.privileged_locked else "no RPM exposed"
 
 
+def default_sensor_info() -> SensorInfo:
+    return SensorInfo(
+        thermal_warning="pending",
+        performance_warning="pending",
+        cpu_power_w=None,
+        gpu_power_w=None,
+        cpu_temp_c=None,
+        gpu_temp_c=None,
+        fan_rpm=None,
+        privileged_locked=True,
+        raw_hint="warming up",
+    )
+
+
+def thermal_level_from_sysctl() -> tuple[str, bool] | None:
+    value = sysctl_int("machdep.xcpm.cpu_thermal_level")
+    if value is None:
+        return None
+    levels = {
+        0: ("nominal", False),
+        1: ("fair", True),
+        2: ("serious", True),
+        3: ("critical", True),
+    }
+    return levels.get(value, ("unknown", False))
+
+
 def format_optional_int(value: int | None, suffix: str = "") -> str:
     if value is None:
         return "locked"
@@ -314,6 +885,172 @@ def parse_power_value(raw: str, label: str) -> float | None:
     return value / 1000.0 if unit == "mw" else value
 
 
+def parse_any_power_value(raw: str, labels: list[str]) -> float | None:
+    for label in labels:
+        value = parse_power_value(raw, label)
+        if value is not None:
+            return value
+    return None
+
+
+def parse_percent_value(raw: str, labels: list[str]) -> float | None:
+    for label in labels:
+        pattern = rf"{re.escape(label)}[^\n:]*:\s*([\d.]+)\s*%"
+        match = re.search(pattern, raw, re.IGNORECASE)
+        if match:
+            try:
+                return clamp(float(match.group(1)))
+            except ValueError:
+                return None
+    return None
+
+
+def parse_frequency_mhz(raw: str, labels: list[str]) -> int | None:
+    for label in labels:
+        pattern = rf"{re.escape(label)}[^\n:]*:\s*([\d.]+)\s*(MHz|GHz)"
+        match = re.search(pattern, raw, re.IGNORECASE)
+        if match:
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                return None
+            if match.group(2).lower() == "ghz":
+                value *= 1000.0
+            return int(round(value))
+    return None
+
+
+def powermetrics_sample() -> str:
+    sampler_sets = [
+        "thermal,cpu_power,gpu_power,ane_power,battery,smc",
+        "thermal,cpu_power,gpu_power,ane_power,battery",
+        "all",
+    ]
+    for samplers in sampler_sets:
+        raw = run_command(
+            [
+                "sudo",
+                "-n",
+                "powermetrics",
+                "--samplers",
+                samplers,
+                "--show-extra-power-info",
+                "-n",
+                "1",
+                "-i",
+                "1000",
+            ],
+            timeout=5.5,
+        )
+        if raw:
+            return raw
+    return ""
+
+
+def parse_fan_readings(raw: str) -> list[FanReading]:
+    fans: list[FanReading] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        if "fan" not in line.lower() or "rpm" not in line.lower():
+            continue
+        rpm_match = re.search(r"(\d{3,6})\s*rpm", line, re.IGNORECASE)
+        if not rpm_match:
+            continue
+        rpm = int(rpm_match.group(1))
+        prefix = line[: rpm_match.start()].strip(" :-")
+        id_match = re.search(r"fan\s*(\d+)", line, re.IGNORECASE)
+        name = prefix or (f"Fan {id_match.group(1)}" if id_match else f"Fan {len(fans)}")
+        name = re.sub(r"\s+", " ", name)
+        key = f"{name}:{rpm}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        def rpm_field(label: str) -> int | None:
+            match = re.search(rf"{label}[^\d]*(\d{{3,6}})\s*rpm", line, re.IGNORECASE)
+            return int(match.group(1)) if match else None
+
+        mode = ""
+        mode_match = re.search(r"\b(auto|automatic|forced|manual)\b", line, re.IGNORECASE)
+        if mode_match:
+            mode = mode_match.group(1).lower()
+        fans.append(
+            FanReading(
+                name=name[:42],
+                rpm=rpm,
+                minimum_rpm=rpm_field("min"),
+                maximum_rpm=rpm_field("max"),
+                target_rpm=rpm_field("target"),
+                mode=mode,
+            )
+        )
+    return fans
+
+
+def parse_temperature_readings(raw: str) -> list[TempReading]:
+    readings: list[TempReading] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        normalized = line.strip()
+        if not normalized:
+            continue
+        if not re.search(r"(temperature|temp|\bT[A-Za-z0-9]{2,4}\b)", normalized, re.IGNORECASE):
+            continue
+        match = re.search(
+            r"(?:(\b[A-Za-z][A-Za-z0-9]{2,4}\b)\s+)?(.{0,64}?)(?:temperature|temp)?\s*:?\s*(-?\d+(?:\.\d+)?)\s*(?:C|°C|celsius)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        key = match.group(1) or ""
+        name = (match.group(2) or key or "temperature").strip(" :-")
+        value = float(match.group(3))
+        if value < -20 or value > 140:
+            continue
+        label = name or key or "temperature"
+        dedupe_key = f"{key}:{label}:{value:.1f}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        readings.append(TempReading(key=key, name=re.sub(r"\s+", " ", label)[:54], value_c=value))
+    readings.sort(key=lambda item: item.value_c, reverse=True)
+    return readings[:24]
+
+
+def temp_from_readings(readings: list[TempReading], needles: tuple[str, ...]) -> float | None:
+    candidates = []
+    for reading in readings:
+        haystack = f"{reading.key} {reading.name}".lower()
+        if any(needle in haystack for needle in needles):
+            candidates.append(reading.value_c)
+    return max(candidates) if candidates else None
+
+
+def average_temp_from_smc_keys(readings: list[TempReading], second_chars: set[str]) -> float | None:
+    values = [
+        reading.value_c
+        for reading in readings
+        if len(reading.key) >= 2 and reading.key[0] == "T" and reading.key[1] in second_chars
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def merge_temperature_readings(*groups: list[TempReading]) -> list[TempReading]:
+    merged: list[TempReading] = []
+    seen: set[str] = set()
+    for readings in groups:
+        for reading in readings:
+            key = reading.key or reading.name.lower()
+            dedupe_key = re.sub(r"\s+", " ", key.strip().lower())
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            merged.append(reading)
+    merged.sort(key=lambda item: item.value_c, reverse=True)
+    return merged[:48]
+
+
 def parse_temp_value(raw: str, pattern: str) -> float | None:
     match = re.search(pattern, raw, re.IGNORECASE)
     if not match:
@@ -362,19 +1099,19 @@ def format_core_topology(raw: str) -> str:
 
 def perflevel_clusters(topology: dict[str, int]) -> list[dict[str, Any]]:
     clusters: list[dict[str, Any]] = []
-    for index in range(4):
-        logical_raw = run_command(["sysctl", "-n", f"hw.perflevel{index}.logicalcpu"])
-        try:
-            logical = int(logical_raw)
-        except ValueError:
-            logical = 0
+    nlevels = sysctl_int("hw.nperflevels") or 4
+    for index in range(nlevels):
+        logical = sysctl_int(f"hw.perflevel{index}.logicalcpu") or 0
         if logical <= 0:
             continue
-        raw_name = run_command(["sysctl", "-n", f"hw.perflevel{index}.name"]) or f"Cluster {index}"
+        raw_name = sysctl_value(f"hw.perflevel{index}.name") or f"Cluster {index}"
         normalized = raw_name.strip().lower()
         performance_count = topology.get("performance", 0)
         efficiency_count = topology.get("efficiency", 0)
-        if "performance" in normalized or (performance_count and logical == performance_count and logical != efficiency_count):
+        if "super" in normalized:
+            code = "S"
+            label = "Super"
+        elif "performance" in normalized or (performance_count and logical == performance_count and logical != efficiency_count):
             code = "P"
             label = "Performance"
         elif "efficiency" in normalized or (efficiency_count and logical == efficiency_count and logical != performance_count):
@@ -392,6 +1129,116 @@ def perflevel_clusters(topology: dict[str, int]) -> list[dict[str, Any]]:
             }
         )
     return clusters
+
+
+def perflevel_counts() -> dict[str, int]:
+    counts = {"E": 0, "P": 0, "S": 0}
+    nlevels = sysctl_int("hw.nperflevels") or 0
+    if nlevels:
+        for index in range(nlevels):
+            logical = sysctl_int(f"hw.perflevel{index}.logicalcpu") or 0
+            name = sysctl_value(f"hw.perflevel{index}.name").lower()
+            if logical <= 0:
+                continue
+            if name.startswith("super"):
+                counts["S"] += logical
+            elif name.startswith("efficiency"):
+                counts["E"] += logical
+            else:
+                counts["P"] += logical
+    else:
+        counts["P"] = sysctl_int("hw.perflevel0.logicalcpu") or 0
+        counts["E"] = sysctl_int("hw.perflevel1.logicalcpu") or 0
+    return counts
+
+
+def detect_core_topology() -> list[tuple[int, str]]:
+    raw = run_command(["ioreg", "-l", "-p", "IODeviceTree"], timeout=3.0)
+    entries: list[tuple[int, str]] = []
+    if not raw:
+        return entries
+    lines = raw.splitlines()
+    seen: set[int] = set()
+    last_cluster_type: str | None = None
+    for index, line in enumerate(lines):
+        cluster_match = re.search(r'"cluster-type"\s*=\s*<"([A-Za-z])">', line)
+        if cluster_match:
+            last_cluster_type = cluster_match.group(1).upper()
+        name_match = re.search(r'"name"\s*=\s*<"cpu(\d+)">', line)
+        if not name_match:
+            continue
+        cpu_id = int(name_match.group(1))
+        if cpu_id in seen:
+            continue
+        core_type = last_cluster_type
+        if core_type is None:
+            for lookahead in lines[index + 1 : index + 8]:
+                cluster_match = re.search(r'"cluster-type"\s*=\s*<"([A-Za-z])">', lookahead)
+                if cluster_match:
+                    core_type = cluster_match.group(1).upper()
+                    break
+        if core_type is None:
+            continue
+        entries.append((cpu_id, core_type))
+        seen.add(cpu_id)
+        last_cluster_type = None
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def build_core_labels() -> tuple[list[str], list[int], dict[str, int]]:
+    topology = detect_core_topology()
+    counts = {"E": 0, "P": 0, "S": 0}
+    if not topology:
+        return [], [], counts
+
+    perf_counts = perflevel_counts()
+    grouped: dict[str, list[tuple[int, int]]] = {"E": [], "P": [], "S": [], "M": []}
+    for mach_index, (_cpu_id, raw_type) in enumerate(topology):
+        grouped.setdefault(raw_type, []).append((mach_index, len(grouped.get(raw_type, []))))
+
+    # M5-era device trees report "M" for Performance-tier cores and "P" for Super-tier cores.
+    if grouped.get("M"):
+        s_cores = grouped.get("P", [])
+        p_cores = grouped.get("M", [])
+        if perf_counts.get("S") and len(s_cores) != perf_counts["S"]:
+            s_cores = grouped.get("S", []) + grouped.get("P", [])
+        grouped["P"] = p_cores
+        grouped["S"] = s_cores
+
+    labels: list[str] = []
+    index_map: list[int] = []
+    for code in ("E", "P", "S"):
+        for display_index, (mach_index, _raw_index) in enumerate(grouped.get(code, [])):
+            labels.append(f"{code}{display_index}")
+            index_map.append(mach_index)
+        counts[code] = len(grouped.get(code, []))
+    return labels, index_map, counts
+
+
+def gpu_core_count_fast() -> int | None:
+    raw = run_command(["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"], timeout=2.0)
+    match = re.search(r'"gpu-core-count"\s*=\s*(\d+)', raw)
+    if not match:
+        config_match = re.search(r'"num_cores"\s*=\s*(\d+)', raw)
+        match = config_match
+    return int(match.group(1)) if match else None
+
+
+def max_gpu_frequency_mhz() -> int | None:
+    raw = run_command(["ioreg", "-r", "-c", "AppleARMIODevice", "-d", "1", "-k", "voltage-states9"], timeout=3.0)
+    match = re.search(r'"voltage-states9"\s*=\s*<([0-9a-fA-F]+)>', raw)
+    if not match:
+        return None
+    blob = bytes.fromhex(match.group(1))
+    if len(blob) < 8:
+        return None
+    max_mhz = 0
+    for offset in range(0, len(blob) - 7, 8):
+        freq_hz = int.from_bytes(blob[offset : offset + 4], "little", signed=False)
+        if freq_hz:
+            max_mhz = max(max_mhz, freq_hz // 1_000_000)
+    return max_mhz or None
 
 
 class MacCpuSampler:
@@ -488,18 +1335,24 @@ class MacCpuSampler:
 
 
 def collect_static_info() -> dict[str, Any]:
+    core_labels, cpu_index_map, core_counts = build_core_labels()
     info: dict[str, Any] = {
         "host": socket.gethostname().split(".")[0],
         "os": f"macOS {run_command(['sw_vers', '-productVersion'])}",
         "build": run_command(["sw_vers", "-buildVersion"]),
         "kernel": platform.release(),
-        "model": run_command(["sysctl", "-n", "hw.model"]),
-        "chip": run_command(["sysctl", "-n", "machdep.cpu.brand_string"]),
-        "physical_cpu": run_command(["sysctl", "-n", "hw.physicalcpu"]),
-        "logical_cpu": run_command(["sysctl", "-n", "hw.logicalcpu"]),
+        "model": sysctl_value("hw.model"),
+        "chip": sysctl_value("machdep.cpu.brand_string"),
+        "physical_cpu": sysctl_value("hw.physicalcpu"),
+        "logical_cpu": sysctl_value("hw.logicalcpu"),
         "memory": "",
         "cpu_clusters": [],
+        "core_labels": core_labels,
+        "cpu_index_map": cpu_index_map,
+        "core_counts": core_counts,
         "gpus": [],
+        "gpu_core_count": gpu_core_count_fast(),
+        "max_gpu_freq_mhz": max_gpu_frequency_mhz(),
     }
 
     raw = run_command(
@@ -540,6 +1393,8 @@ def collect_static_info() -> dict[str, Any]:
                     or gpu.get("sppci_cores")
                     or ""
                 )
+                if not cores and info.get("gpu_core_count"):
+                    cores = str(info["gpu_core_count"])
                 metal = gpu.get("spdisplays_metalfamily") or gpu.get("spdisplays_metal") or ""
                 metal = metal or gpu.get("spdisplays_mtlgpufamilysupport") or ""
                 displays = gpu.get("spdisplays_ndrvs") or []
@@ -552,6 +1407,7 @@ def collect_static_info() -> dict[str, Any]:
                         "cores": str(cores),
                         "metal": str(metal),
                         "displays": ", ".join(display_names[:3]),
+                        "max_freq_mhz": str(info.get("max_gpu_freq_mhz") or ""),
                     }
                 )
             info["gpus"] = gpus
@@ -562,9 +1418,16 @@ def collect_static_info() -> dict[str, Any]:
         info["chip"] = "Apple Silicon" if platform.machine() == "arm64" else platform.processor()
     if not info["cpu_clusters"]:
         info["cpu_clusters"] = perflevel_clusters({})
+    core_counts = info.get("core_counts") or {}
+    detected_total = sum(int(core_counts.get(code, 0) or 0) for code in ("E", "P", "S"))
+    if detected_total:
+        parts = [f"{core_counts[code]}{code}" for code in ("P", "E", "S") if core_counts.get(code)]
+        info["cpu_cores"] = f"{detected_total} cores ({'/'.join(parts)})"
     if not info["memory"]:
-        total = run_command(["sysctl", "-n", "hw.memsize"])
+        total = sysctl_value("hw.memsize")
         info["memory"] = human_bytes(float(total or 0))
+    if info.get("gpu_core_count") and info.get("max_gpu_freq_mhz"):
+        info["gpu_fp32_tflops"] = float(info["gpu_core_count"]) * float(info["max_gpu_freq_mhz"]) * 0.000256
     return info
 
 
@@ -577,7 +1440,7 @@ def boot_seconds() -> int:
 
 
 def memory_stats() -> dict[str, float]:
-    total_raw = run_command(["sysctl", "-n", "hw.memsize"])
+    total_raw = sysctl_value("hw.memsize")
     total = float(total_raw or 0)
     raw = run_command(["vm_stat"], timeout=1.5)
     page_match = re.search(r"page size of (\d+) bytes", raw)
@@ -684,45 +1547,79 @@ def sensor_info() -> SensorInfo:
     therm_raw = run_command(["pmset", "-g", "therm"], timeout=1.5)
     thermal_warning = "nominal"
     performance_warning = "nominal"
+    sysctl_thermal = thermal_level_from_sysctl()
+    if sysctl_thermal is not None:
+        thermal_warning = sysctl_thermal[0]
     if "No thermal warning" not in therm_raw and therm_raw:
         thermal_warning = "active"
     if "No performance warning" not in therm_raw and therm_raw:
         performance_warning = "active"
 
-    power_raw = run_command(
-        [
-            "sudo",
-            "-n",
-            "powermetrics",
-            "--samplers",
-            "thermal,cpu_power,gpu_power,battery",
-            "-n",
-            "1",
-            "-i",
-            "1000",
-        ],
-        timeout=4.0,
-    )
+    smc_fans, smc_temp_sensors = read_smc_sensors()
+    smc_online = bool(smc_fans or smc_temp_sensors)
+    power_raw = powermetrics_sample()
     locked = not bool(power_raw)
-    cpu_temp = parse_temp_value(power_raw, r"(?:CPU|processor)[^\n:]*temperature[^\d]*([\d.]+)\s*C")
-    gpu_temp = parse_temp_value(power_raw, r"GPU[^\n:]*temperature[^\d]*([\d.]+)\s*C")
-    fan_match = re.search(r"fan[^\n]*?(\d{3,5})\s*rpm", power_raw, re.IGNORECASE)
-    fan_rpm = int(fan_match.group(1)) if fan_match else None
+    fans = smc_fans or parse_fan_readings(power_raw)
+    temp_sensors = merge_temperature_readings(smc_temp_sensors, parse_temperature_readings(power_raw))
+    cpu_temp = parse_temp_value(power_raw, r"(?:CPU|processor)[^\n:]*temperature[^\d-]*(-?[\d.]+)\s*(?:C|°C)")
+    gpu_temp = parse_temp_value(power_raw, r"GPU[^\n:]*temperature[^\d-]*(-?[\d.]+)\s*(?:C|°C)")
+    cpu_temp = cpu_temp if cpu_temp is not None else average_temp_from_smc_keys(temp_sensors, {"p", "e", "f", "s"})
+    gpu_temp = gpu_temp if gpu_temp is not None else average_temp_from_smc_keys(temp_sensors, {"g", "R"})
+    cpu_temp = cpu_temp if cpu_temp is not None else temp_from_readings(temp_sensors, ("cpu", "processor", "p-core", "e-core", "soc"))
+    gpu_temp = gpu_temp if gpu_temp is not None else temp_from_readings(temp_sensors, ("gpu", "graphics", "agx"))
+    fan_rpm = max((fan.rpm for fan in fans), default=None)
+    fan_count = len(fans)
 
     pressure_match = re.search(r"thermal pressure\s*:\s*([A-Za-z ]+)", power_raw, re.IGNORECASE)
     if pressure_match:
         thermal_warning = pressure_match.group(1).strip().lower()
 
+    cpu_power = parse_any_power_value(power_raw, ["CPU Power", "Processor Power"])
+    gpu_power = parse_any_power_value(power_raw, ["GPU Power"])
+    ane_power = parse_any_power_value(power_raw, ["ANE Power", "Neural Engine Power"])
+    dram_power = parse_any_power_value(power_raw, ["DRAM Power", "Memory Power"])
+    gpu_sram_power = parse_any_power_value(power_raw, ["GPU SRAM Power", "GPUSRAM Power"])
+    package_power = parse_any_power_value(power_raw, ["Package Power", "Combined Power", "SoC Power", "System Power"])
+    if package_power is None:
+        parts = [cpu_power, gpu_power, ane_power, dram_power, gpu_sram_power]
+        known = [value for value in parts if value is not None]
+        package_power = sum(known) if known else None
+    if smc_online and locked:
+        raw_hint = "smc + sudo powermetrics"
+    elif smc_online:
+        raw_hint = "smc + powermetrics"
+    elif locked:
+        raw_hint = "sudo powermetrics"
+    else:
+        raw_hint = "powermetrics"
+
     return SensorInfo(
         thermal_warning=thermal_warning,
         performance_warning=performance_warning,
-        cpu_power_w=parse_power_value(power_raw, "CPU Power"),
-        gpu_power_w=parse_power_value(power_raw, "GPU Power"),
+        cpu_power_w=cpu_power,
+        gpu_power_w=gpu_power,
         cpu_temp_c=cpu_temp,
         gpu_temp_c=gpu_temp,
         fan_rpm=fan_rpm,
         privileged_locked=locked,
-        raw_hint="sudo powermetrics" if locked else "powermetrics",
+        raw_hint=raw_hint,
+        ane_power_w=ane_power,
+        dram_power_w=dram_power,
+        gpu_sram_power_w=gpu_sram_power,
+        package_power_w=package_power,
+        gpu_active_percent=parse_percent_value(power_raw, ["GPU active residency", "GPU Active", "GPU HW active residency"]),
+        gpu_freq_mhz=parse_frequency_mhz(power_raw, ["GPU HW active frequency", "GPU active frequency", "GPU Frequency"]),
+        e_cluster_active=parse_percent_value(power_raw, ["E-Cluster active residency", "E cluster active residency", "Efficiency cluster active residency"]),
+        p_cluster_active=parse_percent_value(power_raw, ["P-Cluster active residency", "P cluster active residency", "Performance cluster active residency"]),
+        s_cluster_active=parse_percent_value(power_raw, ["S-Cluster active residency", "S cluster active residency", "Super cluster active residency"]),
+        e_cluster_freq_mhz=parse_frequency_mhz(power_raw, ["E-Cluster HW active frequency", "E cluster active frequency", "Efficiency cluster active frequency"]),
+        p_cluster_freq_mhz=parse_frequency_mhz(power_raw, ["P-Cluster HW active frequency", "P cluster active frequency", "Performance cluster active frequency"]),
+        s_cluster_freq_mhz=parse_frequency_mhz(power_raw, ["S-Cluster HW active frequency", "S cluster active frequency", "Super cluster active frequency"]),
+        dram_read_gbs=parse_temp_value(power_raw, r"DRAM\s+read[^\n:]*:\s*([\d.]+)\s*GB/s"),
+        dram_write_gbs=parse_temp_value(power_raw, r"DRAM\s+write[^\n:]*:\s*([\d.]+)\s*GB/s"),
+        fan_count=fan_count,
+        fans=fans,
+        temp_sensors=temp_sensors,
     )
 
 
@@ -740,6 +1637,33 @@ def disk_info() -> DiskInfo:
             return DiskInfo(label=label, mount=mount, total=usage.total, used=usage.used, free=usage.free)
     usage = shutil.disk_usage("/")
     return DiskInfo(label="root", mount="/", total=usage.total, used=usage.used, free=usage.free)
+
+
+def disk_activity() -> DiskActivity:
+    raw = run_command(["iostat", "-Id", "-c", "2", "-w", "1"], timeout=2.5)
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if len(lines) < 4:
+        return DiskActivity()
+    numeric_lines = [
+        line
+        for line in lines
+        if re.match(r"^\s*[-+]?\d+(?:\.\d+)?\s+", line)
+    ]
+    if not numeric_lines:
+        return DiskActivity()
+    parts = numeric_lines[-1].split()
+    values: list[float] = []
+    for part in parts:
+        try:
+            values.append(float(part))
+        except ValueError:
+            pass
+    total_mb = 0.0
+    total_xfers = 0.0
+    for offset in range(0, len(values) - 2, 3):
+        total_xfers += max(0.0, values[offset + 1])
+        total_mb += max(0.0, values[offset + 2])
+    return DiskActivity(bytes_per_sec=total_mb * 1024 * 1024, iops=total_xfers)
 
 
 def network_bytes() -> tuple[int, int]:
@@ -776,22 +1700,91 @@ def network_bytes() -> tuple[int, int]:
     )
 
 
-def process_rows(sort_mode: str) -> list[ProcessRow]:
+class GPUProcessSampler:
+    def __init__(self) -> None:
+        self.previous: dict[int, int] | None = None
+        self.previous_time = 0.0
+
+    def sample(self, system_gpu_percent: float | None = None) -> dict[int, float]:
+        raw = run_command(["ioreg", "-r", "-c", "AGXDeviceUserClient", "-l"], timeout=2.0)
+        current: dict[int, int] = {}
+        if not raw:
+            return {}
+
+        current_pid: int | None = None
+        current_total = 0
+        saw_usage = False
+        for line in raw.splitlines():
+            creator = re.search(r'"IOUserClientCreator"\s*=\s*"pid\s+(\d+),', line)
+            if creator:
+                if current_pid is not None and current_total > 0:
+                    current[current_pid] = current.get(current_pid, 0) + current_total
+                current_pid = int(creator.group(1))
+                current_total = 0
+                saw_usage = False
+                continue
+            if current_pid is None:
+                continue
+            values = [int(value) for value in re.findall(r'"accumulatedGPUTime"\s*=\s*(\d+)', line)]
+            if values:
+                current_total += sum(values)
+                saw_usage = True
+            if saw_usage and ")" in line:
+                current[current_pid] = current.get(current_pid, 0) + current_total
+                current_pid = None
+                current_total = 0
+                saw_usage = False
+        if current_pid is not None and current_total > 0:
+            current[current_pid] = current.get(current_pid, 0) + current_total
+
+        now = time.monotonic()
+        if self.previous is None or self.previous_time <= 0:
+            self.previous = current
+            self.previous_time = now
+            return {}
+
+        elapsed = max(0.25, now - self.previous_time)
+        gpu_ms_per_sec: dict[int, float] = {}
+        total_ms = 0.0
+        for pid, value in current.items():
+            before = self.previous.get(pid)
+            if before is None or value < before:
+                continue
+            ms_per_sec = (value - before) / elapsed / 1_000_000.0
+            if ms_per_sec <= 0:
+                continue
+            gpu_ms_per_sec[pid] = ms_per_sec
+            total_ms += ms_per_sec
+
+        raw_total_percent = total_ms / 10.0
+        scale = 1.0
+        if raw_total_percent > 0.01 and system_gpu_percent and system_gpu_percent > 0.01:
+            scale = system_gpu_percent / raw_total_percent
+
+        self.previous = current
+        self.previous_time = now
+        return {pid: value * scale / 10.0 for pid, value in gpu_ms_per_sec.items()}
+
+
+def process_rows(sort_mode: str, gpu_sampler: GPUProcessSampler | None = None, system_gpu_percent: float | None = None) -> list[ProcessRow]:
     raw = run_command(
         ["ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
         timeout=2.0,
     )
+    gpu_by_pid = gpu_sampler.sample(system_gpu_percent) if gpu_sampler else {}
     rows: list[ProcessRow] = []
     for line in raw.splitlines():
         parts = line.strip().split(None, 5)
         if len(parts) < 6:
             continue
         try:
+            pid = int(parts[0])
             rows.append(
                 ProcessRow(
-                    pid=int(parts[0]),
+                    pid=pid,
                     cpu=float(parts[1]),
                     mem=float(parts[2]),
+                    gpu=gpu_by_pid.get(pid, 0.0),
                     stat=parts[3],
                     etime=parts[4],
                     command=parts[5],
@@ -799,7 +1792,12 @@ def process_rows(sort_mode: str) -> list[ProcessRow]:
             )
         except ValueError:
             continue
-    key = (lambda row: row.mem) if sort_mode == "MEM" else (lambda row: row.cpu)
+    if sort_mode == "GPU":
+        key = lambda row: row.gpu
+    elif sort_mode == "MEM":
+        key = lambda row: row.mem
+    else:
+        key = lambda row: row.cpu
     rows.sort(key=key, reverse=True)
     return rows
 
@@ -825,12 +1823,17 @@ def safe_add(screen: curses.window, y: int, x: int, text: str, attr: int = 0) ->
 def draw_box(screen: curses.window, y: int, x: int, h: int, w: int, title: str, attr: int) -> None:
     if h < 3 or w < 8:
         return
-    top = "+" + "-" * (w - 2) + "+"
+    if unicode_ok():
+        tl, tr, bl, br, hz, vt = "╭", "╮", "╰", "╯", "─", "│"
+    else:
+        tl, tr, bl, br, hz, vt = "+", "+", "+", "+", "-", "|"
+    top = tl + hz * (w - 2) + tr
+    bottom = bl + hz * (w - 2) + br
     safe_add(screen, y, x, top, attr)
     for row in range(1, h - 1):
-        safe_add(screen, y + row, x, "|", attr)
-        safe_add(screen, y + row, x + w - 1, "|", attr)
-    safe_add(screen, y + h - 1, x, top, attr)
+        safe_add(screen, y + row, x, vt, attr)
+        safe_add(screen, y + row, x + w - 1, vt, attr)
+    safe_add(screen, y + h - 1, x, bottom, attr)
     label = f" {title} "
     safe_add(screen, y, x + 2, label[: max(0, w - 4)], attr | curses.A_BOLD)
 
@@ -838,7 +1841,8 @@ def draw_box(screen: curses.window, y: int, x: int, h: int, w: int, title: str, 
 def bar(percent: float, width: int, label: str = "") -> str:
     width = max(4, width)
     filled = int(round(width * clamp(percent) / 100.0))
-    body = "#" * filled + "." * (width - filled)
+    fill_char, empty_char = ("█", "░") if unicode_ok() else ("#", ".")
+    body = fill_char * filled + empty_char * (width - filled)
     suffix = f" {percent:5.1f}%"
     return f"{label}[{body}]{suffix}"
 
@@ -846,9 +1850,10 @@ def bar(percent: float, width: int, label: str = "") -> str:
 def pulse_bar(percent: float, width: int, phase: int, label: str = "") -> str:
     width = max(4, width)
     filled = int(round(width * clamp(percent) / 100.0))
-    body = ["#"] * filled + ["."] * (width - filled)
+    fill_char, empty_char, pulse_char = ("█", "░", "◆") if unicode_ok() else ("#", ".", "@")
+    body = [fill_char] * filled + [empty_char] * (width - filled)
     if filled:
-        body[phase % filled] = "@"
+        body[phase % filled] = pulse_char
     return f"{label}[{''.join(body)}] {percent:5.1f}%"
 
 
@@ -893,15 +1898,16 @@ def disk_percent(disk: DiskInfo) -> float:
 
 def comet(width: int, phase: int, density: float = 0.65) -> str:
     width = max(4, width)
-    trail = ["."] * width
+    empty = "·" if unicode_ok() else "."
+    trail = [empty] * width
     head = phase % width
-    chars = ["@", "#", "*", "+", "-", "."]
+    chars = ["◆", "●", "•", "·", "-", empty] if unicode_ok() else ["@", "#", "*", "+", "-", "."]
     for offset, char in enumerate(chars):
         idx = (head - offset) % width
         trail[idx] = char
     fill = int(width * clamp(density * 100.0) / 100.0)
     for idx in range(fill, width):
-        if trail[idx] == ".":
+        if trail[idx] == empty:
             trail[idx] = " "
     return "".join(trail)
 
@@ -923,7 +1929,77 @@ def temp_attr(value: float | None) -> int:
     return curses.color_pair(2)
 
 
+def fan_percent(fan: FanReading) -> float:
+    if fan.maximum_rpm and fan.maximum_rpm > 0:
+        return clamp(fan.rpm / fan.maximum_rpm * 100.0)
+    if fan.target_rpm and fan.target_rpm > 0:
+        return clamp(fan.rpm / fan.target_rpm * 100.0)
+    return clamp(fan.rpm / 7000.0 * 100.0)
+
+
+def fan_attr(fan: FanReading) -> int:
+    pct = fan_percent(fan)
+    if pct >= 85:
+        return curses.color_pair(4) | curses.A_BOLD
+    if pct >= 55:
+        return curses.color_pair(3) | curses.A_BOLD
+    return curses.color_pair(2)
+
+
+def temperature_group_rows(readings: list[TempReading]) -> list[tuple[str, float, float, int]]:
+    grouped: dict[str, list[float]] = {}
+    for reading in readings:
+        label = reading.name
+        if reading.key and label.endswith(reading.key):
+            label = label[: -len(reading.key)].strip() or reading.key
+        label = re.sub(r"\s+", " ", label.strip()) or "Sensor"
+        grouped.setdefault(label, []).append(reading.value_c)
+    rows = [
+        (label, sum(values) / len(values), max(values), len(values))
+        for label, values in grouped.items()
+        if values
+    ]
+    rows.sort(key=lambda item: item[2], reverse=True)
+    return rows
+
+
+def display_core_usage(per_core: list[float], static: dict[str, Any]) -> tuple[list[float], list[str]]:
+    index_map = static.get("cpu_index_map") or []
+    labels = static.get("core_labels") or []
+    if index_map and labels and len(index_map) == len(labels):
+        ordered: list[float] = []
+        ordered_labels: list[str] = []
+        for label, mach_index in zip(labels, index_map):
+            if isinstance(mach_index, int) and 0 <= mach_index < len(per_core):
+                ordered.append(per_core[mach_index])
+                ordered_labels.append(str(label))
+        if ordered:
+            return ordered, ordered_labels
+    return per_core, [f"W{index}" for index in range(len(per_core))]
+
+
 def cpu_groups(static: dict[str, Any], core_count: int) -> list[dict[str, Any]]:
+    labels = static.get("core_labels") or []
+    index_map = static.get("cpu_index_map") or []
+    if labels and index_map and len(labels) == core_count:
+        names = {
+            "E": "Efficiency",
+            "P": "Performance",
+            "S": "Super",
+            "M": "Medium",
+            "W": "Workers",
+        }
+        groups: list[dict[str, Any]] = []
+        start = 0
+        while start < core_count:
+            code = str(labels[start])[:1] or "W"
+            end = start + 1
+            while end < core_count and str(labels[end]).startswith(code):
+                end += 1
+            groups.append({"code": code, "label": names.get(code, "Cluster"), "start": start, "count": end - start})
+            start = end
+        return groups
+
     clusters = static.get("cpu_clusters") or []
     groups: list[dict[str, Any]] = []
     start = 0
@@ -966,25 +2042,72 @@ def cpu_panel_required_height(panel_width: int, core_count: int, static: dict[st
     return group_rows + 7
 
 
+def proportional_heights(total: int, specs: list[tuple[int, int]]) -> list[int]:
+    if not specs:
+        return []
+    minimums = [minimum for minimum, _weight in specs]
+    weights = [weight for _minimum, weight in specs]
+    min_sum = sum(minimums)
+    if total <= min_sum:
+        heights = minimums[:]
+        overflow = min_sum - total
+        for index in sorted(range(len(heights)), key=lambda item: heights[item], reverse=True):
+            reducible = max(0, heights[index] - 4)
+            take = min(reducible, overflow)
+            heights[index] -= take
+            overflow -= take
+            if overflow <= 0:
+                break
+        if overflow > 0:
+            heights[-1] = max(3, heights[-1] - overflow)
+        return heights
+
+    extra = total - min_sum
+    weight_sum = sum(weights) or len(specs)
+    heights = minimums[:]
+    assigned = 0
+    for index, weight in enumerate(weights[:-1]):
+        add = extra * (weight or 1) // weight_sum
+        heights[index] += add
+        assigned += add
+    heights[-1] += extra - assigned
+    return heights
+
+
 def cpu_lane_text(label: str, index: int, percent: float, width: int, phase: int) -> str:
     if width >= 20:
         return pulse_bar(percent, max(4, width - 13), phase + index, f"{label} ")[: max(0, width)]
     if width >= 11:
         bar_width = max(1, width - 9)
         filled = int(round(bar_width * clamp(percent) / 100.0))
-        body = ["#"] * filled + ["."] * (bar_width - filled)
+        fill_char, empty_char, pulse_char = ("█", "░", "◆") if unicode_ok() else ("#", ".", "@")
+        body = [fill_char] * filled + [empty_char] * (bar_width - filled)
         if filled:
-            body[(phase + index) % filled] = "@"
+            body[(phase + index) % filled] = pulse_char
         short_pct = min(99, int(round(percent)))
         return f"{label} [{''.join(body)}] {short_pct:2d}"[: max(0, width)]
-    return f"{label[-2:]} {percent:3.0f}%"[: max(0, width)]
+        return f"{label[-2:]} {percent:3.0f}%"[: max(0, width)]
+
+
+def pig_mascot_lines(phase: int) -> list[str]:
+    blink = (phase // 10) % 18 == 0
+    grin_frames = ["\\____/", "\\_u__/", "\\____/", "\\_v__/"]
+    eyes = "--  --" if blink else "oo  oo" if (phase // 18) % 5 else "^^  ^^"
+    ear_tip = "~" if (phase // 9) % 2 else "^"
+    return [
+        f"   /{ear_tip}\\   _.._   /{ear_tip}\\  ",
+        "  /  `.'    `.'  \\ ",
+        f" |    {eyes}    |",
+        " |    .-oo-.    |",
+        f" |    {grin_frames[(phase // 7) % len(grin_frames)]:^6}    |",
+        "  '._  ----  _.'  ",
+    ]
 
 
 def draw_header(screen: curses.window, width: int, phase: int, static: dict[str, Any], config: HudConfig) -> int:
     screen.erase()
     now_text = time.strftime("%Y-%m-%d %H:%M:%S")
-    if width >= 118:
-        eyes = "--" if (phase // 12) % 14 == 0 else "oo"
+    if width >= 118 and config.layout_name != "compact":
         title_lines = [
             " ____            _          _   _ _   _ ____  ",
             "|  _ \\ ___  _ __| | ___   _| | | | | | |  _ \\ ",
@@ -993,14 +2116,7 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
             "|_|   \\___/|_|  |_|\\_\\\\__, |_| |_|\\___/|____/ ",
             "                       |___/                  ",
         ]
-        mascot_lines = [
-            "   /\\ .--. /\\  ",
-            "  /  \\____/  \\ ",
-            f" |    {eyes}    | ",
-            " |    (oo)    | ",
-            "  \\  \\____/  / ",
-            "   '-.____.-'  ",
-        ]
+        mascot_lines = pig_mascot_lines(phase)
         for idx, line in enumerate(title_lines):
             attr = curses.color_pair(2) | curses.A_BOLD if idx in (0, 2) else curses.color_pair(1)
             safe_add(screen, idx, 2, line, attr)
@@ -1011,7 +2127,7 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
         safe_add(screen, 1, max(58, width - len(now_text) - 3), now_text, curses.color_pair(6) | curses.A_BOLD)
         rig = f"{static.get('chip', 'Mac')} / {static.get('model', '')}".strip()
         safe_add(screen, 3, max(58, width - len(rig) - 3), rig[: max(0, width - 62)], curses.color_pair(1))
-        meta = f"{COPYRIGHT_TEXT}  |  theme {config.theme_name}"
+        meta = f"{COPYRIGHT_TEXT}  |  {config.theme_name} / {config.layout_name}"
         safe_add(screen, 5, max(58, width - len(meta) - 3), meta, curses.color_pair(7) | curses.A_BOLD)
         divider = list("-" * (width - 2))
         head = (phase * 3) % max(1, width - 2)
@@ -1025,7 +2141,7 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
     title = " P O R K Y H U D "
     safe_add(screen, 0, 1, title, curses.color_pair(2) | curses.A_BOLD)
     safe_add(screen, 0, max(1, width - len(now_text) - 2), now_text, curses.color_pair(6) | curses.A_BOLD)
-    meta = f"{COPYRIGHT_TEXT} | {config.theme_name}"
+    meta = f"{COPYRIGHT_TEXT} | {config.theme_name} / {config.layout_name}"
     safe_add(screen, 1, max(1, width - len(meta) - 2), meta[: max(0, width - 3)], curses.color_pair(7))
     divider = list("-" * (width - 2))
     divider[(phase * 2) % max(1, width - 2)] = "*"
@@ -1047,8 +2163,9 @@ def draw_cpu_panel(
     draw_box(screen, y, x, h, w, "CPU WORKER CORES", curses.color_pair(5))
     if h < 5:
         return
-    total = cpu_total_percent(per_core)
-    logical = static.get("logical_cpu") or str(len(per_core) or "?")
+    display_core, labels = display_core_usage(per_core, static)
+    total = cpu_total_percent(display_core)
+    logical = static.get("logical_cpu") or str(len(display_core) or "?")
     physical = static.get("physical_cpu") or "?"
     core_line = static.get("cpu_cores") or f"{physical} physical / {logical} logical"
     safe_add(screen, y + 1, x + 2, f"{static.get('chip', 'CPU')}"[: w - 4], curses.color_pair(1) | curses.A_BOLD)
@@ -1058,11 +2175,11 @@ def draw_cpu_panel(
 
     lanes_start = y + 6
     lanes_available = max(0, h - 7)
-    if not per_core or lanes_available <= 0:
+    if not display_core or lanes_available <= 0:
         safe_add(screen, y + 6, x + 2, "per-core stream unavailable", curses.color_pair(3))
         return
 
-    groups = cpu_groups(static, len(per_core))
+    groups = cpu_groups(static, len(display_core))
     columns = cpu_group_columns(w)
     col_width = (w - 4) // columns
     row_y = lanes_start
@@ -1083,8 +2200,8 @@ def draw_cpu_panel(
                 hidden += 1
                 continue
             cx = x + 2 + column * col_width
-            pct = per_core[core_index]
-            core_label = f"{group['code']}{offset:02d}"
+            pct = display_core[core_index]
+            core_label = labels[core_index] if core_index < len(labels) else f"{group['code']}{offset:02d}"
             safe_add(screen, cy, cx, cpu_lane_text(core_label, core_index, pct, max(1, col_width - 1), phase), color_for_percent(pct))
         row_y += (group["count"] + columns - 1) // columns
     if hidden:
@@ -1220,31 +2337,132 @@ def draw_thermal_panel(
         (f"battery skin: {format_temp(battery.temp_c)}", temp_attr(battery.temp_c)),
         (f"virtual pack: {format_temp(battery.virtual_temp_c)}", temp_attr(battery.virtual_temp_c)),
     ]
+    exposed_count = 0
+    if sensor.cpu_temp_c is not None:
+        lines.append((f"processor temp: {format_temp(sensor.cpu_temp_c)}", temp_attr(sensor.cpu_temp_c)))
+        exposed_count += 1
+    if sensor.gpu_temp_c is not None:
+        lines.append((f"graphics temp:  {format_temp(sensor.gpu_temp_c)}", temp_attr(sensor.gpu_temp_c)))
+        exposed_count += 1
+    if sensor.fan_rpm is not None:
+        fan_prefix = f"{sensor.fan_count} fans" if sensor.fan_count > 1 else "fan"
+        lines.append((f"{fan_prefix}: {fan_text(sensor)}", curses.color_pair(2)))
+        exposed_count += 1
     if sensor.privileged_locked:
-        lines.append(("advanced: press u to unlock", curses.color_pair(3) | curses.A_BOLD))
+        locked_text = "power sampler: press u" if exposed_count else "advanced: press u to unlock"
+        lines.append((locked_text, curses.color_pair(3) | curses.A_BOLD))
     else:
-        exposed_count = 0
-        if sensor.cpu_temp_c is not None:
-            lines.append((f"processor temp: {format_temp(sensor.cpu_temp_c)}", temp_attr(sensor.cpu_temp_c)))
-            exposed_count += 1
-        if sensor.gpu_temp_c is not None:
-            lines.append((f"graphics temp:  {format_temp(sensor.gpu_temp_c)}", temp_attr(sensor.gpu_temp_c)))
-            exposed_count += 1
-        if sensor.fan_rpm is not None:
-            lines.append((f"fan: {fan_text(sensor)}", curses.color_pair(2)))
-            exposed_count += 1
         if sensor.cpu_power_w is not None:
             lines.append((f"cpu power: {format_watts(sensor.cpu_power_w)}", curses.color_pair(1)))
             exposed_count += 1
         if sensor.gpu_power_w is not None:
             lines.append((f"gpu power: {format_watts(sensor.gpu_power_w)}", curses.color_pair(1)))
             exposed_count += 1
+        if sensor.ane_power_w is not None:
+            lines.append((f"ane power: {format_watts(sensor.ane_power_w)}", curses.color_pair(9)))
+            exposed_count += 1
+        if sensor.dram_power_w is not None:
+            bw = ""
+            if sensor.dram_read_gbs is not None or sensor.dram_write_gbs is not None:
+                bw = f"  bw {(sensor.dram_read_gbs or 0) + (sensor.dram_write_gbs or 0):.1f}GB/s"
+            lines.append((f"dram power: {format_watts(sensor.dram_power_w)}{bw}", curses.color_pair(10)))
+            exposed_count += 1
+        if sensor.package_power_w is not None:
+            lines.append((f"package: {format_watts(sensor.package_power_w)}", curses.color_pair(6) | curses.A_BOLD))
+            exposed_count += 1
         if exposed_count == 0:
             lines.append(("advanced: no extra sensors exposed", curses.color_pair(3)))
+    cluster_bits = []
+    for code, active, freq in (
+        ("E", sensor.e_cluster_active, sensor.e_cluster_freq_mhz),
+        ("P", sensor.p_cluster_active, sensor.p_cluster_freq_mhz),
+        ("S", sensor.s_cluster_active, sensor.s_cluster_freq_mhz),
+    ):
+        if active is not None or freq is not None:
+            active_text = "--" if active is None else f"{active:.0f}%"
+            freq_text = "--" if freq is None else f"{freq}MHz"
+            cluster_bits.append(f"{code} {active_text}/{freq_text}")
+    if cluster_bits:
+        lines.append(("clusters: " + "  ".join(cluster_bits), curses.color_pair(2)))
     if h > 10:
         lines.append((f"sensor bus: {comet(max(8, w - 18), phase, 0.85)}", curses.color_pair(2)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
         safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+
+
+def draw_sensors_panel(
+    screen: curses.window,
+    y: int,
+    x: int,
+    h: int,
+    w: int,
+    battery: BatteryInfo,
+    sensor: SensorInfo,
+    phase: int,
+) -> None:
+    draw_box(screen, y, x, h, w, "FANS + TEMP SENSORS", curses.color_pair(5))
+    if h < 5:
+        return
+
+    line_y = y + 1
+    source = sensor.raw_hint.replace("smc", "SMC")
+    if sensor.privileged_locked and sensor.raw_hint.startswith("smc"):
+        source = "SMC online / power locked"
+    safe_add(screen, line_y, x + 2, source[: w - 4], curses.color_pair(6) | curses.A_BOLD)
+    line_y += 1
+
+    if sensor.fans:
+        safe_add(screen, line_y, x + 2, f"fan array: {sensor.fan_count} active", curses.color_pair(2) | curses.A_BOLD)
+        line_y += 1
+        fan_rows = min(len(sensor.fans), max(1, (h - 6) // 3 + 1))
+        for index, fan in enumerate(sensor.fans[:fan_rows]):
+            if line_y >= y + h - 1:
+                break
+            pct = fan_percent(fan)
+            bar_width = max(6, min(18, w - 28))
+            mode = f" {fan.mode}" if fan.mode else ""
+            max_text = f"/{fan.maximum_rpm}" if fan.maximum_rpm else ""
+            line = f"{fan.name:<7.7} {pulse_bar(pct, bar_width, phase + index, '')} {fan.rpm}{max_text}rpm{mode}"
+            safe_add(screen, line_y, x + 2, line[: w - 4], fan_attr(fan))
+            line_y += 1
+            if line_y < y + h - 1 and (fan.minimum_rpm or fan.target_rpm or fan.maximum_rpm):
+                bounds = f"min {format_optional_int(fan.minimum_rpm)}  target {format_optional_int(fan.target_rpm)}  max {format_optional_int(fan.maximum_rpm)}"
+                safe_add(screen, line_y, x + 4, bounds[: w - 6], curses.color_pair(7))
+                line_y += 1
+    else:
+        text = "fans: press u or SMC unavailable" if sensor.privileged_locked else "fans: none exposed"
+        safe_add(screen, line_y, x + 2, text[: w - 4], curses.color_pair(3))
+        line_y += 1
+
+    quick_temps = [
+        ("CPU", sensor.cpu_temp_c),
+        ("GPU", sensor.gpu_temp_c),
+        ("BAT", battery.temp_c),
+    ]
+    for label, value in quick_temps:
+        if line_y >= y + h - 1 or value is None:
+            continue
+        width_for_bar = max(6, w - 20)
+        safe_add(screen, line_y, x + 2, pulse_bar(clamp(value), width_for_bar, phase, f"{label:<3} ")[: w - 4], temp_attr(value))
+        line_y += 1
+
+    rows = temperature_group_rows(sensor.temp_sensors)
+    if rows and line_y < y + h - 1:
+        safe_add(screen, line_y, x + 2, "hottest groups", curses.color_pair(6) | curses.A_BOLD)
+        line_y += 1
+    for label, average, hottest, count in rows:
+        if line_y >= y + h - 1:
+            break
+        line = f"{label:<13.13} avg {average:4.1f}C  max {hottest:4.1f}C  n={count}"
+        safe_add(screen, line_y, x + 2, line[: w - 4], temp_attr(hottest))
+        line_y += 1
+
+    if line_y < y + h - 1:
+        if sensor.temp_sensors:
+            line = f"sensor sweep {comet(max(8, w - 16), phase + 5, 0.75)}"
+        else:
+            line = "temperature sensors: no detail exposed"
+        safe_add(screen, line_y, x + 2, line[: w - 4], curses.color_pair(2))
 
 
 def draw_gpu_panel(
@@ -1269,36 +2487,51 @@ def draw_gpu_panel(
         if line_y >= y + h - 1:
             break
         name = gpu.get("name", "GPU")
-        cores = gpu.get("cores", "")
+        cores = gpu.get("cores", "") or str(static.get("gpu_core_count") or "")
         core_text = f" [{cores} GPU cores]" if cores else ""
         safe_add(screen, line_y, x + 2, f"{name}{core_text}"[: w - 4], curses.color_pair(2) | curses.A_BOLD)
         line_y += 1
+        if line_y < y + h - 1 and sensor.gpu_active_percent is not None:
+            safe_add(screen, line_y, x + 2, pulse_bar(sensor.gpu_active_percent, max(8, w - 18), phase, "active "), color_for_percent(sensor.gpu_active_percent))
+            line_y += 1
         if cores and line_y < y + h - 1:
             try:
                 core_count = int(cores)
             except ValueError:
                 core_count = 12
             lane_width = min(max(8, w - 12), max(8, core_count))
+            fill_char, dim_char, hot_char = ("█", "░", "◆") if unicode_ok() else ("#", ".", "@")
             cells = []
             for idx in range(lane_width):
                 if idx == (phase % lane_width):
-                    cells.append("@")
+                    cells.append(hot_char)
                 elif (idx + phase) % 5 == 0:
-                    cells.append("*")
+                    cells.append("•" if unicode_ok() else "*")
                 else:
-                    cells.append("#" if idx < min(core_count, lane_width) else ".")
+                    cells.append(fill_char if idx < min(core_count, lane_width) else dim_char)
             safe_add(screen, line_y, x + 2, f"cores: [{''.join(cells)}]"[: w - 4], curses.color_pair(2))
             line_y += 1
         if line_y < y + h - 1:
             safe_add(screen, line_y, x + 2, f"shader: {comet(max(8, w - 14), phase * 2, 0.9)}"[: w - 4], curses.color_pair(6))
             line_y += 1
-        if line_y < y + h - 1 and (sensor.gpu_temp_c is not None or sensor.gpu_power_w is not None):
+        if line_y < y + h - 1 and (sensor.gpu_temp_c is not None or sensor.gpu_power_w is not None or sensor.gpu_freq_mhz is not None):
             stats = []
             if sensor.gpu_temp_c is not None:
                 stats.append(f"temp: {format_temp(sensor.gpu_temp_c)}")
             if sensor.gpu_power_w is not None:
                 stats.append(f"power: {format_watts(sensor.gpu_power_w)}")
+            if sensor.gpu_sram_power_w is not None:
+                stats.append(f"sram: {format_watts(sensor.gpu_sram_power_w)}")
+            if sensor.gpu_freq_mhz is not None:
+                stats.append(f"freq: {sensor.gpu_freq_mhz}MHz")
             safe_add(screen, line_y, x + 2, "  ".join(stats)[: w - 4], temp_attr(sensor.gpu_temp_c))
+            line_y += 1
+        peak = gpu.get("max_freq_mhz") or str(static.get("max_gpu_freq_mhz") or "")
+        fp32 = static.get("gpu_fp32_tflops")
+        if line_y < y + h - 1 and (peak or fp32):
+            peak_text = f"peak {peak}MHz" if peak else "peak freq unknown"
+            fp32_text = f"  {fp32:.1f} TFLOPS est" if isinstance(fp32, float) else ""
+            safe_add(screen, line_y, x + 2, f"{peak_text}{fp32_text}"[: w - 4], curses.color_pair(8))
             line_y += 1
         metal = gpu.get("metal", "")
         if metal and line_y < y + h - 1:
@@ -1320,6 +2553,7 @@ def draw_io_panel(
     h: int,
     w: int,
     disk: DiskInfo,
+    activity: DiskActivity,
     net_down: float,
     net_up: float,
     history: MetricHistory,
@@ -1333,6 +2567,7 @@ def draw_io_panel(
     lines = [
         (pulse_bar(disk_pct, max(8, w - 18), phase, "disk "), color_for_percent(disk_pct)),
         (f"{disk.label} {human_bytes(disk.used)} / {human_bytes(disk.total)}  free {human_bytes(disk.free)}", curses.color_pair(1)),
+        (f"disk live {human_bytes(activity.bytes_per_sec)}/s  {activity.iops:.0f} iops", curses.color_pair(10) | curses.A_BOLD),
         (f"net d {human_bytes(net_down)}/s  u {human_bytes(net_up)}/s", curses.color_pair(2) | curses.A_BOLD),
         (f"net 60s  {sparkline(history.net, net_spark_width, None)} {net_peak_text}", curses.color_pair(6)),
         (f"disk 60s {sparkline(history.disk, max(8, w - 18), 100.0)}", curses.color_pair(2)),
@@ -1358,7 +2593,7 @@ def draw_process_panel(
     if h < 5:
         return
     compact = w < 58
-    header = " PID     CPU%  MEM% ST   COMMAND" if compact else " PID      CPU%  MEM%  ST     ELAPSED    COMMAND"
+    header = " PID     CPU%  MEM%  GPU ST   COMMAND" if compact else " PID      CPU%  MEM%  GPU% ST     ELAPSED    COMMAND"
     safe_add(screen, y + 1, x + 1, header[: w - 2], curses.color_pair(6) | curses.A_BOLD)
     safe_add(screen, y + 2, x + 1, "-" * (w - 2), curses.color_pair(5))
 
@@ -1367,30 +2602,30 @@ def draw_process_panel(
     for index, row in enumerate(rows[scroll : scroll + body_height]):
         line_y = y + 3 + index
         if compact:
-            command_width = max(10, w - 28)
+            command_width = max(10, w - 34)
             line = (
-                f"{row.pid:>6} {row.cpu:6.1f} {row.mem:5.1f} "
+                f"{row.pid:>6} {row.cpu:6.1f} {row.mem:5.1f} {row.gpu:4.0f} "
                 f"{row.stat:<4.4} {visible_command(row.command, command_width)}"
             )
         else:
-            command_width = max(8, w - 43)
+            command_width = max(8, w - 49)
             line = (
-                f"{row.pid:>6}  {row.cpu:6.1f} {row.mem:5.1f}  "
+                f"{row.pid:>6}  {row.cpu:6.1f} {row.mem:5.1f} {row.gpu:5.1f} "
                 f"{row.stat:<5.5} {row.etime:>9.9}  {visible_command(row.command, command_width)}"
             )
         attr = curses.color_pair(1)
-        if row.cpu >= 80:
+        if row.cpu >= 80 or row.gpu >= 80:
             attr = curses.color_pair(4) | curses.A_BOLD
-        elif row.cpu >= 35:
+        elif row.cpu >= 35 or row.gpu >= 35:
             attr = curses.color_pair(3) | curses.A_BOLD
         elif index % 2:
             attr = curses.color_pair(7)
         safe_add(screen, line_y, x + 1, line[: w - 2], attr)
 
     if compact:
-        footer = f"{len(rows)} procs {scroll + 1}-{min(len(rows), scroll + body_height)} | q quit | m sort | arrows/page"
+        footer = f"{len(rows)} procs {scroll + 1}-{min(len(rows), scroll + body_height)} | m CPU/MEM/GPU | arrows/page"
     else:
-        footer = f"{len(rows)} processes  scroll {scroll + 1}-{min(len(rows), scroll + body_height)}  q quit | m CPU/MEM | arrows/page scroll"
+        footer = f"{len(rows)} processes  scroll {scroll + 1}-{min(len(rows), scroll + body_height)}  m sort CPU/MEM/GPU | arrows/page"
     safe_add(screen, y + h - 1, x + 2, footer[: w - 4], curses.color_pair(6) | curses.A_BOLD)
 
 
@@ -1406,19 +2641,25 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
     y = max(2, (height - h) // 2)
     x = max(2, (width - w) // 2)
     draw_box(screen, y, x, h, w, "SHORTCUTS", curses.color_pair(6) | curses.A_BOLD)
-    unlock_state = "online" if not sensor.privileged_locked else "locked"
+    if not sensor.privileged_locked:
+        unlock_state = "online"
+    elif sensor.raw_hint.startswith("smc"):
+        unlock_state = "SMC online / power locked"
+    else:
+        unlock_state = "locked"
     lines = [
         "q / Esc       quit",
         "h / ?         show or hide this panel",
         "t             cycle theme",
+        "l             cycle terminal layout",
         "a             animation: off / calm / vivid",
-        "m             sort process grid by CPU or memory",
+        "m             sort process grid by CPU, memory, or GPU",
         "r             rescan system and sensor data",
         "u             unlock advanced macOS sensors with sudo",
         "arrows/j/k    scroll processes",
         "PgUp/PgDn     faster process scrolling",
         "",
-        f"theme: {config.theme_name}    sensors: {unlock_state}",
+        f"theme: {config.theme_name}    layout: {config.layout_name}    sensors: {unlock_state}",
         COPYRIGHT_TEXT,
     ]
     for index, line in enumerate(lines[: h - 2], start=1):
@@ -1436,16 +2677,16 @@ def init_colors(theme_index: int = 0) -> None:
     except curses.error:
         return
 
-    background = -1
+    background = curses.COLOR_BLACK
     try:
         curses.use_default_colors()
     except curses.error:
-        background = curses.COLOR_BLACK
+        pass
 
     theme = THEMES[theme_index % len(THEMES)]["colors"]
     for pair_id, foreground in theme.items():
         try:
-            curses.init_pair(pair_id, foreground, background)
+            curses.init_pair(pair_id, color_id(foreground), background)
         except curses.error:
             pass
 
@@ -1467,27 +2708,32 @@ def hud(screen: curses.window) -> None:
     screen.keypad(True)
     config = HudConfig()
     init_colors(config.theme_index)
+    apply_dark_screen(screen)
 
     static = collect_static_info()
     cpu_sampler = MacCpuSampler()
+    gpu_sampler = GPUProcessSampler()
     per_core = cpu_sampler.sample()
     rows: list[ProcessRow] = []
     sort_mode = "CPU"
     scroll = 0
     last_stats = 0.0
     last_process = 0.0
-    last_sensor = 0.0
     previous_net = network_bytes()
     previous_net_time = time.monotonic()
     net_down = 0.0
     net_up = 0.0
     mem = memory_stats()
     battery = battery_info()
-    sensor = sensor_info()
-    last_sensor = time.monotonic()
+    sensor = default_sensor_info()
+    sensor_poller = AsyncPoller(SENSOR_REFRESH_SECONDS, sensor_info, sensor)
     disk = disk_info()
+    activity = DiskActivity()
+    disk_activity_poller = AsyncPoller(DISK_ACTIVITY_REFRESH_SECONDS, disk_activity, activity)
     history = MetricHistory()
     history.add(cpu_total_percent(per_core), ram_percent(mem), 0.0, disk_percent(disk))
+    force_sensor = True
+    force_disk_activity = True
 
     while True:
         now = time.monotonic()
@@ -1500,7 +2746,12 @@ def hud(screen: curses.window) -> None:
         elif key in (ord("t"), ord("T")):
             config.theme_index = (config.theme_index + 1) % len(THEMES)
             init_colors(config.theme_index)
+            apply_dark_screen(screen)
             set_message(config, f"theme switched to {config.theme_name}")
+        elif key in (ord("l"), ord("L")):
+            config.layout_index = (config.layout_index + 1) % len(LAYOUTS)
+            scroll = 0
+            set_message(config, f"layout switched to {config.layout_name}")
         elif key in (ord("a"), ord("A")):
             config.animation_mode = (config.animation_mode + 1) % 3
             labels = ["off", "calm", "vivid"]
@@ -1508,13 +2759,15 @@ def hud(screen: curses.window) -> None:
         elif key in (ord("u"), ord("U")):
             if unlock_privileged_sensors(screen):
                 sensor = sensor_info()
-                last_sensor = time.monotonic()
+                sensor_poller.value = sensor
+                force_sensor = True
                 set_message(config, "advanced sensor session unlocked")
             else:
                 set_message(config, "advanced sensor unlock skipped")
         elif key in (ord("m"), ord("M")):
-            sort_mode = "MEM" if sort_mode == "CPU" else "CPU"
-            rows = process_rows(sort_mode)
+            sort_modes = ["CPU", "MEM", "GPU"]
+            sort_mode = sort_modes[(sort_modes.index(sort_mode) + 1) % len(sort_modes)]
+            rows = process_rows(sort_mode, gpu_sampler, sensor.gpu_active_percent)
             scroll = 0
             last_process = now
             set_message(config, f"process sort: {sort_mode}")
@@ -1533,8 +2786,14 @@ def hud(screen: curses.window) -> None:
         elif key in (ord("r"), ord("R")):
             last_stats = 0.0
             last_process = 0.0
-            last_sensor = 0.0
+            force_sensor = True
+            force_disk_activity = True
             set_message(config, "rescanning system state")
+
+        sensor = sensor_poller.tick(now, force_sensor) or sensor
+        activity = disk_activity_poller.tick(now, force_disk_activity) or activity
+        force_sensor = False
+        force_disk_activity = False
 
         if now - last_stats >= REFRESH_SECONDS:
             sampled = cpu_sampler.sample()
@@ -1552,12 +2811,8 @@ def hud(screen: curses.window) -> None:
             history.add(cpu_total_percent(per_core), ram_percent(mem), net_down + net_up, disk_percent(disk))
             last_stats = now
 
-        if now - last_sensor >= SENSOR_REFRESH_SECONDS:
-            sensor = sensor_info()
-            last_sensor = now
-
         if now - last_process >= PROCESS_REFRESH_SECONDS:
-            rows = process_rows(sort_mode)
+            rows = process_rows(sort_mode, gpu_sampler, sensor.gpu_active_percent)
             last_process = now
 
         height, width = screen.getmaxyx()
@@ -1576,30 +2831,62 @@ def hud(screen: curses.window) -> None:
         body_height = height - header_h - 1
 
         if width >= 118 and height >= 34:
+            layout = config.layout_name
             left_x = 1
-            left_width = 38
+            if layout in ("io", "thermals"):
+                left_width = 46
+            elif layout == "compute":
+                left_width = 34
+            elif layout == "compact":
+                left_width = 36
+            else:
+                left_width = 38
             center_x = left_x + left_width + 1
-            min_right_width = 48 if width >= 132 else 34
-            center_width = max(44, min(72, width - left_width - min_right_width - 4))
+            if layout == "processes":
+                min_right_width = max(56, width * 43 // 100)
+            elif layout == "compute":
+                min_right_width = 36
+            elif layout == "cinema":
+                min_right_width = 40
+            else:
+                min_right_width = 48 if width >= 132 else 34
+            center_cap = 96 if layout in ("compute", "cinema") else 72
+            center_width = max(44, min(center_cap, width - left_width - min_right_width - 4))
             right_x = center_x + center_width + 1
             right_width = width - right_x - 1
             body_y = header_h
 
-            system_h = 8
-            power_h = 9
-            thermal_h = 10
-            io_h = max(7, body_height - system_h - power_h - thermal_h)
-            draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery)
-            draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
-            draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
-            draw_io_panel(screen, body_y + system_h + power_h + thermal_h, left_x, io_h, left_width, disk, net_down, net_up, history, phase)
+            if layout == "thermals":
+                system_h, power_h, thermal_h, sensors_h = proportional_heights(body_height, [(6, 0), (6, 0), (7, 1), (9, 4)])
+                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery)
+                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
+                draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
+                draw_sensors_panel(screen, body_y + system_h + power_h + thermal_h, left_x, sensors_h, left_width, battery, sensor, phase)
+            elif layout == "io":
+                system_h, power_h, sensors_h, io_h = proportional_heights(body_height, [(6, 0), (6, 0), (7, 1), (8, 4)])
+                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery)
+                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
+                draw_sensors_panel(screen, body_y + system_h + power_h, left_x, sensors_h, left_width, battery, sensor, phase)
+                draw_io_panel(screen, body_y + system_h + power_h + sensors_h, left_x, io_h, left_width, disk, activity, net_down, net_up, history, phase)
+            else:
+                compact_left = layout == "compact"
+                system_h, power_h, thermal_h, io_h = proportional_heights(
+                    body_height,
+                    [(5 if compact_left else 7, 0), (5 if compact_left else 7, 0), (6 if compact_left else 8, 1), (7, 3)],
+                )
+                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery)
+                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
+                draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
+                draw_io_panel(screen, body_y + system_h + power_h + thermal_h, left_x, io_h, left_width, disk, activity, net_down, net_up, history, phase)
 
-            min_gpu_h = 7
-            min_mem_h = 8
-            target_cpu_h = max(16, cpu_panel_required_height(center_width, len(per_core), static))
-            cpu_h = max(10, min(target_cpu_h, body_height - min_gpu_h - min_mem_h))
-            gpu_h = min(10, max(min_gpu_h, body_height - cpu_h - min_mem_h))
-            mem_h = max(min_mem_h, body_height - cpu_h - gpu_h)
+            if layout == "compute":
+                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(18, 5), (10, 2), (7, 1)])
+            elif layout == "cinema":
+                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(16, 4), (10, 3), (7, 1)])
+            elif layout == "compact":
+                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(11, 3), (6, 1), (6, 1)])
+            else:
+                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(14, 4), (8, 2), (7, 2)])
             draw_cpu_panel(screen, body_y, center_x, cpu_h, center_width, per_core, static, history, phase)
             draw_gpu_panel(screen, body_y + cpu_h, center_x, gpu_h, center_width, static, sensor, phase)
             draw_memory_panel(screen, body_y + cpu_h + gpu_h, center_x, mem_h, center_width, mem, history, phase)
@@ -1622,14 +2909,19 @@ def hud(screen: curses.window) -> None:
             power_h = max(5, top_height - sys_h)
             cpu_h = top_height
             lower_h = height - (header_h + top_height) - 1
-            thermal_h = min(8, max(5, lower_h // 2))
-            gpu_h = max(4, lower_h - thermal_h)
 
             draw_system_panel(screen, header_h, left_x, sys_h, left_width, static, battery)
             draw_battery_panel(screen, header_h + sys_h, left_x, power_h, left_width, battery, phase)
             draw_cpu_panel(screen, header_h, right_x, cpu_h, right_width, per_core, static, history, phase)
-            draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
-            draw_gpu_panel(screen, header_h + top_height + thermal_h, left_x, gpu_h, left_width, static, sensor, phase)
+            if lower_h >= 16:
+                thermal_h, sensors_h, gpu_h = proportional_heights(lower_h, [(5, 1), (6, 2), (5, 1)])
+                draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
+                draw_sensors_panel(screen, header_h + top_height + thermal_h, left_x, sensors_h, left_width, battery, sensor, phase)
+                draw_gpu_panel(screen, header_h + top_height + thermal_h + sensors_h, left_x, gpu_h, left_width, static, sensor, phase)
+            else:
+                thermal_h, gpu_h = proportional_heights(lower_h, [(5, 1), (4, 1)])
+                draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
+                draw_gpu_panel(screen, header_h + top_height + thermal_h, left_x, gpu_h, left_width, static, sensor, phase)
 
             proc_y = header_h + top_height
             proc_h = height - proc_y - 1
@@ -1640,7 +2932,7 @@ def hud(screen: curses.window) -> None:
         if config.show_help:
             draw_help_overlay(screen, config, sensor)
 
-        status = "h help  t theme  a motion  u sensors  m sort  r rescan  q quit"
+        status = "h help  t theme  l layout  a motion  u sensors  m sort CPU/MEM/GPU  r rescan  q quit"
         if config.message and now < config.message_until:
             status = f"{config.message} | {status}"
         safe_add(screen, height - 1, 1, status[: width - 2], curses.color_pair(6))
@@ -1648,7 +2940,85 @@ def hud(screen: curses.window) -> None:
         time.sleep(0.08)
 
 
-def main() -> int:
+def collect_snapshot() -> dict[str, Any]:
+    static = collect_static_info()
+    cpu_sampler = MacCpuSampler()
+    time.sleep(0.25)
+    per_core = cpu_sampler.sample()
+    mem = memory_stats()
+    battery = battery_info()
+    sensor = sensor_info()
+    disk = disk_info()
+    activity = disk_activity()
+    gpu_sampler = GPUProcessSampler()
+    gpu_sampler.sample(sensor.gpu_active_percent)
+    time.sleep(0.5)
+    rows = process_rows("CPU", gpu_sampler, sensor.gpu_active_percent)[:12]
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "system": static,
+        "cpu": {
+            "average_percent": cpu_total_percent(per_core),
+            "cores": [
+                {"label": label, "percent": percent}
+                for percent, label in zip(*display_core_usage(per_core, static))
+            ],
+        },
+        "memory": {
+            "used_percent": ram_percent(mem),
+            "used_bytes": mem.get("used", 0.0),
+            "total_bytes": mem.get("total", 0.0),
+            "swap_used_bytes": mem.get("swap_used", 0.0),
+            "swap_total_bytes": mem.get("swap_total", 0.0),
+        },
+        "battery": asdict(battery),
+        "sensors": asdict(sensor),
+        "disk": {
+            "capacity": asdict(disk),
+            "activity": asdict(activity),
+        },
+        "processes": [asdict(row) for row in rows],
+    }
+
+
+def print_text_snapshot(snapshot: dict[str, Any]) -> None:
+    system = snapshot["system"]
+    cpu = snapshot["cpu"]
+    memory = snapshot["memory"]
+    sensors = snapshot["sensors"]
+    disk = snapshot["disk"]
+    print("PorkyHUD snapshot")
+    print(f"Mac: {system.get('chip', 'Mac')} / {system.get('model', '')}")
+    print(f"CPU: {cpu['average_percent']:.1f}% across {len(cpu['cores'])} sampled workers")
+    print(f"RAM: {human_bytes(memory['used_bytes'])} / {human_bytes(memory['total_bytes'])} ({memory['used_percent']:.1f}%)")
+    print(f"Thermal: {sensors.get('thermal_warning')}  Package: {format_watts(sensors.get('package_power_w'))}")
+    fan_rows = sensors.get("fans") or []
+    if fan_rows:
+        print("Fans: " + ", ".join(f"{fan['name']} {fan['rpm']}rpm" for fan in fan_rows[:4]))
+    temp_rows = sensors.get("temp_sensors") or []
+    if temp_rows:
+        hottest = ", ".join(f"{temp['name']} {temp['value_c']:.1f}C" for temp in temp_rows[:4])
+        print(f"Hottest sensors: {hottest}")
+    print(f"Disk: {human_bytes(disk['activity']['bytes_per_sec'])}/s, {disk['activity']['iops']:.0f} iops")
+    print("Top processes:")
+    for row in snapshot["processes"][:8]:
+        print(f"  {row['pid']:>6} CPU {row['cpu']:5.1f}% MEM {row['mem']:4.1f}% GPU {row['gpu']:4.1f}%  {visible_command(row['command'], 72)}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="PorkyHUD terminal system monitor for macOS.")
+    parser.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
+    parser.add_argument("--snapshot", action="store_true", help="print one text snapshot and exit")
+    args = parser.parse_args(argv)
+    if args.json or args.snapshot:
+        snapshot = collect_snapshot()
+        if args.json:
+            print(json.dumps(snapshot, indent=2, sort_keys=True))
+        else:
+            print_text_snapshot(snapshot)
+        return 0
+
+    enforce_dark_terminal()
     try:
         curses.wrapper(hud)
         return 0
@@ -1660,4 +3030,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
