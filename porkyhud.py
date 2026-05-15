@@ -33,6 +33,7 @@ REFRESH_SECONDS = 1.0
 PROCESS_REFRESH_SECONDS = 2.5
 SENSOR_REFRESH_SECONDS = 12.0
 DISK_ACTIVITY_REFRESH_SECONDS = 4.0
+VERSION = "0.1.0"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
 LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "compact", "cinema"]
@@ -3103,6 +3104,7 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PorkyHUD terminal system monitor for macOS.")
+    parser.add_argument("--version", action="version", version=f"PorkyHUD {VERSION}")
     parser.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
     parser.add_argument("--snapshot", action="store_true", help="print one text snapshot and exit")
     args = parser.parse_args(argv)

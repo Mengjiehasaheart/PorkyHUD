@@ -10,7 +10,23 @@ PorkyHUD is a portable, dependency free macOS terminal dashboard for system stat
   <sub>Demo profile.</sub>
 </p>
 
-## Run
+## Install
+
+Homebrew:
+
+```bash
+brew tap Dr-Matcha-Studio/porkyhud
+brew install porkyhud
+porkyhud
+```
+
+One-command install:
+
+```bash
+brew install Dr-Matcha-Studio/porkyhud/porkyhud
+```
+
+From a checkout:
 
 Double-click:
 
