@@ -15,7 +15,7 @@ PorkyHUD is a portable, dependency free macOS terminal dashboard for system stat
 Homebrew:
 
 ```bash
-brew tap Dr-Matcha-Studio/porkyhud
+brew tap Mengjiehasaheart/porkyhud
 brew install porkyhud
 porkyhud
 ```
@@ -23,7 +23,7 @@ porkyhud
 One-command install:
 
 ```bash
-brew install Dr-Matcha-Studio/porkyhud/porkyhud
+brew install Mengjiehasaheart/porkyhud/porkyhud
 ```
 
 From a checkout:
