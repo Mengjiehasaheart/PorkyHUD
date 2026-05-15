@@ -70,6 +70,7 @@ If admin access has not been granted, PorkyHUD shows one unlock hint. If admin a
 - Apple Silicon core labels use IORegistry topology with `hw.perflevel*` cross-checks, including M-series Performance/Super layouts.
 - Fan RPM and grouped temperature sensors use the same read-only SMC key model as the reference Mac app, with a dedicated thermal layout for quick inspection.
 - Process GPU attribution uses AGX `accumulatedGPUTime` deltas when macOS exposes them.
+- The bottom `read:` line turns the current signals into one plain sentence without expanding the layout.
 - CPU, RAM, network, and disk panels include compact 60-second sparklines.
 - Apple Silicon CPU workers are grouped by reported Performance, Efficiency, and Super clusters when macOS exposes the data.
 

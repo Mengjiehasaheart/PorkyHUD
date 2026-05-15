@@ -1442,6 +1442,11 @@ def boot_seconds() -> int:
 def memory_stats() -> dict[str, float]:
     total_raw = sysctl_value("hw.memsize")
     total = float(total_raw or 0)
+    if total <= 0:
+        try:
+            total = float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except (OSError, ValueError):
+            total = 0.0
     raw = run_command(["vm_stat"], timeout=1.5)
     page_match = re.search(r"page size of (\d+) bytes", raw)
     page_size = int(page_match.group(1)) if page_match else 4096
@@ -1550,10 +1555,13 @@ def sensor_info() -> SensorInfo:
     sysctl_thermal = thermal_level_from_sysctl()
     if sysctl_thermal is not None:
         thermal_warning = sysctl_thermal[0]
-    if "No thermal warning" not in therm_raw and therm_raw:
-        thermal_warning = "active"
-    if "No performance warning" not in therm_raw and therm_raw:
-        performance_warning = "active"
+    therm_lower = therm_raw.lower()
+    therm_error = "error:" in therm_lower or "failed to get" in therm_lower
+    if therm_raw and not therm_error:
+        if "no thermal warning" not in therm_lower:
+            thermal_warning = "active"
+        if "no performance warning" not in therm_lower:
+            performance_warning = "active"
 
     smc_fans, smc_temp_sensors = read_smc_sensors()
     smc_online = bool(smc_fans or smc_temp_sensors)
@@ -1961,6 +1969,84 @@ def temperature_group_rows(readings: list[TempReading]) -> list[tuple[str, float
     ]
     rows.sort(key=lambda item: item[2], reverse=True)
     return rows
+
+
+def simple_process_name(command: str) -> str:
+    app_match = re.search(r"/([^/]+)\.app(?:/|$)", command)
+    if app_match:
+        return app_match.group(1)
+    first = command.strip().split(None, 1)[0] if command.strip() else "a process"
+    name = os.path.basename(first) or first
+    return visible_command(name, 22)
+
+
+def system_read(
+    per_core: list[float],
+    mem: dict[str, float],
+    disk: DiskInfo,
+    activity: DiskActivity,
+    battery: BatteryInfo,
+    sensor: SensorInfo,
+    rows: list[ProcessRow],
+    net_down: float = 0.0,
+    net_up: float = 0.0,
+) -> tuple[str, str]:
+    cpu_pct = cpu_total_percent(per_core)
+    mem_pct = ram_percent(mem)
+    disk_pct = disk_percent(disk)
+    swap_total = mem.get("swap_total", 0.0)
+    swap_pct = mem.get("swap_used", 0.0) / swap_total * 100.0 if swap_total else 0.0
+    hottest = max(
+        [value for value in (sensor.cpu_temp_c, sensor.gpu_temp_c, battery.temp_c) if value is not None],
+        default=None,
+    )
+    max_fan_pct = max((fan_percent(fan) for fan in sensor.fans), default=0.0)
+    top_cpu = rows[0] if rows else None
+    top_gpu = max(rows, key=lambda row: row.gpu, default=None)
+    net_bps = net_down + net_up
+
+    if sensor.performance_warning not in ("nominal", "pending"):
+        return ("read: macOS is holding performance back; heat is the reason.", "hot")
+    if sensor.thermal_warning not in ("nominal", "pending"):
+        return ("read: Thermal pressure is active; fans need time to catch up.", "hot")
+    if hottest is not None and hottest >= 92 and cpu_pct >= 55:
+        return ("read: Hot CPU work is driving the machine right now.", "hot")
+    if hottest is not None and hottest >= 88 and max_fan_pct >= 80:
+        return ("read: Very warm, with fans already working hard.", "hot")
+    if mem_pct >= 90 or swap_pct >= 25:
+        return ("read: Memory is tight; closing heavy apps would help.", "hot")
+    if top_cpu and cpu_pct >= 72 and top_cpu.cpu >= 80:
+        return (f"read: CPU is busy; {simple_process_name(top_cpu.command)} is the main pull.", "watch")
+    if cpu_pct >= 72:
+        return ("read: CPU is busy; something is working hard.", "watch")
+    if top_gpu and (sensor.gpu_active_percent or top_gpu.gpu) >= 45:
+        name = simple_process_name(top_gpu.command) if top_gpu.gpu >= 8 else "graphics work"
+        return (f"read: GPU is busy; {name} is driving it.", "watch")
+    if max_fan_pct >= 75:
+        return ("read: Fans are high; this is a sustained workload.", "watch")
+    if sensor.package_power_w is not None and sensor.package_power_w >= 70:
+        return ("read: Power draw is high, but thermals still look controlled.", "watch")
+    if activity.bytes_per_sec >= 900_000_000 or activity.iops >= 15_000:
+        return ("read: Disk is moving a lot of data right now.", "watch")
+    if mem_pct >= 82:
+        return ("read: Memory use is high, but there is still room.", "watch")
+    if disk_pct >= 88:
+        return ("read: Storage is getting full; keep an eye on free space.", "watch")
+    if not battery.external_connected and (cpu_pct >= 45 or net_bps >= 25_000_000):
+        return ("read: Running hard on battery; runtime will drop.", "watch")
+    if hottest is not None and hottest >= 78 and cpu_pct < 30:
+        return ("read: Warm for a light load; charging or displays may be adding heat.", "watch")
+    if cpu_pct <= 25 and mem_pct <= 75 and (hottest is None or hottest <= 70):
+        return ("read: Quiet. Nothing unusual stands out.", "good")
+    return ("read: Normal workload; no obvious pressure right now.", "good")
+
+
+def read_attr(level: str) -> int:
+    if level == "hot":
+        return curses.color_pair(4) | curses.A_BOLD
+    if level == "watch":
+        return curses.color_pair(3) | curses.A_BOLD
+    return curses.color_pair(7)
 
 
 def display_core_usage(per_core: list[float], static: dict[str, Any]) -> tuple[list[float], list[str]]:
@@ -2828,7 +2914,8 @@ def hud(screen: curses.window) -> None:
         else:
             phase = int(now * 8)
         header_h = draw_header(screen, width, phase, static, config)
-        body_height = height - header_h - 1
+        footer_lines = 2 if height >= 24 else 1
+        body_height = height - header_h - footer_lines
 
         if width >= 118 and height >= 34:
             layout = config.layout_name
@@ -2908,7 +2995,7 @@ def hud(screen: curses.window) -> None:
             sys_h = max(5, min(7, top_height // 2))
             power_h = max(5, top_height - sys_h)
             cpu_h = top_height
-            lower_h = height - (header_h + top_height) - 1
+            lower_h = height - (header_h + top_height) - footer_lines
 
             draw_system_panel(screen, header_h, left_x, sys_h, left_width, static, battery)
             draw_battery_panel(screen, header_h + sys_h, left_x, power_h, left_width, battery, phase)
@@ -2924,7 +3011,7 @@ def hud(screen: curses.window) -> None:
                 draw_gpu_panel(screen, header_h + top_height + thermal_h, left_x, gpu_h, left_width, static, sensor, phase)
 
             proc_y = header_h + top_height
-            proc_h = height - proc_y - 1
+            proc_h = height - proc_y - footer_lines
             process_scroll_max = max(0, len(rows) - max(0, proc_h - 4))
             scroll = max(0, min(scroll, process_scroll_max))
             draw_process_panel(screen, proc_y, right_x, proc_h, right_width, rows, scroll, sort_mode)
@@ -2932,6 +3019,9 @@ def hud(screen: curses.window) -> None:
         if config.show_help:
             draw_help_overlay(screen, config, sensor)
 
+        if footer_lines == 2:
+            read_text, read_level = system_read(per_core, mem, disk, activity, battery, sensor, rows, net_down, net_up)
+            safe_add(screen, height - 2, 1, read_text[: width - 2], read_attr(read_level))
         status = "h help  t theme  l layout  a motion  u sensors  m sort CPU/MEM/GPU  r rescan  q quit"
         if config.message and now < config.message_until:
             status = f"{config.message} | {status}"
@@ -2954,8 +3044,13 @@ def collect_snapshot() -> dict[str, Any]:
     gpu_sampler.sample(sensor.gpu_active_percent)
     time.sleep(0.5)
     rows = process_rows("CPU", gpu_sampler, sensor.gpu_active_percent)[:12]
+    read_text, read_level = system_read(per_core, mem, disk, activity, battery, sensor, rows)
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "read": {
+            "message": read_text,
+            "level": read_level,
+        },
         "system": static,
         "cpu": {
             "average_percent": cpu_total_percent(per_core),
@@ -2988,6 +3083,7 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
     sensors = snapshot["sensors"]
     disk = snapshot["disk"]
     print("PorkyHUD snapshot")
+    print(snapshot.get("read", {}).get("message", "read: snapshot collected"))
     print(f"Mac: {system.get('chip', 'Mac')} / {system.get('model', '')}")
     print(f"CPU: {cpu['average_percent']:.1f}% across {len(cpu['cores'])} sampled workers")
     print(f"RAM: {human_bytes(memory['used_bytes'])} / {human_bytes(memory['total_bytes'])} ({memory['used_percent']:.1f}%)")
