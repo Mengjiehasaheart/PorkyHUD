@@ -31,14 +31,8 @@ echo "Diagnostics: ./porkyhud.py --snapshot or ./porkyhud.py --json"
 echo
 echo "Read-only fans and temperatures use AppleSMC when available."
 echo "Advanced CPU/GPU power and residency counters require administrator access on macOS."
-printf "Unlock advanced sensors now with sudo? [y/N] "
-read -r unlock_reply
-if [[ "$unlock_reply" == [Yy]* ]]; then
-  sudo -v
-  if [[ $? -ne 0 ]]; then
-    echo "Continuing without advanced sensor unlock."
-  fi
-fi
+echo "One-time advanced setup: ./porkyhud.py --setup-sensors"
+echo "Temporary session unlock inside the HUD: press u."
 echo
 
 /usr/bin/env python3 "$APP_DIR/porkyhud.py"

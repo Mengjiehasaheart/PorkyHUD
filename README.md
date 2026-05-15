@@ -26,6 +26,21 @@ One-command install:
 brew install Mengjiehasaheart/porkyhud/porkyhud
 ```
 
+Optional one-time advanced sensor setup:
+
+```bash
+porkyhud --setup-sensors
+```
+
+This asks for an administrator password once and installs `/etc/sudoers.d/porkyhud`, allowing admin users to run only the bounded `powermetrics` sample commands PorkyHUD uses. After that, normal launches can read advanced CPU/GPU power and residency data without another sensor password prompt.
+
+To check or remove it:
+
+```bash
+porkyhud --sensor-access-status
+porkyhud --remove-sensor-access
+```
+
 From a checkout:
 
 Double-click:
@@ -72,8 +87,8 @@ Most PorkyHUD data is available to a normal user account. PorkyHUD reads AppleSM
 
 PorkyHUD handles this in two ways:
 
-- At launch, it can ask whether to unlock advanced sensors with `sudo`.
-- Inside the dashboard, press `u` to try the unlock again.
+- Run `porkyhud --setup-sensors` once to install a narrow passwordless `powermetrics` rule for future launches.
+- Inside the dashboard, press `u` to try a temporary sudo session unlock without installing the rule.
 
 If admin access has not been granted, PorkyHUD shows one unlock hint. If admin access is available but the Mac model still does not publish a value, PorkyHUD hides that field instead of inventing a reading.
 

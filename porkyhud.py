@@ -22,6 +22,7 @@ import socket
 import struct
 import sys
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -33,13 +34,21 @@ REFRESH_SECONDS = 1.0
 PROCESS_REFRESH_SECONDS = 2.5
 SENSOR_REFRESH_SECONDS = 12.0
 DISK_ACTIVITY_REFRESH_SECONDS = 4.0
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
 LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "compact", "cinema"]
 DARK_BG_RGB = "#05070d"
 DARK_FG_RGB = "#e6f7ff"
 DARK_CURSOR_RGB = "#5df2ff"
+POWER_METRICS_PATH = "/usr/bin/powermetrics"
+VISUDO_PATH = "/usr/sbin/visudo"
+SUDOERS_PATH = "/etc/sudoers.d/porkyhud"
+POWER_METRICS_SAMPLER_SETS = [
+    "thermal,cpu_power,gpu_power,ane_power,battery,smc",
+    "thermal,cpu_power,gpu_power,ane_power,battery",
+    "all",
+]
 KERNEL_INDEX_SMC = 2
 SMC_CMD_READ_BYTES = 5
 SMC_CMD_READ_INDEX = 8
@@ -717,12 +726,128 @@ def read_smc_sensors() -> tuple[list[FanReading], list[TempReading]]:
         return [], []
 
 
+def powermetrics_args(samplers: str) -> list[str]:
+    return [
+        POWER_METRICS_PATH,
+        "--samplers",
+        samplers,
+        "--show-extra-power-info",
+        "-n",
+        "1",
+        "-i",
+        "1000",
+    ]
+
+
 def sudo_cached() -> bool:
     return subprocess.run(
         ["sudo", "-n", "-v"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     ).returncode == 0
+
+
+def advanced_sensor_access_available() -> bool:
+    if not os.path.exists(POWER_METRICS_PATH):
+        return False
+    command = powermetrics_args(POWER_METRICS_SAMPLER_SETS[0])
+    return subprocess.run(
+        ["sudo", "-n", "-l", *command],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def sudoers_contents() -> str:
+    command_lines = []
+    for samplers in POWER_METRICS_SAMPLER_SETS:
+        escaped_samplers = samplers.replace(",", r"\,")
+        command_lines.append(" ".join(powermetrics_args(escaped_samplers)))
+    return (
+        "# PorkyHUD advanced sensor access.\n"
+        "# Allows admin users to run PorkyHUD's bounded powermetrics samples without a password.\n"
+        f"Cmnd_Alias PORKYHUD_POWERMETRICS = {', '.join(command_lines)}\n"
+        "%admin ALL=(root) NOPASSWD: PORKYHUD_POWERMETRICS\n"
+    )
+
+
+def validate_sudoers_file(path: str) -> bool:
+    return subprocess.run([VISUDO_PATH, "-cf", path]).returncode == 0
+
+
+def install_sensor_access() -> int:
+    if platform.system() != "Darwin":
+        print("PorkyHUD sensor access setup is only available on macOS.")
+        return 1
+    if not os.path.exists(POWER_METRICS_PATH):
+        print(f"Cannot find {POWER_METRICS_PATH}. Advanced sensor setup was not installed.")
+        return 1
+    if not os.path.exists(VISUDO_PATH):
+        print(f"Cannot find {VISUDO_PATH}. Advanced sensor setup was not installed.")
+        return 1
+
+    contents = sudoers_contents()
+    fd, tmp_path = tempfile.mkstemp(prefix="porkyhud-sudoers-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(contents)
+        os.chmod(tmp_path, 0o440)
+        if not validate_sudoers_file(tmp_path):
+            print("Generated sudoers rule did not validate. Nothing was installed.")
+            return 1
+
+        print("PorkyHUD advanced sensor setup")
+        print(f"Installing {SUDOERS_PATH}")
+        print("This grants admin users passwordless access only to PorkyHUD's bounded powermetrics samples.")
+        print("macOS will ask for your administrator password once to install the rule.")
+        print()
+        result = subprocess.run(
+            ["sudo", "install", "-o", "root", "-g", "wheel", "-m", "0440", tmp_path, SUDOERS_PATH]
+        )
+        if result.returncode != 0:
+            print("Sensor access setup was not installed.")
+            return result.returncode
+
+        verify = subprocess.run(["sudo", VISUDO_PATH, "-cf", SUDOERS_PATH])
+        if verify.returncode != 0:
+            subprocess.run(["sudo", "rm", "-f", SUDOERS_PATH])
+            print("Installed rule failed validation and was removed.")
+            return verify.returncode
+
+        if advanced_sensor_access_available():
+            print("Advanced sensor access is ready. You can now run `porkyhud` without a sensor password prompt.")
+        else:
+            print("Setup installed, but passwordless powermetrics access was not available yet.")
+            print("Try opening a new terminal and run `porkyhud --sensor-access-status`.")
+        return 0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def remove_sensor_access() -> int:
+    print(f"Removing {SUDOERS_PATH}")
+    result = subprocess.run(["sudo", "rm", "-f", SUDOERS_PATH])
+    if result.returncode == 0:
+        print("PorkyHUD advanced sensor access removed.")
+    else:
+        print("Could not remove PorkyHUD advanced sensor access.")
+    return result.returncode
+
+
+def print_sensor_access_status() -> int:
+    print("PorkyHUD advanced sensor access")
+    print(f"powermetrics: {POWER_METRICS_PATH if os.path.exists(POWER_METRICS_PATH) else 'not found'}")
+    print(f"sudoers file: {SUDOERS_PATH if os.path.exists(SUDOERS_PATH) else 'not installed'}")
+    if advanced_sensor_access_available():
+        print("status: ready")
+        print("Normal `porkyhud` launches can sample advanced sensors without a password prompt.")
+    else:
+        print("status: not ready")
+        print("Run `porkyhud --setup-sensors` to enable one-time advanced sensor setup.")
+    return 0
 
 
 def unlock_privileged_sensors(screen: curses.window) -> bool:
@@ -922,25 +1047,9 @@ def parse_frequency_mhz(raw: str, labels: list[str]) -> int | None:
 
 
 def powermetrics_sample() -> str:
-    sampler_sets = [
-        "thermal,cpu_power,gpu_power,ane_power,battery,smc",
-        "thermal,cpu_power,gpu_power,ane_power,battery",
-        "all",
-    ]
-    for samplers in sampler_sets:
+    for samplers in POWER_METRICS_SAMPLER_SETS:
         raw = run_command(
-            [
-                "sudo",
-                "-n",
-                "powermetrics",
-                "--samplers",
-                samplers,
-                "--show-extra-power-info",
-                "-n",
-                "1",
-                "-i",
-                "1000",
-            ],
+            ["sudo", "-n", *powermetrics_args(samplers)],
             timeout=5.5,
         )
         if raw:
@@ -3107,7 +3216,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"PorkyHUD {VERSION}")
     parser.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
     parser.add_argument("--snapshot", action="store_true", help="print one text snapshot and exit")
+    parser.add_argument(
+        "--setup-sensors",
+        "--install-sensor-access",
+        dest="setup_sensors",
+        action="store_true",
+        help="install a narrow sudoers rule for passwordless advanced sensor sampling",
+    )
+    parser.add_argument(
+        "--remove-sensor-access",
+        action="store_true",
+        help="remove PorkyHUD's advanced sensor sudoers rule",
+    )
+    parser.add_argument(
+        "--sensor-access-status",
+        action="store_true",
+        help="show whether passwordless advanced sensor sampling is ready",
+    )
     args = parser.parse_args(argv)
+    if args.setup_sensors:
+        return install_sensor_access()
+    if args.remove_sensor_access:
+        return remove_sensor_access()
+    if args.sensor_access_status:
+        return print_sensor_access_status()
     if args.json or args.snapshot:
         snapshot = collect_snapshot()
         if args.json:
