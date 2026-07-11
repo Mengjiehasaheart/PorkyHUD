@@ -7,23 +7,18 @@ PorkyHUD is a portable, dependency free macOS terminal dashboard for system stat
 </p>
 
 <p align="center">
-  <sub>Demo profile.</sub>
+  <sub>Sanitized illustrative demo. Live panels adapt to your Mac and terminal size.</sub>
 </p>
 
 ## Install
 
-Homebrew:
+Homebrew 6 trusts third-party taps explicitly:
 
 ```bash
+brew trust --tap Mengjiehasaheart/porkyhud
 brew tap Mengjiehasaheart/porkyhud
 brew install porkyhud
 porkyhud
-```
-
-One-command install:
-
-```bash
-brew install Mengjiehasaheart/porkyhud/porkyhud
 ```
 
 Optional one-time advanced sensor setup:
@@ -55,7 +50,11 @@ From Terminal:
 ./PorkyHUD.command
 ```
 
-The launcher and curses app explicitly set a dark terminal background so every theme remains legible even when Terminal is normally using a light profile.
+By default, the launcher and curses app use a dark terminal palette so every theme remains legible. Set `NO_COLOR=1` to preserve your terminal's existing foreground, background, and cursor colors:
+
+```bash
+NO_COLOR=1 porkyhud
+```
 
 ## Keyboard Shortcuts
 
@@ -67,10 +66,11 @@ The launcher and curses app explicitly set a dark terminal background so every t
 | `a` | Cycle animation mode: off, calm, vivid |
 | `u` | Retry advanced sensor unlock with `sudo` |
 | `m` | Cycle process sort by CPU, memory, or GPU |
-| `r` | Rescan system and sensor state |
+| `r` | Refresh live telemetry |
 | `Up` / `Down` or `j` / `k` | Scroll process list |
 | `PageUp` / `PageDown` | Fast scroll process list |
-| `q` or `Esc` | Quit |
+| `q` | Quit |
+| `Esc` | Close shortcut help, or quit when help is closed |
 
 ## Snapshot Mode
 
@@ -80,6 +80,8 @@ For packaging, debugging, and future GUI integration:
 ./porkyhud.py --snapshot
 ./porkyhud.py --json
 ```
+
+Known secret-bearing command flags are redacted from process output.
 
 ## macOS Sensor Access
 
