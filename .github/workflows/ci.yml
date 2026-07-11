@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python -m py_compile porkyhud.py
+      - name: Test
+        run: python -m unittest discover -v
+      - name: Validate launcher
+        run: zsh -n PorkyHUD.command
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .

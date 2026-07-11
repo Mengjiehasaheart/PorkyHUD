@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "porkyhud"
-version = "0.1.1"
+version = "0.1.2"
 description = "Terminal-first Apple Silicon system HUD for macOS."
 readme = "README.md"
 requires-python = ">=3.9"
