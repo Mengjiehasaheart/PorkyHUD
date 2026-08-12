@@ -34,7 +34,7 @@ printf '\033[8;42;132t'
 clear
 
 echo "Launching PorkyHUD..."
-echo "Keys: h help, t theme, l layout, a animation, u unlock sensors, m sort, r refresh, q quit."
+echo "Press h for current shortcuts."
 echo
 
 if [[ -f "$APP_DIR/porkyhud.py" ]]; then
@@ -63,13 +63,11 @@ else
   cli_hint="porkyhud"
 fi
 
-echo "Terminal-first build: l cycles layouts, m cycles CPU/MEM/GPU process sort."
 echo "Diagnostics: $cli_hint --snapshot or $cli_hint --json"
 echo
 echo "Read-only fans and temperatures use AppleSMC when available."
 echo "Advanced CPU/GPU power and residency counters require administrator access on macOS."
 echo "One-time advanced setup: $cli_hint --setup-sensors"
-echo "Temporary session unlock inside the HUD: press u."
 echo
 
 "${run_command[@]}"

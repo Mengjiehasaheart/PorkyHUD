@@ -13,17 +13,52 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.14"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile
-        run: python -m py_compile porkyhud.py porkyhud_core.py
+        run: >-
+          python -m py_compile
+          porkyhud.py porkyhud_core.py
+          tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py
+          tests/test_repository_tools.py
       - name: Test
-        run: python -m unittest discover -v
+        run: python -W error -m unittest discover -v
+      - name: Validate repository contracts
+        run: python tools/validate_docs.py
       - name: Validate launcher
-        run: zsh -n PorkyHUD.command
+        run: |
+          zsh -n PorkyHUD.command
+          ./porkyhud.py --help
+          ./porkyhud.py --version
       - name: Build wheel
         run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Verify wheel boundary and imports
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit("expected exactly one wheel")
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+          required = {"porkyhud.py", "porkyhud_core.py"}
+          if not required.issubset(names):
+              raise SystemExit("wheel is missing a production module")
+          if any(name.startswith(("tools/", "tests/")) for name in names):
+              raise SystemExit("wheel contains source-tree repository tools or tests")
+          PY
+          package_target="$(mktemp -d)"
+          outside_checkout="$(mktemp -d)"
+          trap 'rm -rf "$package_target" "$outside_checkout"' EXIT
+          python -m pip install --no-deps --target "$package_target" dist/*.whl
+          (
+            cd "$outside_checkout"
+            PYTHONPATH="$package_target" python -c 'import porkyhud, porkyhud_core'
+          )

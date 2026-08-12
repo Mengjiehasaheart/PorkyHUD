@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from math import inf, nan
+from typing import Tuple
 import unittest
 
 from porkyhud_core import (

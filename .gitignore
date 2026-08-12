@@ -6,4 +6,7 @@ build/
 dist/
 *.egg-info/
 assets/demo-frames/
-tools/
+tools/*
+!tools/validate_docs.py
+!tools/render_demo_gif.py
+!tools/measure_release.py

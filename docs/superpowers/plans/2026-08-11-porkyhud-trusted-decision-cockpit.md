@@ -43,10 +43,12 @@
 | `porkyhud.py` | Modify | Effects, structured command runner, adapters, source scheduling, live orchestration, snapshot projection, curses UI, controls, and CLI |
 | `tests/test_core.py` | Create | Platform-independent source, policy, recovery, contributor, precedence, and evidence-state contracts |
 | `tests/test_porkyhud.py` | Modify | Structured runner, parser, native adapter, poller, process/GPU, rendering, input, snapshot, terminal, and regression tests |
+| `tests/test_repository_tools.py` | Create | Validator, renderer, measurement, path-safety, privacy, timeout-cleanup, and CLI contracts for source-tree tools |
 | `tools/validate_docs.py` | Create | Mechanical tracked-map, stable-anchor, local-link, and control-contract validation using only the standard library |
 | `tools/render_demo_gif.py` | Track and modify | Reproducible, sanitized, explicitly illustrative Overview demo; development-only Chrome/ffmpeg dependencies |
+| `tools/measure_release.py` | Create | Bounded standard-library Task 15 measurement harness with private artifacts and redacted JSON results |
 | `assets/porkyhud-demo.gif` | Modify | Updated illustrative product media, never runtime or hardware evidence |
-| `.gitignore` | Modify | Keep local tools ignored except the two reviewed reproducible repository tools |
+| `.gitignore` | Modify | Keep local tools ignored except the three reviewed reproducible repository tools |
 | `README.md` | Modify | User positioning, states, modes, support tiers, privacy limits, metric semantics, and current workflows |
 | `AGENTS.md` | Modify | New boundary, routes, invariants, flows, tracked files, validation, and future adapter guidance |
 | `PorkyHUD.command` | Modify | Short current launch/help guidance without duplicating the full key map |
@@ -1541,6 +1543,8 @@ git commit -m "feat: add responsive direct cockpit modes"
 
 **Files:**
 - Create: `tools/validate_docs.py`
+- Create: `tools/measure_release.py`
+- Create: `tests/test_repository_tools.py`
 - Track and modify: `tools/render_demo_gif.py`
 - Modify: `.gitignore`
 - Modify: `assets/porkyhud-demo.gif`
@@ -1564,6 +1568,7 @@ First change `.gitignore` so only the reviewed repository tools are visible:
 tools/*
 !tools/validate_docs.py
 !tools/render_demo_gif.py
+!tools/measure_release.py
 ```
 
 Then create a standard-library tool with this public CLI:
@@ -1579,17 +1584,19 @@ validate_control_contract(root: Path) -> List[str]
 main(argv: Optional[Sequence[str]] = None) -> int
 ```
 
-`tracked_files` calls `git ls-files --cached --others --exclude-standard` so a newly unignored intended source is caught before commit; `mapped_files` parses only the complete tracked-file table in `AGENTS.md`; symbol validation parses Python AST for `path::symbol` anchors and shell/TOML/YAML paths for existence; local-link validation resolves Markdown links while skipping `http`, `https`, and anchors; control validation checks the canonical key set against README/help/handler tokens without requiring duplicated full prose.
+`tracked_files` calls `git ls-files --cached --others --exclude-standard` so a newly unignored intended source is caught before commit; `mapped_files` parses only the complete tracked-file table in `AGENTS.md`; symbol validation parses Python AST only for `path::qualname` anchors found in `AGENTS.md`, while every mapped path is checked for exact-case existence; local-link validation resolves every tracked Markdown inline/reference/HTML link outside fenced code while rejecting decoded traversal, untracked targets, symlink escapes, and case mismatches; control validation checks semantic key groups including `DIRECT_MODE_KEYS` without requiring duplicated full prose. The CLI emits sorted private diagnostics with success/failure/usage exits 0/1/2.
 
 Run: `python3 tools/validate_docs.py`
 
-Expected: nonzero with explicit missing map rows for the two newly unignored tool paths before AGENTS is updated; core, core tests, and this plan were already mapped in their creation commits.
+Expected: nonzero with explicit missing map rows for the three newly unignored tool paths plus `tests/test_repository_tools.py` before AGENTS is updated; core, core tests, and this plan were already mapped in their creation commits.
 
-- [ ] **Step 2: Review both reproducible tools and update packaging/CI**
+- [ ] **Step 2: Review all reproducible tools and update packaging/CI**
 
-Review the existing renderer for sanitization and update its generated view to the decision header, core evidence ribbon, Overview hierarchy, restrained graphite/cyan/green/amber/red semantics, motion-off still clarity, and a visible `illustrative demo` badge. It remains a development tool and must not import app internals or collect host data.
+Review the existing renderer for sanitization and update its generated view to the decision header, core evidence ribbon, Overview hierarchy, restrained graphite/cyan/green/amber/red semantics, motion-off still clarity, and the exact visible `ILLUSTRATIVE DEMO · SYNTHETIC DATA` badge in every frame. It remains a development tool and may use only fixed generic values. It must not import app internals, inspect the host/network, accept `--no-sandbox`, follow an output symlink, write outside the repository, or leave a timed-out subprocess group alive.
 
-Set `py-modules = ["porkyhud", "porkyhud_core"]`. Expand CI matrix to `3.9`, `3.10`, `3.11`, `3.12`, `3.13`, `3.14`; compile both modules; run discovery and launcher validation; run `tools/validate_docs.py`; build a wheel; install it into a temporary target; and import both modules from that target.
+Add the bounded standard-library `tools/measure_release.py` harness consumed by Task 15. It supports environment, startup, snapshot, pure, live, soak, and timeout-cleanup batches, nearest-rank statistics, no-shell subprocess groups, private temporary artifacts, exact launch/thread lifecycle accounting, and sanitized machine-readable JSON. Public results may include only allowlisted model/chip/RAM/macOS/architecture/Python facts and aggregates—never hostname, user/home, raw argv, process text, PIDs, or PTY content. Task 14 validates this harness; Task 15 owns running it and recording host evidence.
+
+Set `py-modules = ["porkyhud", "porkyhud_core"]`. Expand CI matrix to `3.9`, `3.10`, `3.11`, `3.12`, `3.13`, `3.14`; compile both modules, all three tools, and the repository-tool test module; run discovery and launcher validation; run `tools/validate_docs.py`; build a wheel; assert the wheel excludes tools/tests; install it into a temporary target; and import both production modules from outside the checkout.
 
 - [ ] **Step 3: Update all user-facing contracts**
 
@@ -1607,7 +1614,7 @@ Shorten module/launcher copy to `Press h for current shortcuts` instead of dupli
 
 - [ ] **Step 4: Update the maintainer map and design record**
 
-Add every tracked path to `AGENTS.md`; add `area:health-policy` and `area:structured-adapters`; update live/snapshot flows, task routes, invariants, validation, package contents, demo policy, and future MCP boundary. Change the design status to approved/implemented only after code is green; append the exact deterministic and host-measured evidence from Task 15, clearly separating tests from physical validation.
+Add every tracked path to `AGENTS.md`; add `area:health-policy` and `area:structured-adapters`; update live/snapshot flows, task routes, invariants, validation, package contents, demo policy, and future MCP boundary. Set the design status exactly to `implementation complete; host validation pending` only after Task 14 code is green. Do not append Task 15 performance or physical-host claims in this task.
 
 - [ ] **Step 5: Regenerate and visually inspect the demo**
 
@@ -1618,7 +1625,7 @@ python3 tools/render_demo_gif.py --frames 36 --fps 12
 file assets/porkyhud-demo.gif
 ```
 
-Expected: a GIF at 960 pixels wide. Inspect the first, middle, and last frames; confirm visible decision hierarchy, no clipped content, no private host/process data, restrained semantic colors, and explicit illustrative labeling.
+Expected: exactly 36 frames at 12 fps and 960 pixels wide, preferably no more than 1 MiB. Inspect the first, middle, and last frames; confirm visible decision hierarchy, no clipped content, no private host/process data, restrained semantic colors, and exact synthetic-only provenance in every frame.
 
 - [ ] **Step 6: Run packaging and documentation checks**
 
@@ -1626,8 +1633,8 @@ Run:
 
 ```bash
 python3 tools/validate_docs.py
-python3 -m py_compile porkyhud.py porkyhud_core.py tools/validate_docs.py tools/render_demo_gif.py
-python3 -m unittest discover -v
+python3 -m py_compile porkyhud.py porkyhud_core.py tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py tests/test_repository_tools.py
+python3 -W error -m unittest discover -v
 zsh -n PorkyHUD.command
 python3 -m pip wheel --no-deps --wheel-dir dist .
 ```
@@ -1639,8 +1646,10 @@ Install the newest wheel into a fresh `mktemp -d` target and run `PYTHONPATH=<ta
 ```bash
 git add .gitignore .github/workflows/ci.yml AGENTS.md README.md \
   PorkyHUD.command pyproject.toml porkyhud.py assets/porkyhud-demo.gif \
-  tools/validate_docs.py tools/render_demo_gif.py \
-  docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md
+  tests/test_repository_tools.py tools/validate_docs.py \
+  tools/render_demo_gif.py tools/measure_release.py \
+  docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md \
+  docs/superpowers/plans/2026-08-11-porkyhud-trusted-decision-cockpit.md
 git commit -m "docs: publish the trusted cockpit contract"
 ```
 
@@ -1685,8 +1694,9 @@ On Terminal.app and one available alternate terminal or PTY, check `76x22`, `80x
 
 ```bash
 python3 -m py_compile porkyhud.py porkyhud_core.py \
-  tools/validate_docs.py tools/render_demo_gif.py
-python3 -m unittest discover -v
+  tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py \
+  tests/test_repository_tools.py
+python3 -W error -m unittest discover -v
 zsh -n PorkyHUD.command
 python3 tools/validate_docs.py
 ./porkyhud.py --help
@@ -1723,6 +1733,6 @@ Do not tag, publish, push, update Homebrew, or mutate sudoers in this task.
 - Truth coverage: legal outcomes, last-valid/last-attempt separation, stale/failure eligibility, public memory/thermal sources, CPU windows, exact latches, storage provenance, contributor proof, and AGX null/zero semantics all have deterministic tests before integration.
 - UX coverage: progressive shell, decision hierarchy, cited evidence, five narrow operational modes, honest Cinema rejection, motion/accessibility, and control copy have explicit tests and manual gates.
 - Performance coverage: draw-time purity and cadence are deterministic; launch, snapshot, live resource, child-count, thread-soak, and contrast measurements are host-specific release evidence rather than mocked claims.
-- Maintainability coverage: the core/effects boundary, interface ledger, two reviewed tools, two-module wheel, CI matrix, exhaustive tracked map, symbol anchors, local links, and future-agent routes are verified mechanically.
+- Maintainability coverage: the core/effects boundary, interface ledger, three reviewed tools, two-module wheel, CI matrix, exhaustive tracked map, symbol anchors, local links, and future-agent routes are verified mechanically.
 - Type consistency: `HealthFacts` uses core `SourceState` values; adapters return `AdapterResult`; `SourcePoller` consumes those results; `HealthFrame` is the only new presentation input; unavailable process GPU is `Optional[float]` end-to-end.
 - Safety coverage: no automated sudoers mutation, no shell runner, bounded process groups, redaction at output boundaries, no raw stderr or privileged detail projection, and no release/publish side effects.

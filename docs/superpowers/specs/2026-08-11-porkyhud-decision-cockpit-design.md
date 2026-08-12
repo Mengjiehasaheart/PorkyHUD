@@ -1,6 +1,6 @@
 # PorkyHUD Trusted Decision Cockpit — Phase 1 Design
 
-Status: approved for Phase 1 implementation on 2026-08-11.
+Status: implementation complete; host validation pending
 
 Date: 2026-08-11
 
@@ -732,6 +732,18 @@ The Phase 1 implementation updates:
 The README remains user-facing. This spec records the design decision; `AGENTS.md` remains the ongoing maintainer navigation layer. No generated wiki, graph database, new runtime dependency, or ignored local tool is presented as canonical.
 
 ## Acceptance outcome
+
+### Task 14 deterministic implementation record
+
+The implementation surfaces and reproducible repository contracts are complete:
+
+- the source tree contains the effects module and pure policy module, with the runtime package restricted to those two standard-library modules
+- the Git inventory and exact `AGENTS.md` map contain the same 19 paths; AGENTS-only Python anchors, every tracked Markdown local link, and the semantic control contract validate mechanically
+- repository-tool tests cover strict map parsing, unsafe and case-conflicting paths, qualified AST anchors, fenced/reference/HTML links, traversal/symlink/tracking/case failures, deterministic private CLI errors, renderer path/limit/provenance safety, and measurement statistics/privacy/process-cleanup primitives
+- CI declares Python 3.9 through 3.14, compiles both modules, all three tools, and repository-tool tests, runs warnings-as-errors discovery and documentation validation, checks launcher/help/version, and verifies the fresh wheel includes both production modules while excluding tools and tests
+- the tracked 36-frame, 12 fps, 960-pixel-wide demo is generated only from fixed synthetic values, visibly labels every frame `ILLUSTRATIVE DEMO · SYNTHETIC DATA`, and uses bounded Chrome/Chromium and ffmpeg development subprocesses without weakening the browser sandbox
+
+This record contains no Task 15 startup, snapshot, resource, soak, contrast, terminal, physical-device, or release-performance result. Passing deterministic or mocked tests is not physical validation. Task 15 alone records those measurements, misses, unavailable checks, and review closures before the status can advance.
 
 Phase 1 is complete when a user can launch PorkyHUD at `76×22` and understand:
 

@@ -1472,9 +1472,11 @@ class DecisionAdapterTests(unittest.TestCase):
         outcome: core.AttemptOutcome = core.AttemptOutcome.SUCCESS,
         failure: core.FailureCode | None = None,
     ) -> porkyhud.CommandResult:
+        now = time.monotonic()
         return porkyhud.CommandResult(
             "fixture", stdout, "", 0 if outcome is core.AttemptOutcome.SUCCESS else None,
-            10.0, 10.2, datetime(2026, 8, 11, 12, tzinfo=timezone.utc), outcome, failure,
+            now - 0.2, now - 0.1,
+            datetime(2026, 8, 11, 12, tzinfo=timezone.utc), outcome, failure,
         )
 
     def test_adapter_result_accepts_only_core_outcome_failure_pairs(self) -> None:

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""
-PorkyHUD: a dependency-free macOS terminal system monitor.
+"""PorkyHUD: a dependency-free Apple Silicon decision cockpit for macOS.
 
-Double-click PorkyHUD.command to run it in Terminal.
-Keys: q quit, m sort process list by CPU/MEM, arrows/page keys scroll.
+Press h for current shortcuts.
 """
 
 from __future__ import annotations
@@ -7858,10 +7856,18 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="PorkyHUD terminal system monitor for macOS.")
+    parser = argparse.ArgumentParser(
+        description="PorkyHUD Apple Silicon decision cockpit for macOS.",
+    )
     parser.add_argument("--version", action="version", version=f"PorkyHUD {VERSION}")
-    parser.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
-    parser.add_argument("--snapshot", action="store_true", help="print one text snapshot and exit")
+    parser.add_argument(
+        "--json", action="store_true",
+        help="print one unversioned machine-readable snapshot and exit",
+    )
+    parser.add_argument(
+        "--snapshot", action="store_true",
+        help="print one unversioned text snapshot and exit",
+    )
     parser.add_argument(
         "--setup-sensors",
         "--install-sensor-access",
