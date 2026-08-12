@@ -504,6 +504,93 @@ class ContributorTests(unittest.TestCase):
             ContributorState.UNAVAILABLE,
         )
 
+    def test_source_validation_rejects_revision_and_active_attempt_forgery(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        history, source = self.history_for(rows, rows)
+        sources = (
+            replace(source, revision=99),
+            replace(source, active_revision=3, active_started_mono_s=3.1),
+        )
+        for forged in sources:
+            with self.subTest(forged=forged):
+                with self.assertRaises(ValueError):
+                    reduce_process_history(history, forged)
+                with self.assertRaises(ValueError):
+                    select_cpu_contributor(history, forged, 3.2)
+
+    def test_same_consumed_revision_that_becomes_failure_clears_history(self):
+        first = (ProcessFact(42, "Xcode", 30.0, 100),)
+        second = (ProcessFact(42, "Xcode", 36.0, 102),)
+        first_source = self.process_source(first, 1.0)
+        history = reduce_process_history(ProcessHistory(), first_source)
+        source = self.process_source(second, 2.0, first_source)
+        history = reduce_process_history(history, source)
+        replaced_failure = replace(
+            source,
+            last_attempt=replace(
+                source.last_attempt,
+                outcome=AttemptOutcome.TIMEOUT,
+                failure=FailureCode.COMMAND_TIMEOUT,
+            ),
+            last_valid=first_source.last_valid,
+        )
+        cleared = reduce_process_history(history, replaced_failure)
+        self.assertEqual((cleared.previous, cleared.current), ((), ()))
+        self.assertEqual(cleared.last_attempt_revision, 2)
+        self.assertEqual(
+            select_cpu_contributor(history, replaced_failure, 2.0).state,
+            ContributorState.UNAVAILABLE,
+        )
+
+    def test_source_validation_rejects_failure_retaining_future_sample(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        first = self.process_source(rows, 1.0)
+        second = self.process_source(rows, 2.0, first)
+        failed = self.failed_process_source(second, 3.0)
+        forged = replace(
+            failed,
+            last_valid=replace(second.last_valid, revision=4),
+        )
+        history = reduce_process_history(ProcessHistory(), second)
+        with self.assertRaises(ValueError):
+            reduce_process_history(history, forged)
+        with self.assertRaises(ValueError):
+            select_cpu_contributor(history, forged, 3.0)
+
+    def test_legitimate_active_refresh_retains_usable_contributor_evidence(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        history, source = self.history_for(rows, rows)
+        active, _ = start_attempt(source, 3.1)
+        self.assertIs(reduce_process_history(history, active), history)
+        self.assertEqual(
+            select_cpu_contributor(history, active, 3.2).state,
+            ContributorState.LEADING,
+        )
+
+    def test_ratio_uses_exact_float_values_at_the_boundary(self):
+        first = (
+            ProcessFact(42, "Xcode", 30.0, 100),
+            ProcessFact(7, "runner", 20.0, 50),
+        )
+        rounded_down = (
+            ProcessFact(42, "Xcode", 48.00000000000003, 102),
+            ProcessFact(7, "runner", 32.00000000000002, 52),
+        )
+        history, source = self.history_for(first, rounded_down)
+        self.assertEqual(
+            select_cpu_contributor(history, source, 3.0).state,
+            ContributorState.NO_CLEAR_LEADER,
+        )
+        exact = (
+            ProcessFact(42, "Xcode", 48.0, 102),
+            ProcessFact(7, "runner", 32.0, 52),
+        )
+        history, source = self.history_for(first, exact)
+        self.assertEqual(
+            select_cpu_contributor(history, source, 3.0).state,
+            ContributorState.LEADING,
+        )
+
     def test_attribution_rejects_invalid_clock_and_age_budgets(self):
         rows = (ProcessFact(42, "Xcode", 30.0, 100),)
         history, source = self.history_for(rows, rows)

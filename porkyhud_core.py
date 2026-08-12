@@ -499,13 +499,12 @@ def reduce_process_history(
     """
     if not isinstance(history, ProcessHistory):
         raise ValueError("history must be a ProcessHistory")
-    if not isinstance(source, SourceState) or source.source_id is not SourceId.PROCESS_TABLE:
-        raise ValueError("source must be a process table SourceState")
-    attempt = source.last_attempt
+    attempt = _process_attempt(source)
     if attempt is None:
         return history
-    _validate_process_attempt(attempt)
     if attempt.revision == history.last_attempt_revision:
+        if attempt.outcome is not AttemptOutcome.SUCCESS and history.current_revision:
+            return ProcessHistory(last_attempt_revision=attempt.revision)
         return history
     if attempt.revision < history.last_attempt_revision:
         raise ValueError("process attempt revision cannot recede")
@@ -540,17 +539,14 @@ def select_cpu_contributor(
     """Name a CPU contributor only when recent identity evidence is decisive."""
     if not isinstance(history, ProcessHistory):
         raise ValueError("history must be a ProcessHistory")
-    if not isinstance(source, SourceState) or source.source_id is not SourceId.PROCESS_TABLE:
-        raise ValueError("source must be a process table SourceState")
     _require_finite_mono(now_mono_s, "now_mono_s")
     _require_finite_positive(max_age_s, "max_age_s")
     if max_age_s > 6.0:
         raise ValueError("max_age_s cannot exceed the attribution limit")
 
-    attempt = source.last_attempt
+    attempt = _process_attempt(source, now_mono_s)
     if attempt is None:
         return CpuContributor(ContributorState.UNAVAILABLE)
-    _validate_process_attempt(attempt)
     if attempt.outcome is not AttemptOutcome.SUCCESS:
         return CpuContributor(ContributorState.UNAVAILABLE)
     sample = _validated_process_success(source, attempt)
@@ -573,7 +569,10 @@ def select_cpu_contributor(
     runner_up_percent = max(
         (fact.cpu_percent for fact in current if fact is not top), default=0.0
     )
-    if top.cpu_percent < 25.0 or top.cpu_percent < 1.5 * runner_up_percent:
+    if (
+        top.cpu_percent < 25.0
+        or _less_than_one_point_five_times(top.cpu_percent, runner_up_percent)
+    ):
         return CpuContributor(ContributorState.NO_CLEAR_LEADER)
     previous = next((fact for fact in history.previous if fact.pid == top.pid), None)
     if (
@@ -594,6 +593,84 @@ def _validate_process_table(rows: Tuple[ProcessFact, ...], name: str) -> None:
         if fact.pid in seen_pids:
             raise ValueError("%s process rows must have unique PIDs" % name)
         seen_pids.add(fact.pid)
+
+
+def _process_attempt(
+    source: SourceState[Tuple[ProcessFact, ...]], now_mono_s: Optional[float] = None
+) -> Optional[CollectionAttempt]:
+    """Validate a complete process source before any attribution early return."""
+    if not isinstance(source, SourceState) or source.source_id is not SourceId.PROCESS_TABLE:
+        raise ValueError("source must be a process table SourceState")
+    _require_finite_positive(source.expected_cadence_s, "source.expected_cadence_s")
+    _require_finite_positive(source.stale_after_s, "source.stale_after_s")
+    if source.stale_after_s < source.expected_cadence_s:
+        raise ValueError("source stale_after_s is shorter than cadence")
+    if type(source.revision) is not int or source.revision < 0:
+        raise ValueError("source revision must be a nonnegative int")
+    if now_mono_s is not None:
+        _require_finite_mono(now_mono_s, "now_mono_s")
+    if source.active_revision is None:
+        if source.active_started_mono_s is not None:
+            raise ValueError("inactive source cannot retain an active start time")
+    else:
+        if (
+            type(source.active_revision) is not int
+            or source.active_revision <= 0
+            or source.active_revision != source.revision
+        ):
+            raise ValueError("active source revision is inconsistent")
+        if source.active_started_mono_s is None:
+            raise ValueError("active source requires an active start time")
+        _require_finite_mono(source.active_started_mono_s, "source.active_started_mono_s")
+        if now_mono_s is not None and now_mono_s < source.active_started_mono_s:
+            raise ValueError("now_mono_s cannot precede the active attempt")
+
+    attempt = source.last_attempt
+    if attempt is None:
+        if source.last_valid is not None:
+            raise ValueError("source cannot retain a sample without an attempt")
+        if source.active_revision is None and source.revision != 0:
+            raise ValueError("inactive source cannot have an uncompleted revision")
+        return None
+    _validate_process_attempt(attempt)
+    if now_mono_s is not None and now_mono_s < attempt.completed_mono_s:
+        raise ValueError("now_mono_s cannot precede the completed attempt")
+    if source.active_revision is None:
+        if attempt.revision != source.revision:
+            raise ValueError("completed attempt must match source revision")
+    elif (
+        attempt.revision != source.active_revision - 1
+        or source.active_started_mono_s < attempt.completed_mono_s
+    ):
+        raise ValueError("active source cannot skip or precede an attempt")
+
+    sample = source.last_valid
+    if sample is not None:
+        _validate_process_sample(sample)
+        if sample.revision > attempt.revision:
+            raise ValueError("retained sample cannot follow the latest attempt")
+        if now_mono_s is not None and now_mono_s < sample.completed_mono_s:
+            raise ValueError("now_mono_s cannot precede the retained sample")
+        if attempt.outcome is not AttemptOutcome.SUCCESS:
+            if sample.revision == attempt.revision:
+                raise ValueError("failed attempt cannot own a valid sample")
+            if sample.completed_mono_s > attempt.started_mono_s:
+                raise ValueError("retained sample cannot complete after a later attempt starts")
+            if sample.completed_at_utc > attempt.completed_at_utc:
+                raise ValueError("retained sample wall time cannot follow a later attempt")
+    if attempt.outcome is AttemptOutcome.SUCCESS:
+        _validated_process_success(source, attempt)
+    return attempt
+
+
+def _less_than_one_point_five_times(top: float, runner_up: float) -> bool:
+    """Compare finite CPU values exactly without rounded float multiplication."""
+    top_numerator, top_denominator = top.as_integer_ratio()
+    runner_numerator, runner_denominator = runner_up.as_integer_ratio()
+    return (
+        2 * top_numerator * runner_denominator
+        < 3 * runner_numerator * top_denominator
+    )
 
 
 def _validate_process_fact(fact: ProcessFact) -> None:
@@ -618,9 +695,8 @@ def _validate_process_attempt(attempt: CollectionAttempt) -> None:
     if attempt.completed_mono_s < attempt.started_mono_s:
         raise ValueError("process attempt completion cannot precede its start")
     if (
-        not isinstance(attempt.completed_at_utc, datetime)
-        or attempt.completed_at_utc.tzinfo is None
-        or attempt.completed_at_utc.utcoffset() is None
+        type(attempt.completed_at_utc) is not datetime
+        or attempt.completed_at_utc.tzinfo is not timezone.utc
     ):
         raise ValueError("process attempt completion timestamp must be timezone-aware")
     if not isinstance(attempt.outcome, AttemptOutcome):
@@ -638,6 +714,19 @@ def _validated_process_success(
     sample = source.last_valid
     if type(sample) is not Sample or sample.revision != attempt.revision:
         raise ValueError("successful process attempt lacks its matching sample")
+    _validate_process_sample(sample)
+    if (
+        sample.started_mono_s != attempt.started_mono_s
+        or sample.completed_mono_s != attempt.completed_mono_s
+        or sample.completed_at_utc != attempt.completed_at_utc
+    ):
+        raise ValueError("process sample does not match its completed attempt")
+    return sample
+
+
+def _validate_process_sample(sample: Sample[Tuple[ProcessFact, ...]]) -> None:
+    if type(sample) is not Sample:
+        raise ValueError("source last_valid must be a Sample")
     if type(sample.value) is not tuple:
         raise ValueError("process sample rows must be a tuple")
     _validate_process_table(sample.value, "process sample")
@@ -647,19 +736,8 @@ def _validated_process_success(
     _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
     if sample.completed_mono_s < sample.started_mono_s:
         raise ValueError("process sample completion cannot precede its start")
-    if (
-        not isinstance(sample.completed_at_utc, datetime)
-        or sample.completed_at_utc.tzinfo is None
-        or sample.completed_at_utc.utcoffset() is None
-    ):
-        raise ValueError("process sample completion timestamp must be timezone-aware")
-    if (
-        sample.started_mono_s != attempt.started_mono_s
-        or sample.completed_mono_s != attempt.completed_mono_s
-        or sample.completed_at_utc != attempt.completed_at_utc
-    ):
-        raise ValueError("process sample does not match its completed attempt")
-    return sample
+    if type(sample.completed_at_utc) is not datetime or sample.completed_at_utc.tzinfo is not timezone.utc:
+        raise ValueError("process sample completion timestamp must be normalized UTC")
 
 
 def reduce_cpu_window(
