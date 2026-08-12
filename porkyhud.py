@@ -592,14 +592,18 @@ def collect_disk_capacity() -> AdapterResult[DiskCapacity]:
     started_mono_s = time.monotonic()
     inspection_failed = False
     for volume_name, mount_point in (("Data", "/System/Volumes/Data"), ("Root", "/")):
-        if not os.path.exists(mount_point):
-            continue
         try:
             filesystem = os.statvfs(mount_point)
-            if filesystem.f_flag & os.ST_RDONLY:
-                continue
+        except FileNotFoundError:
+            continue
+        except Exception:
+            inspection_failed = True
+            continue
+        if filesystem.f_flag & os.ST_RDONLY:
+            continue
+        try:
             usage = shutil.disk_usage(mount_point)
-        except OSError:
+        except Exception:
             inspection_failed = True
             continue
         return AdapterResult(
@@ -2692,11 +2696,16 @@ class MacCpuSampler:
                 ctypes.c_ulong,
             ]
             self.host = self.lib.mach_host_self()
-            self.previous = self._read_raw()
-            self.last_read_completed_mono_s = time.monotonic()
-            self.available = bool(self.previous)
         except Exception:
-            self.available = False
+            return
+        self.available = True
+        try:
+            initial = self._read_raw()
+        except Exception:
+            return
+        if initial:
+            self.previous = initial
+            self.last_read_completed_mono_s = time.monotonic()
 
     def _read_raw(self) -> list[tuple[int, int, int, int]]:
         cpu_count = ctypes.c_uint(0)

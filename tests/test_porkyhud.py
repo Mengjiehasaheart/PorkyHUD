@@ -1296,8 +1296,7 @@ class DecisionAdapterTests(unittest.TestCase):
     def test_disk_capacity_prefers_writable_data_and_preserves_provenance(self) -> None:
         stat = type("Stat", (), {"f_flag": 0, "f_fsid": 44})()
         usage = type("Usage", (), {"total": 1000, "used": 250, "free": 750})()
-        with mock.patch.object(porkyhud.os.path, "exists", side_effect=lambda path: path == "/System/Volumes/Data"), \
-             mock.patch.object(porkyhud.os, "statvfs", return_value=stat), \
+        with mock.patch.object(porkyhud.os, "statvfs", return_value=stat), \
              mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
             result = porkyhud.collect_disk_capacity()
         self.assertEqual(result.value, core.DiskCapacity("fsid:44", "Data", "/System/Volumes/Data", 1000, 750))
@@ -1306,20 +1305,64 @@ class DecisionAdapterTests(unittest.TestCase):
         readonly = type("Stat", (), {"f_flag": porkyhud.os.ST_RDONLY, "f_fsid": 1})()
         root = type("Stat", (), {"f_flag": 0, "f_fsid": 2})()
         usage = type("Usage", (), {"total": 200, "used": 50, "free": 150})()
-        with mock.patch.object(porkyhud.os.path, "exists", return_value=True), \
-             mock.patch.object(porkyhud.os, "statvfs", side_effect=[readonly, root]), \
+        with mock.patch.object(porkyhud.os, "statvfs", side_effect=[readonly, root]), \
              mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
             fallback = porkyhud.collect_disk_capacity()
         self.assertEqual(fallback.value, core.DiskCapacity("fsid:2", "Root", "/", 200, 150))
-        with mock.patch.object(porkyhud.os.path, "exists", return_value=False):
+        with mock.patch.object(
+            porkyhud.os, "statvfs",
+            side_effect=[FileNotFoundError("Data absent"), readonly],
+        ):
             absent = porkyhud.collect_disk_capacity()
         self.assertEqual((absent.outcome, absent.failure),
                          (core.AttemptOutcome.NOT_APPLICABLE, core.FailureCode.NOT_APPLICABLE))
-        with mock.patch.object(porkyhud.os.path, "exists", return_value=True), \
-             mock.patch.object(porkyhud.os, "statvfs", side_effect=OSError("boom")):
+        with mock.patch.object(porkyhud.os, "statvfs", side_effect=OSError("boom")):
             broken = porkyhud.collect_disk_capacity()
         self.assertEqual((broken.outcome, broken.failure),
                          (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION))
+
+    def test_disk_capacity_does_not_treat_inaccessible_mounts_as_absent(self) -> None:
+        with mock.patch.object(
+            porkyhud.os, "statvfs", side_effect=PermissionError("denied"),
+        ):
+            result = porkyhud.collect_disk_capacity()
+        self.assertEqual(
+            (result.outcome, result.failure),
+            (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+        )
+
+    def test_disk_capacity_contains_unexpected_inspection_exceptions(self) -> None:
+        with mock.patch.object(
+            porkyhud.os, "statvfs", side_effect=RuntimeError("unexpected"),
+        ):
+            try:
+                result = porkyhud.collect_disk_capacity()
+            except RuntimeError as exc:
+                self.fail("disk inspection exception escaped: %s" % exc)
+        self.assertEqual(
+            (result.outcome, result.failure),
+            (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+        )
+
+    def test_disk_capacity_prefers_writable_root_after_inaccessible_data(self) -> None:
+        root = type("Stat", (), {"f_flag": 0, "f_fsid": 22})()
+        usage = type("Usage", (), {"total": 400, "used": 100, "free": 300})()
+
+        def inspect(mount: str) -> object:
+            if mount == "/System/Volumes/Data":
+                raise PermissionError("denied")
+            return root
+
+        with mock.patch.object(
+            porkyhud.os, "statvfs", side_effect=inspect,
+        ), mock.patch.object(
+            porkyhud.shutil, "disk_usage", return_value=usage,
+        ):
+            result = porkyhud.collect_disk_capacity()
+        self.assertEqual(
+            result.value,
+            core.DiskCapacity("fsid:22", "Root", "/", 400, 300),
+        )
 
     def test_cpu_usage_uses_counter_read_window_and_resets_on_bad_counters(self) -> None:
         sampler = object.__new__(porkyhud.MacCpuSampler)
@@ -1349,6 +1392,58 @@ class DecisionAdapterTests(unittest.TestCase):
         self.assertEqual((missing.outcome, missing.failure),
                          (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION))
         self.assertIsNone(missing.value)
+
+    def test_cpu_transient_initial_read_retries_and_uses_successful_read_window(self) -> None:
+        baseline = [(100, 10, 90, 0), (10, 0, 90, 0)]
+        current = [(130, 20, 100, 0), (20, 10, 110, 0)]
+        completed_at = datetime(2026, 8, 11, 12, tzinfo=timezone.utc)
+        for initial in ([], RuntimeError("transient native read")):
+            with self.subTest(initial=type(initial).__name__):
+                reads: list[object] = [initial, baseline, current]
+
+                def read_raw(_sampler: object) -> list[tuple[int, int, int, int]]:
+                    value = reads.pop(0)
+                    if isinstance(value, Exception):
+                        raise value
+                    return value  # type: ignore[return-value]
+
+                clock_values = iter((10.0, 10.5, 11.0, 12.0))
+                with mock.patch.object(porkyhud.ctypes, "CDLL", return_value=mock.Mock()), \
+                     mock.patch.object(porkyhud.MacCpuSampler, "_read_raw", autospec=True,
+                                       side_effect=read_raw), \
+                     mock.patch.object(porkyhud.time, "monotonic",
+                                       side_effect=lambda: next(clock_values, 99.0)), \
+                     mock.patch.object(porkyhud, "utc_now", return_value=completed_at):
+                    sampler = porkyhud.MacCpuSampler()
+                    primed = sampler.sample_usage()
+                    result = sampler.sample_usage()
+
+                self.assertEqual(
+                    (primed.outcome, primed.failure, primed.value),
+                    (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.PARSER_REJECTED, None),
+                )
+                self.assertEqual(
+                    (result.value.window_started_mono_s, result.value.window_completed_mono_s),
+                    (10.5, 12.0),
+                )
+                self.assertAlmostEqual(result.value.percent, 60 / 90 * 100)
+                self.assertEqual(sampler.last_per_core, (80.0, 50.0))
+
+    def test_cpu_native_setup_failure_remains_unavailable(self) -> None:
+        with mock.patch.object(
+            porkyhud.ctypes, "CDLL", side_effect=OSError("native library unavailable"),
+        ), mock.patch.object(
+            porkyhud.time, "monotonic", side_effect=[1.0, 1.5],
+        ), mock.patch.object(
+            porkyhud, "utc_now", return_value=datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
+        ):
+            sampler = porkyhud.MacCpuSampler()
+            result = sampler.sample_usage()
+        self.assertFalse(sampler.available)
+        self.assertEqual(
+            (result.outcome, result.failure),
+            (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+        )
 
     def test_sensor_os_thermal_is_independent_and_missing_state_is_unavailable(self) -> None:
         os_state = core.OsThermalState(0, 2)
@@ -1382,6 +1477,31 @@ class DecisionAdapterTests(unittest.TestCase):
         with mock.patch.object(porkyhud.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
             self.assertTrue(porkyhud.validate_sudoers_file("/tmp/porkyhud-rule"))
         run.assert_called_once_with([porkyhud.VISUDO_PATH, "-c", "-s", "-f", "/tmp/porkyhud-rule"])
+
+    def test_invalid_generated_sudoers_rule_fails_closed_before_privileged_actions(self) -> None:
+        fake_file = mock.mock_open()
+        with mock.patch.object(porkyhud.platform, "system", return_value="Darwin"), \
+             mock.patch.object(porkyhud.os.path, "exists", return_value=True), \
+             mock.patch.object(porkyhud.tempfile, "mkstemp",
+                               return_value=(123, "/tmp/porkyhud-test-rule")), \
+             mock.patch.object(porkyhud.os, "fdopen", fake_file), \
+             mock.patch.object(porkyhud.os, "chmod"), \
+             mock.patch.object(porkyhud.os, "unlink"), \
+             mock.patch.object(porkyhud, "validate_sudoers_file",
+                               return_value=False) as validate, \
+             mock.patch.object(porkyhud.subprocess, "run") as privileged_run, \
+             mock.patch.object(porkyhud, "remove_sensor_access") as remove_access, \
+             mock.patch.object(porkyhud, "powermetrics_sample") as sample_power, \
+             mock.patch.object(porkyhud, "advanced_sensor_access_available") as access_check, \
+             mock.patch("builtins.print"):
+            result = porkyhud.install_sensor_access()
+
+        self.assertEqual(result, 1)
+        validate.assert_called_once_with("/tmp/porkyhud-test-rule")
+        privileged_run.assert_not_called()
+        remove_access.assert_not_called()
+        sample_power.assert_not_called()
+        access_check.assert_not_called()
 
     @unittest.skipUnless(porkyhud.platform.system() == "Darwin", "visudo syntax is macOS-specific")
     def test_generated_sudoers_timeout_passes_macos_check_only_validation(self) -> None:
