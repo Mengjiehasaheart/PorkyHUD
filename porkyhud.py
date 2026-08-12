@@ -3564,7 +3564,14 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
         if is_header:
             raise ValueError("nested AGX object")
         top_level = outer_depth == 1
-        if top_level and "IOUserClientCreator" in line:
+        creator_property = top_level and "IOUserClientCreator" in line
+        usage_property = top_level and '"AppUsage"' in line
+        property_line = bool(
+            re.fullmatch(r'"(?:[^"\\]|\\.)+"\s*=\s*\S.*', stripped)
+        )
+        if stripped and stripped != "}" and not property_line:
+            raise ValueError("malformed AGX property line")
+        if creator_property:
             match = re.search(r'"IOUserClientCreator"\s*=\s*"pid\s+(\d+)\s*,\s*(.*?)"\s*$', line.strip())
             if match is None or current["pid"] is not None:
                 raise ValueError("malformed AGX creator")
@@ -3574,7 +3581,7 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
                 raise ValueError("invalid AGX creator")
             current["pid"] = pid
             current["identity"] = identity
-        if top_level and '"AppUsage"' in line:
+        if usage_property:
             if current["app_usage"] is not None:
                 raise ValueError("duplicate AGX AppUsage")
             match = re.fullmatch(r'"AppUsage"\s*=\s*(\(.*\))', stripped)
@@ -3588,6 +3595,8 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
         if outer_depth < 0:
             raise ValueError("unbalanced AGX object")
         if outer_depth == 0:
+            if stripped != "}":
+                raise ValueError("AGX outer object requires an exact close")
             pid = current["pid"]
             identity = current["identity"]
             counter = current["app_usage"]

@@ -2408,6 +2408,16 @@ class ProcessEvidenceTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 porkyhud.parse_agx_counters(raw)
 
+    def test_agx_parser_requires_an_exact_outer_close(self) -> None:
+        with self.assertRaises(ValueError):
+            porkyhud.parse_agx_counters(self.AGX_EMPTY_USAGE.replace("\n}\n", "\n} trailing\n"))
+
+    def test_agx_parser_rejects_arbitrary_lines_inside_a_client(self) -> None:
+        with self.assertRaises(ValueError):
+            porkyhud.parse_agx_counters(
+                self.AGX_EMPTY_USAGE.replace('  "AppUsage" = ()', "  arbitrary garbage\n  \"AppUsage\" = ()")
+            )
+
     def test_agx_creator_identity_preserves_spaced_labels_for_process_merge(self) -> None:
         parsed = porkyhud.parse_agx_counters(self.AGX_EMPTY_USAGE)
         self.assertEqual(parsed.identities[7], "Cisco Secure Client")
