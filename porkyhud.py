@@ -54,9 +54,11 @@ from porkyhud_core import (
     OsThermalState,
     PolicyState,
     ProcessFact,
+    RuleId,
     SourceId,
     SourceState,
     SourceView,
+    SourceViewStatus,
     complete_failure,
     complete_success,
     initial_policy_state,
@@ -386,6 +388,12 @@ class MetricHistory:
         self.net.append(max(0.0, net_bps))
         self.disk.append(clamp(disk_pct))
 
+    def clear(self) -> None:
+        self.cpu.clear()
+        self.ram.clear()
+        self.net.clear()
+        self.disk.clear()
+
 
 LIVE_SOURCE_SPECS: tuple[tuple[SourceId, float, float], ...] = (
     (SourceId.CPU_USAGE, 1.0, 2.5),
@@ -460,8 +468,53 @@ class HealthFrame:
         ordered = dict(self.source_views)
         if tuple(ordered) != tuple(source_id for source_id, _cadence, _stale in LIVE_SOURCE_SPECS):
             raise ValueError("source_views must contain the live registry in order")
+        if any(not isinstance(view, SourceView) for view in ordered.values()):
+            raise ValueError("source_views must contain SourceView values")
         if any(view.source_id is not source_id for source_id, view in ordered.items()):
             raise ValueError("source view has the wrong source id")
+
+        def supports_projection(source_id: SourceId) -> bool:
+            view = ordered[source_id]
+            return (
+                view.status is SourceViewStatus.LIVE
+                and view.decision_ready
+                and type(view.last_valid_revision) is int
+                and view.last_valid_revision > 0
+            )
+
+        for value, source_id, name in (
+            (self.cpu_percent, SourceId.CPU_USAGE, "cpu_percent"),
+            (self.memory_pressure, SourceId.MEMORY_PRESSURE, "memory_pressure"),
+            (self.thermal, SourceId.THERMAL_OS, "thermal"),
+            (self.disk_capacity, SourceId.DISK_CAPACITY, "disk_capacity"),
+        ):
+            if value is not None and not supports_projection(source_id):
+                raise ValueError("%s requires matching live evidence" % name)
+        if self.contributor.state is ContributorState.LEADING and (
+            not supports_projection(SourceId.PROCESS_TABLE)
+            or self.contributor.source_revision
+            != ordered[SourceId.PROCESS_TABLE].last_valid_revision
+        ):
+            raise ValueError("leading contributor requires matching process evidence")
+
+        first_rule_source = None
+        if self.assessment.active_rules:
+            first_rule = self.assessment.active_rules[0]
+            if first_rule in (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL):
+                first_rule_source = SourceId.MEMORY_PRESSURE
+            elif first_rule is RuleId.THERMAL_WATCH:
+                first_rule_source = SourceId.THERMAL_OS
+            elif first_rule is RuleId.STORAGE_WATCH:
+                first_rule_source = SourceId.DISK_CAPACITY
+            elif first_rule is RuleId.CPU_WATCH:
+                first_rule_source = SourceId.CPU_USAGE
+        has_matching_trigger = any(
+            ref.role is EvidenceRole.TRIGGER
+            and ref.source_id is first_rule_source
+            for ref in self.assessment.evidence
+        )
+        if has_matching_trigger != (self.decisive_triggered_mono_s is not None):
+            raise ValueError("decisive trigger time must match active trigger evidence")
         object.__setattr__(self, "source_views", MappingProxyType(ordered))
 
 
@@ -537,6 +590,19 @@ class AsyncPoller:
             next_thread.start()
 
 
+def _start_static_discovery(
+    collector: Callable[[], Any], now_mono_s: float,
+) -> AsyncPoller:
+    """Start one background static-discovery attempt for this HUD session."""
+
+    poller = AsyncPoller(float("inf"), collector)
+    poller.tick(now_mono_s, force=True)
+    return poller
+
+
+_NO_ATTEMPT_CONTEXT = object()
+
+
 class SourcePoller(Generic[T]):
     """Single-flight scheduler for collectors that return typed evidence."""
 
@@ -549,8 +615,8 @@ class SourcePoller(Generic[T]):
     def __init__(
         self,
         initial_state: SourceState[T],
-        collector: Callable[[], AdapterResult[T]],
-        on_attempt_started: Optional[Callable[[int], None]] = None,
+        collector: Callable[..., AdapterResult[T]],
+        attempt_context_factory: Optional[Callable[[int], Any]] = None,
     ) -> None:
         if not isinstance(initial_state, SourceState):
             raise ValueError("initial_state must be a SourceState")
@@ -568,16 +634,22 @@ class SourcePoller(Generic[T]):
         validate_source_state(initial_state, validation_now)
         if not callable(collector):
             raise ValueError("collector must be callable")
-        if on_attempt_started is not None and not callable(on_attempt_started):
-            raise ValueError("on_attempt_started must be callable or None")
+        if (
+            attempt_context_factory is not None
+            and not callable(attempt_context_factory)
+        ):
+            raise ValueError("attempt_context_factory must be callable or None")
 
         self._state = initial_state
         self._collector = collector
-        self._on_attempt_started = on_attempt_started
+        self._attempt_context_factory = attempt_context_factory
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._work_pending = False
         self._pending_revision: Optional[int] = None
+        self._pending_context: Any = None
+        self._pending_has_context = False
+        self._accepting_token: Optional[object] = None
         self._force_pending = False
         self._failure_count = 0
         self._next_due_mono_s: Optional[float] = None
@@ -613,17 +685,18 @@ class SourcePoller(Generic[T]):
     def tick(
         self, now_mono_s: float, force: bool = False
     ) -> SourceState[T]:
+        reservation: Optional[tuple[object, SourceState[T], int]] = None
         with self._condition:
             if self._closed:
                 raise RuntimeError("source poller is closed")
             now_mono_s = self._validate_mono(now_mono_s, "now_mono_s")
             if type(force) is not bool:
                 raise ValueError("force must be a bool")
-            if self._state.active_revision is not None:
+            if (
+                self._state.active_revision is not None
+                or self._accepting_token is not None
+            ):
                 if force:
-                    self._failure_count = 0
-                    self._automatic_stopped = False
-                    self._next_due_mono_s = None
                     self._force_pending = True
                 return self._state
 
@@ -635,18 +708,69 @@ class SourcePoller(Generic[T]):
                 )
             )
             if force or due:
-                state, revision = start_attempt(self._state, now_mono_s)
-                self._state = state
-                self._pending_revision = revision
-                if self._on_attempt_started is not None:
-                    self._on_attempt_started(revision)
-                self._work_pending = True
-                if force:
-                    self._failure_count = 0
-                    self._automatic_stopped = False
-                    self._next_due_mono_s = None
-                self._condition.notify_all()
+                reservation = self._reserve_attempt_locked(now_mono_s)
+            else:
+                return self._state
+
+        token, state, revision = reservation
+        context: Any = None
+        has_context = self._attempt_context_factory is not None
+        try:
+            if has_context:
+                context = self._attempt_context_factory(revision)
+        except BaseException:
+            with self._condition:
+                self._rollback_reservation_locked(token)
+            raise
+
+        with self._condition:
+            if self._closed or self._accepting_token is not token:
+                self._rollback_reservation_locked(token)
+                raise RuntimeError("source poller closed during attempt acceptance")
+            self._commit_reservation_locked(
+                token, state, revision, context, has_context,
+            )
+            if force:
+                self._failure_count = 0
+                self._automatic_stopped = False
+                self._next_due_mono_s = None
+            self._condition.notify_all()
             return self._state
+
+    def _reserve_attempt_locked(
+        self, started_mono_s: float,
+    ) -> tuple[object, SourceState[T], int]:
+        """Reserve one revision without exposing it as accepted work yet."""
+
+        if self._accepting_token is not None:
+            raise RuntimeError("source poller already has an accepting attempt")
+        state, revision = start_attempt(self._state, started_mono_s)
+        token = object()
+        self._accepting_token = token
+        return token, state, revision
+
+    def _commit_reservation_locked(
+        self,
+        token: object,
+        state: SourceState[T],
+        revision: int,
+        context: Any,
+        has_context: bool,
+    ) -> None:
+        if self._accepting_token is not token:
+            raise RuntimeError("attempt reservation is no longer current")
+        self._accepting_token = None
+        self._state = state
+        self._pending_revision = revision
+        self._pending_context = context
+        self._pending_has_context = has_context
+        self._work_pending = True
+
+    def _rollback_reservation_locked(self, token: object) -> None:
+        if self._accepting_token is token:
+            self._accepting_token = None
+            self._force_pending = False
+            self._condition.notify_all()
 
     def snapshot(self) -> SourceState[T]:
         with self._condition:
@@ -659,6 +783,7 @@ class SourcePoller(Generic[T]):
         with self._condition:
             self._closed = True
             self._force_pending = False
+            self._accepting_token = None
             if (
                 self._work_pending
                 and self._pending_revision is not None
@@ -676,6 +801,8 @@ class SourcePoller(Generic[T]):
                     completed_at_utc,
                 )
                 self._pending_revision = None
+                self._pending_context = None
+                self._pending_has_context = False
             self._work_pending = False
             self._condition.notify_all()
             worker = self._worker
@@ -693,13 +820,21 @@ class SourcePoller(Generic[T]):
                     self._work_pending = False
                     return
                 revision = self._pending_revision
+                context = self._pending_context
+                has_context = self._pending_has_context
+                self._pending_context = None
+                self._pending_has_context = False
                 self._work_pending = False
 
             try:
-                result: Any = self._collector()
+                if has_context:
+                    result = self._collector(context)
+                else:
+                    result = self._collector()
             except BaseException:
                 result = None
 
+            followup: Optional[tuple[object, SourceState[T], int]] = None
             with self._condition:
                 if revision is None or self._state.active_revision != revision:
                     if self._pending_revision == revision:
@@ -713,18 +848,39 @@ class SourcePoller(Generic[T]):
                 self._pending_revision = None
                 if self._force_pending and not self._closed:
                     self._force_pending = False
-                    self._failure_count = 0
-                    self._automatic_stopped = False
-                    self._next_due_mono_s = None
-                    state, next_revision = start_attempt(
-                        self._state, completion_mono_s
-                    )
-                    self._state = state
-                    self._pending_revision = next_revision
-                    self._work_pending = True
+                    followup = self._reserve_attempt_locked(completion_mono_s)
                 self._condition.notify_all()
                 if self._closed and not self._work_pending:
                     return
+
+            if followup is None:
+                continue
+            token, state, next_revision = followup
+            next_context: Any = None
+            next_has_context = self._attempt_context_factory is not None
+            try:
+                if next_has_context:
+                    next_context = self._attempt_context_factory(next_revision)
+            except BaseException:
+                with self._condition:
+                    self._rollback_reservation_locked(token)
+                    if self._closed:
+                        return
+                continue
+            with self._condition:
+                if self._closed or self._accepting_token is not token:
+                    self._rollback_reservation_locked(token)
+                    if self._closed:
+                        return
+                    continue
+                self._commit_reservation_locked(
+                    token, state, next_revision, next_context,
+                    next_has_context,
+                )
+                self._failure_count = 0
+                self._automatic_stopped = False
+                self._next_due_mono_s = None
+                self._condition.notify_all()
 
     def _complete_locked(self, revision: int, result: Any) -> float:
         started_mono_s = self._state.active_started_mono_s
@@ -2865,13 +3021,20 @@ def _powermetrics_permission_denied(result: CommandResult) -> bool:
     )
 
 
-def _powermetrics_capability_rejection(result: CommandResult) -> bool:
+def _powermetrics_capability_rejection(
+    result: CommandResult, attempted_samplers: str,
+) -> bool:
     """Recognize only bounded fixture-shaped sampler capability rejections."""
 
+    exact_rejections = {
+        "powermetrics: unrecognized sampler: %s" % sampler
+        for sampler in attempted_samplers.split(",")
+        if sampler
+    }
     return (
         result.outcome is AttemptOutcome.COMMAND_ERROR
         and result.failure is FailureCode.NONZERO_EXIT
-        and result.stderr.startswith("powermetrics: ")
+        and result.stderr.strip() in exact_rejections
     )
 
 
@@ -2889,12 +3052,12 @@ def _collect_powermetrics_attempt() -> _PowermetricsAttempt:
         stdout_limit=1024 * 1024,
         stderr_limit=64 * 1024,
     )
-    if result.outcome is AttemptOutcome.SUCCESS and result.stdout:
+    if result.outcome is AttemptOutcome.SUCCESS and result.stdout.strip():
         with POWER_METRICS_SAMPLER_LOCK:
             POWER_METRICS_SAMPLER_INDEX = index
         return _PowermetricsAttempt(result.stdout, False)
-    if ((result.outcome is AttemptOutcome.SUCCESS and not result.stdout)
-            or _powermetrics_capability_rejection(result)):
+    if ((result.outcome is AttemptOutcome.SUCCESS and not result.stdout.strip())
+            or _powermetrics_capability_rejection(result, samplers)):
         with POWER_METRICS_SAMPLER_LOCK:
             if index < len(POWER_METRICS_SAMPLER_SETS) - 1:
                 POWER_METRICS_SAMPLER_INDEX = index + 1
@@ -3786,6 +3949,36 @@ def network_bytes() -> tuple[int, int]:
     )
 
 
+def _network_rate_update(
+    baseline: Optional[tuple[tuple[int, int], float]],
+    totals: tuple[int, int],
+    sampled_mono_s: float,
+) -> tuple[
+    tuple[tuple[int, int], float], Optional[tuple[float, float]]
+]:
+    """Prime cumulative counters, then derive only monotonic sample deltas."""
+
+    sampled = (int(totals[0]), int(totals[1]))
+    now = float(sampled_mono_s)
+    if baseline is None:
+        return (sampled, now), None
+    previous, previous_mono_s = baseline
+    if sampled == previous:
+        return baseline, None
+    if sampled[0] < previous[0] or sampled[1] < previous[1]:
+        return (sampled, now), (0.0, 0.0)
+    elapsed = now - previous_mono_s
+    if elapsed <= 0.0:
+        return (sampled, now), (0.0, 0.0)
+    return (
+        (sampled, now),
+        (
+            (sampled[0] - previous[0]) / elapsed,
+            (sampled[1] - previous[1]) / elapsed,
+        ),
+    )
+
+
 def collect_runtime_stats() -> RuntimeStats:
     memory = memory_stats()
     battery = battery_info()
@@ -4243,9 +4436,18 @@ def _validated_live_states(
     if tuple(states) != expected:
         raise ValueError("states must use the exact live registry order")
     copied: dict[SourceId, SourceState[Any]] = {}
+    expected_specs = {
+        source_id: (cadence_s, stale_after_s)
+        for source_id, cadence_s, stale_after_s in LIVE_SOURCE_SPECS
+    }
     for source_id in expected:
         state = states[source_id]
         validate_source_state(state, now_mono_s, source_id)
+        if (
+            state.expected_cadence_s,
+            state.stale_after_s,
+        ) != expected_specs[source_id]:
+            raise ValueError("source cadence must match the live registry")
         copied[source_id] = state
     copied[SourceId.PROCESS_TABLE] = _sanitized_process_state(
         copied[SourceId.PROCESS_TABLE], now_mono_s,
@@ -4354,8 +4556,9 @@ class LiveHealthCoordinator:
         self._frame = initial_health_frame(0.0)
         self._per_core: tuple[float, ...] = ()
         self._per_core_revision = 0
-        self._cpu_per_core_by_completion: dict[tuple[int, float], tuple[float, ...]] = {}
-        self._cpu_per_core_by_revision: dict[tuple[int, int], tuple[float, ...]] = {}
+        self._cpu_per_core_result: Optional[
+            tuple[int, int, tuple[float, ...]]
+        ] = None
         self._system_gpu_percent: Optional[float] = None
         self._previous_time: Optional[tuple[float, datetime]] = None
         self._cpu_sampler: MacCpuSampler
@@ -4363,49 +4566,94 @@ class LiveHealthCoordinator:
         self._pollers: Mapping[SourceId, SourcePoller[Any]]
         self._create_generation()
 
+    def _commit_cpu_per_core(
+        self, generation: int, revision: int, per_core: tuple[float, ...],
+    ) -> None:
+        """Commit per-core evidence only to its accepting live generation."""
+
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return
+            self._cpu_per_core_result = (
+                generation, revision, tuple(per_core),
+            )
+
+    def _consume_cpu_per_core_revision(self, revision: int) -> None:
+        """Advance display evidence to one exact CPU source revision."""
+
+        with self._lock:
+            generation = self._generation
+            result = self._cpu_per_core_result
+            if result is None:
+                return
+            result_generation, result_revision, per_core = result
+            if result_generation != generation or result_revision < revision:
+                self._cpu_per_core_result = None
+                return
+            if result_revision != revision:
+                return
+            self._per_core = per_core
+            self._per_core_revision = revision
+            self._cpu_per_core_result = None
+
     def _create_generation(self) -> None:
-        self._generation += 1
-        generation = self._generation
+        generation = self._generation + 1
         cpu_sampler = MacCpuSampler()
         gpu_sampler = GPUProcessSampler()
         pollers: dict[SourceId, SourcePoller[Any]] = {}
-        gpu_calibration_by_revision: dict[int, Optional[float]] = {}
 
-        def collect_cpu() -> AdapterResult[CpuUsage]:
+        def cpu_context(revision: int) -> tuple[int, int]:
+            with self._lock:
+                if self._closed or self._generation != generation:
+                    raise RuntimeError("CPU generation is detached")
+                return generation, revision
+
+        def collect_cpu(context: tuple[int, int]) -> AdapterResult[CpuUsage]:
+            accepted_generation, revision = context
             result = cpu_sampler.sample_usage()
             per_core = tuple(cpu_sampler.last_per_core)
             if result.outcome is AttemptOutcome.SUCCESS:
-                with self._lock:
-                    if self._generation == generation and not self._closed:
-                        self._cpu_per_core_by_completion[(generation, result.completed_mono_s)] = per_core
+                self._commit_cpu_per_core(
+                    accepted_generation, revision, per_core,
+                )
             return result
 
-        def collect_gpu() -> AdapterResult[GpuProcessSample]:
+        def gpu_context(
+            revision: int,
+        ) -> tuple[int, int, Optional[float]]:
             with self._lock:
-                calibration = gpu_calibration_by_revision.pop(
-                    self._pollers[SourceId.PROCESS_GPU].snapshot().active_revision or 0,
-                    self._system_gpu_percent,
+                if self._closed or self._generation != generation:
+                    raise RuntimeError("GPU generation is detached")
+                return generation, revision, self._system_gpu_percent
+
+        def collect_gpu(
+            context: tuple[int, int, Optional[float]],
+        ) -> AdapterResult[GpuProcessSample]:
+            accepted_generation, _revision, calibration = context
+            with self._lock:
+                current = (
+                    self._generation == accepted_generation
+                    and not self._closed
                 )
-                current = self._generation == generation and not self._closed
             if not current:
+                started_mono_s = time.monotonic()
                 return AdapterResult(
-                    None, time.monotonic(), time.monotonic(), utc_now(),
+                    None, started_mono_s, time.monotonic(), utc_now(),
                     AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                 )
             return collect_gpu_process_sample(gpu_sampler, calibration)
 
-        def capture_gpu_calibration(revision: int) -> None:
-            # SourcePoller invokes this while it holds its Condition lock.  The
-            # coordinator tick already owns _lock; do not invert that order.
-            gpu_calibration_by_revision[revision] = self._system_gpu_percent
-
-        collectors: Mapping[SourceId, Callable[[], AdapterResult[Any]]] = {
+        collectors: Mapping[SourceId, Callable[..., AdapterResult[Any]]] = {
             SourceId.CPU_USAGE: collect_cpu,
             SourceId.MEMORY_PRESSURE: collect_memory_pressure,
             SourceId.THERMAL_OS: collect_os_thermal_state,
             SourceId.DISK_CAPACITY: collect_disk_capacity,
             SourceId.PROCESS_TABLE: collect_process_rows,
             SourceId.PROCESS_GPU: collect_gpu,
+        }
+        context_factories: Mapping[SourceId, Callable[[int], Any]] = {
+            SourceId.CPU_USAGE: cpu_context,
+            SourceId.PROCESS_GPU: gpu_context,
         }
         deadline = time.monotonic() + 1.0
         try:
@@ -4415,11 +4663,12 @@ class LiveHealthCoordinator:
                         source_id, cadence_s, stale_after_s,
                     ),
                     collectors[source_id],
-                    capture_gpu_calibration if source_id is SourceId.PROCESS_GPU else None,
+                    context_factories.get(source_id),
                 )
         except BaseException:
             self._close_poller_set(pollers, deadline)
             raise
+        self._generation = generation
         self._cpu_sampler = cpu_sampler
         self._gpu_sampler = gpu_sampler
         self._pollers = MappingProxyType(pollers)
@@ -4460,6 +4709,8 @@ class LiveHealthCoordinator:
         if type(force) is not bool:
             raise ValueError("force must be a bool")
         with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
             snapshots: dict[SourceId, SourceState[Any]] = {}
             for source_id, _cadence, _stale in LIVE_SOURCE_SPECS:
                 self._pollers[source_id].tick(float(now_mono_s), force)
@@ -4474,21 +4725,9 @@ class LiveHealthCoordinator:
             )
             self._frame_states = MappingProxyType(frame_states)
             cpu = frame_states[SourceId.CPU_USAGE]
-            if (cpu.last_attempt is not None
-                    and cpu.last_attempt.outcome is AttemptOutcome.SUCCESS
-                    and cpu.last_valid is not None
+            if (cpu.last_valid is not None
                     and cpu.last_valid.revision != self._per_core_revision):
-                completion_key = (self._generation, cpu.last_valid.completed_mono_s)
-                revision_key = (self._generation, cpu.last_valid.revision)
-                self._cpu_per_core_by_revision[revision_key] = (
-                    self._cpu_per_core_by_completion.pop(completion_key, ())
-                )
-                self._per_core = self._cpu_per_core_by_revision[revision_key]
-                self._per_core_revision = cpu.last_valid.revision
-                self._cpu_per_core_by_revision = {
-                    key: value for key, value in self._cpu_per_core_by_revision.items()
-                    if key[0] == self._generation and key[1] >= self._per_core_revision - 1
-                }
+                self._consume_cpu_per_core_revision(cpu.last_valid.revision)
             return self._frame
 
     def source_state(self, source_id: SourceId) -> SourceState[Any]:
@@ -4515,6 +4754,12 @@ class LiveHealthCoordinator:
         with self._lock:
             return self._per_core
 
+    def source_generation(self) -> int:
+        """Return the live source-domain token used to reset chart evidence."""
+
+        with self._lock:
+            return self._generation
+
     def set_system_gpu_percent(self, percent: Optional[float]) -> None:
         with self._lock:
             if self._closed:
@@ -4525,6 +4770,8 @@ class LiveHealthCoordinator:
                 or percent < 0 or percent > 100):
             raise ValueError("system GPU percent must be a finite 0..100 value or None")
         with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
             self._system_gpu_percent = None if percent is None else float(percent)
 
     def reset_policy(self) -> None:
@@ -4540,30 +4787,39 @@ class LiveHealthCoordinator:
         if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
             raise ValueError("now_mono_s must be finite")
         normalized = _normalize_utc_timestamp(now_utc, "now_utc")
+        old_pollers: Optional[Mapping[SourceId, SourcePoller[Any]]] = None
         with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
             previous = self._previous_time
-            self._previous_time = (float(now_mono_s), normalized)
             if previous is None:
+                self._previous_time = (float(now_mono_s), normalized)
                 return False
             mono_delta = float(now_mono_s) - previous[0]
             wall_delta = (normalized - previous[1]).total_seconds()
             reset_sources = mono_delta < 0 or mono_delta > 30.0
             reset_policy_only = abs(wall_delta - mono_delta) > 5.0
             if not reset_sources and not reset_policy_only:
+                self._previous_time = (float(now_mono_s), normalized)
                 return False
-            self._policy = reset_policy_state()
             if reset_sources:
                 old_pollers = self._pollers
+                self._create_generation()
+                self._policy = reset_policy_state()
                 self._per_core = ()
                 self._per_core_revision = 0
-                self._cpu_per_core_by_completion.clear()
-                self._cpu_per_core_by_revision.clear()
+                self._cpu_per_core_result = None
                 self._frame_states = _registry_states()
-                self._create_generation()
-                error = self._close_poller_set(old_pollers, time.monotonic() + 1.0)
-                if error is not None:
-                    raise error
-            return True
+            else:
+                self._policy = reset_policy_state()
+            self._previous_time = (float(now_mono_s), normalized)
+        if old_pollers is not None:
+            error = self._close_poller_set(
+                old_pollers, time.monotonic() + 1.0,
+            )
+            if error is not None:
+                raise error
+        return True
 
     def close(self) -> None:
         with self._lock:
@@ -4715,6 +4971,43 @@ def ram_percent(mem: dict[str, float]) -> float:
 
 def disk_percent(disk: DiskInfo) -> float:
     return disk.used / disk.total * 100.0 if disk.total else 0.0
+
+
+def _record_history_frame(
+    history: MetricHistory,
+    frame: HealthFrame,
+    last_cpu_revision: Optional[int],
+    per_core: list[float],
+    memory: dict[str, float],
+    network_bps: float,
+    disk: DiskInfo,
+) -> Optional[int]:
+    """Append once for each newly accepted 1 Hz CPU evidence revision."""
+
+    cpu_view = frame.source_views[SourceId.CPU_USAGE]
+    revision = cpu_view.last_valid_revision
+    if (
+        last_cpu_revision is not None
+        and revision is None
+        and cpu_view.status is SourceViewStatus.CHECKING
+    ):
+        history.clear()
+        return None
+    if (
+        cpu_view.status is not SourceViewStatus.LIVE
+        or not cpu_view.decision_ready
+        or type(revision) is not int
+        or revision <= 0
+        or revision == last_cpu_revision
+    ):
+        return last_cpu_revision
+    history.add(
+        cpu_total_percent(per_core),
+        ram_percent(memory),
+        network_bps,
+        disk_percent(disk),
+    )
+    return revision
 
 
 def comet(width: int, phase: int, density: float = 0.65) -> str:
@@ -5754,7 +6047,7 @@ def _hud_impl(
         result["boot_seconds"] = boot_seconds()
         return result
 
-    static_poller = AsyncPoller(3600.0, collect_live_static, static)
+    static_poller: Optional[AsyncPoller] = None
     uptime_at_start = 0
     uptime_clock_start = time.monotonic()
     per_core: list[float] = []
@@ -5773,7 +6066,7 @@ def _hud_impl(
     activity = DiskActivity()
     memory_poller = AsyncPoller(MEMORY_DETAIL_REFRESH_SECONDS, memory_detail, mem)
     swap_poller = AsyncPoller(SWAP_REFRESH_SECONDS, swap_stats, (0.0, 0.0))
-    network_poller = AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes, (0, 0))
+    network_poller = AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes)
     battery_poller = AsyncPoller(BATTERY_REFRESH_SECONDS, battery_info, battery)
     sensor_poller = AsyncPoller(
         OPTIONAL_SENSOR_REFRESH_SECONDS,
@@ -5782,17 +6075,16 @@ def _hud_impl(
     )
     disk_activity_poller = AsyncPoller(DISK_ACTIVITY_REFRESH_SECONDS, disk_activity, activity)
     history = MetricHistory()
-    history.add(cpu_total_percent(per_core), ram_percent(mem), 0.0, disk_percent(disk))
+    history_source_generation = coordinator.source_generation()
+    last_history_cpu_revision: Optional[int] = None
     force_live = True
-    force_static = True
     force_memory = True
     force_swap = True
     force_network = True
     force_battery = True
     force_sensor = True
     force_disk_activity = True
-    prior_network = (0, 0)
-    prior_network_at = time.monotonic()
+    network_baseline: Optional[tuple[tuple[int, int], float]] = None
     last_render = 0.0
 
     def quit_hud() -> None:
@@ -5867,6 +6159,11 @@ def _hud_impl(
             set_message(config, "refreshing live telemetry")
 
         coordinator.observe_time(now, utc_now())
+        current_source_generation = coordinator.source_generation()
+        if current_source_generation != history_source_generation:
+            history.clear()
+            last_history_cpu_revision = None
+            history_source_generation = current_source_generation
         frame = coordinator.tick(now, force_live)
         latest_thermal[0] = frame.thermal
         per_core = list(coordinator.per_core())
@@ -5877,7 +6174,8 @@ def _hud_impl(
                             capacity.free_bytes)
         rows = sort_process_rows(coordinator.process_rows(now), sort_mode)
 
-        static_poller.tick(now, force_static)
+        if static_poller is None:
+            static_poller = _start_static_discovery(collect_live_static, now)
         sampled_static, _static_age, _static_error = static_poller.snapshot(now)
         if sampled_static:
             static = sampled_static
@@ -5892,12 +6190,12 @@ def _hud_impl(
             mem = merge_memory_stats(mem, sampled_swap)
         network_poller.tick(now, force_network)
         sampled_network, _network_age, _network_error = network_poller.snapshot(now)
-        if sampled_network is not None and sampled_network != prior_network:
-            elapsed = max(0.1, now - prior_network_at)
-            net_down = max(0.0, (sampled_network[0] - prior_network[0]) / elapsed)
-            net_up = max(0.0, (sampled_network[1] - prior_network[1]) / elapsed)
-            prior_network = sampled_network
-            prior_network_at = now
+        if sampled_network is not None:
+            network_baseline, sampled_rates = _network_rate_update(
+                network_baseline, sampled_network, now,
+            )
+            if sampled_rates is not None:
+                net_down, net_up = sampled_rates
         battery_poller.tick(now, force_battery)
         sampled_battery, _battery_age, _battery_error = battery_poller.snapshot(now)
         if sampled_battery is not None:
@@ -5914,9 +6212,16 @@ def _hud_impl(
         if sampled_activity is not None:
             activity = replace(sampled_activity, sample_age=activity_age)
 
-        history.add(cpu_total_percent(per_core), ram_percent(mem), net_down + net_up, disk_percent(disk))
+        last_history_cpu_revision = _record_history_frame(
+            history,
+            frame,
+            last_history_cpu_revision,
+            per_core,
+            mem,
+            net_down + net_up,
+            disk,
+        )
         force_live = False
-        force_static = False
         force_memory = False
         force_swap = False
         force_network = False

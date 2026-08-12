@@ -1996,6 +1996,58 @@ class LiveOrchestrationTests(unittest.TestCase):
             self.UTC, outcome, failure,
         )
 
+    def adapter_success(self, value, started: float, completed: float):
+        return porkyhud.AdapterResult(
+            value, started, completed, self.UTC,
+            core.AttemptOutcome.SUCCESS, None,
+        )
+
+    def live_cpu_frame(
+        self, revision, status=core.SourceViewStatus.LIVE, ready=True,
+    ):
+        frame = porkyhud.initial_health_frame(float(max(0, revision or 0)))
+        views = dict(frame.source_views)
+        views[core.SourceId.CPU_USAGE] = core.SourceView(
+            core.SourceId.CPU_USAGE, status, 0.0, False, ready, revision, None,
+        )
+        return replace(frame, source_views=views)
+
+    def threaded_call(self, callback):
+        done, errors = threading.Event(), []
+        def run():
+            try:
+                callback()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        return worker, done, errors
+
+    def wait_for_revision(self, poller, revision):
+        with poller._condition:
+            return poller._condition.wait_for(
+                lambda: poller._state.active_revision is None
+                and poller._state.last_attempt is not None
+                and poller._state.last_attempt.revision == revision,
+                1.0,
+            )
+
+    class SyncPoller:
+        def __init__(self, _interval, collector, initial=None, initial_is_fresh=False):
+            del initial_is_fresh
+            self.collector, self.value, self.started = collector, initial, False
+        def tick(self, _now, force=False):
+            del force
+            if not self.started:
+                self.started = True
+                if self.value is None:
+                    self.value = self.collector()
+            return self.value
+        def snapshot(self, _now=None):
+            return self.value, 0.0, ""
+
     def test_initial_health_frame_is_pristine_and_registry_ordered(self) -> None:
         frame = porkyhud.initial_health_frame(10.0)
         self.assertEqual(
@@ -2026,6 +2078,36 @@ class LiveOrchestrationTests(unittest.TestCase):
         self.assertNotIn("swap_used", first)
         self.assertEqual((merged["swap_used"], merged["swap_total"]), (3.0, 4.0))
 
+    def test_network_rates_prime_then_compute_and_reset_on_counter_reversal(self) -> None:
+        baseline, rates = porkyhud._network_rate_update(
+            None, (1_000, 2_000), 10.0,
+        )
+        self.assertEqual(baseline, ((1_000, 2_000), 10.0))
+        self.assertIsNone(rates)
+
+        unchanged, rates = porkyhud._network_rate_update(
+            baseline, (1_000, 2_000), 10.5,
+        )
+        self.assertEqual(unchanged, baseline)
+        self.assertIsNone(rates)
+
+        baseline, rates = porkyhud._network_rate_update(
+            baseline, (1_600, 2_300), 11.0,
+        )
+        self.assertEqual(baseline, ((1_600, 2_300), 11.0))
+        self.assertEqual(rates, (600.0, 300.0))
+
+        baseline, rates = porkyhud._network_rate_update(
+            baseline, (100, 2_500), 12.0,
+        )
+        self.assertEqual(baseline, ((100, 2_500), 12.0))
+        self.assertEqual(rates, (0.0, 0.0))
+
+        baseline, rates = porkyhud._network_rate_update(
+            baseline, (300, 2_900), 14.0,
+        )
+        self.assertEqual(rates, (100.0, 200.0))
+
     def test_steady_state_launch_budget_is_exactly_bounded(self) -> None:
         budget = porkyhud.steady_state_launch_budget()
         self.assertEqual(budget["scheduled"], 228)
@@ -2048,7 +2130,7 @@ class LiveOrchestrationTests(unittest.TestCase):
         self.assertEqual(runner.call_args.kwargs["timeout_s"], 5.5)
 
     def test_empty_powermetrics_advances_candidate_for_next_attempt_only(self) -> None:
-        empty = self.command_result(stdout="")
+        empty = self.command_result(stdout=" \n\t")
         good = self.command_result(stdout="thermal pressure: nominal")
         with mock.patch.object(porkyhud, "POWER_METRICS_SAMPLER_INDEX", 0), \
                 mock.patch.object(porkyhud, "run_structured_command", side_effect=[empty, good]) as runner:
@@ -2061,6 +2143,33 @@ class LiveOrchestrationTests(unittest.TestCase):
         first_args = runner.call_args_list[0].args[0]
         second_args = runner.call_args_list[1].args[0]
         self.assertNotEqual(first_args, second_args)
+
+    def test_powermetrics_advances_only_for_exact_attempted_sampler_rejection(self) -> None:
+        samplers = porkyhud.POWER_METRICS_SAMPLER_SETS[0]
+        cases = (
+            ("powermetrics: unrecognized sampler: smc\n", 1),
+            ("powermetrics: internal I/O error", 0),
+            ("powermetrics: unrecognized sampler: smc (disabled)", 0),
+            ("error: powermetrics: unrecognized sampler: smc", 0),
+            ("powermetrics: unrecognized sampler: tasks", 0),
+        )
+        for stderr, expected_index in cases:
+            with self.subTest(stderr=stderr):
+                rejected = self.command_result(
+                    stderr=stderr,
+                    outcome=core.AttemptOutcome.COMMAND_ERROR,
+                    failure=core.FailureCode.NONZERO_EXIT,
+                    returncode=1,
+                )
+                with mock.patch.object(
+                    porkyhud, "POWER_METRICS_SAMPLER_INDEX", 0,
+                ), mock.patch.object(
+                    porkyhud, "run_structured_command", return_value=rejected,
+                ):
+                    porkyhud._collect_powermetrics_attempt()
+                    self.assertEqual(
+                        porkyhud.POWER_METRICS_SAMPLER_INDEX, expected_index,
+                    )
 
     def test_frame_rejects_missing_extra_and_wrong_registry_states(self) -> None:
         states = dict(porkyhud._registry_states())
@@ -2076,6 +2185,14 @@ class LiveOrchestrationTests(unittest.TestCase):
         wrong[core.SourceId.CPU_USAGE] = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
         with self.assertRaises(ValueError):
             porkyhud.build_health_frame(core.initial_policy_state(), wrong, 1.0)
+        wrong_cadence = dict(states)
+        wrong_cadence[core.SourceId.CPU_USAGE] = core.new_source(
+            core.SourceId.CPU_USAGE, 2.0, 2.5,
+        )
+        with self.assertRaises(ValueError):
+            porkyhud.build_health_frame(
+                core.initial_policy_state(), wrong_cadence, 1.0,
+            )
 
     def test_default_sensor_is_not_locked_without_permission_proof(self) -> None:
         self.assertFalse(porkyhud.default_sensor_info().privileged_locked)
@@ -2121,8 +2238,19 @@ class LiveOrchestrationTests(unittest.TestCase):
                 frame.captured_mono_s, None,
             )
 
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, 10, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+                frame.captured_mono_s, None,
+            )
+        ready_views = dict(frame.source_views)
+        ready_views[core.SourceId.CPU_USAGE] = core.SourceView(
+            core.SourceId.CPU_USAGE, core.SourceViewStatus.LIVE, 0.0,
+            False, True, 1, None,
+        )
         accepted = porkyhud.HealthFrame(
-            frame.assessment, frame.source_views, 10, frame.memory_pressure,
+            frame.assessment, ready_views, 10, frame.memory_pressure,
             frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
             frame.captured_mono_s, None,
         )
@@ -2144,6 +2272,19 @@ class LiveOrchestrationTests(unittest.TestCase):
                 frame.assessment, frame.source_views, None, frame.memory_pressure,
                 frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
                 frame.captured_mono_s, 2.0,
+            )
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, None, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity,
+                core.CpuContributor(core.ContributorState.LEADING, "python", 1),
+                frame.origin, frame.captured_mono_s, None,
+            )
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, None, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+                frame.captured_mono_s, 0.5,
             )
 
     def test_process_state_uses_canonical_minimized_facts_and_preserves_metadata(self) -> None:
@@ -2171,8 +2312,7 @@ class LiveOrchestrationTests(unittest.TestCase):
         coordinator._frame_states = porkyhud._registry_states()
         coordinator._per_core = ()
         coordinator._per_core_revision = 0
-        coordinator._cpu_per_core_by_completion = {}
-        coordinator._cpu_per_core_by_revision = {}
+        coordinator._cpu_per_core_result = None
         coordinator._pollers = {}
         coordinator._create_generation = mock.Mock()
         coordinator._close_poller_set = mock.Mock(return_value=None)
@@ -2223,13 +2363,94 @@ class LiveOrchestrationTests(unittest.TestCase):
                 porkyhud.LiveHealthCoordinator()
         self.assertTrue(all(getattr(poller, "closed", False) for poller in created[:2]))
 
+    def test_failed_discontinuity_rebuild_preserves_the_live_generation(self) -> None:
+        class Poller:
+            created = []
+            fail_at = None
+
+            def __init__(self, state, *_args, **_kwargs):
+                Poller.created.append(self)
+                if Poller.fail_at == len(Poller.created):
+                    raise RuntimeError("rebuild failed")
+                self.state = state
+                self.closed_with = None
+
+            def tick(self, _now, _force=False):
+                return self.state
+
+            def snapshot(self):
+                return self.state
+
+            def close(self, timeout_s):
+                self.closed_with = timeout_s
+
+        with mock.patch.object(porkyhud, "SourcePoller", Poller):
+            coordinator = porkyhud.LiveHealthCoordinator()
+            old_generation = coordinator.source_generation()
+            old_pollers = coordinator._pollers
+            old_cpu_sampler = coordinator._cpu_sampler
+            old_gpu_sampler = coordinator._gpu_sampler
+            old_policy = coordinator._policy
+            old_frame_states = coordinator._frame_states
+            coordinator._per_core = (42.0,)
+            coordinator._per_core_revision = 7
+            coordinator._cpu_per_core_result = (old_generation, 8, (43.0,))
+            coordinator.observe_time(0.0, self.UTC)
+
+            Poller.fail_at = len(Poller.created) + 3
+            with self.assertRaisesRegex(RuntimeError, "rebuild failed"):
+                coordinator.observe_time(31.0, self.UTC + timedelta(seconds=31))
+
+            self.assertEqual(coordinator.source_generation(), old_generation)
+            self.assertIs(coordinator._pollers, old_pollers)
+            self.assertIs(coordinator._cpu_sampler, old_cpu_sampler)
+            self.assertIs(coordinator._gpu_sampler, old_gpu_sampler)
+            self.assertIs(coordinator._policy, old_policy)
+            self.assertIs(coordinator._frame_states, old_frame_states)
+            self.assertEqual(coordinator.per_core(), (42.0,))
+            self.assertEqual(
+                coordinator._cpu_per_core_result,
+                (old_generation, 8, (43.0,)),
+            )
+            self.assertEqual(coordinator._previous_time, (0.0, self.UTC))
+            staged = Poller.created[6:8]
+            self.assertEqual(len(staged), 2)
+            self.assertTrue(all(item.closed_with is not None for item in staged))
+            self.assertTrue(all(0.0 <= item.closed_with <= 1.0 for item in staged))
+            self.assertIs(coordinator.tick(1.0), coordinator._frame)
+            coordinator.close()
+
+    def test_attempt_context_may_equal_the_internal_absence_sentinel(self) -> None:
+        seen = []
+
+        def collector(context):
+            seen.append(context)
+            return self.adapter_success("ok", 0.0, 0.1)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            collector,
+            attempt_context_factory=lambda _revision: porkyhud._NO_ATTEMPT_CONTEXT,
+        )
+        try:
+            poller.tick(0.0)
+            self.assertTrue(self.wait_for_revision(poller, 1))
+            self.assertEqual(len(seen), 1)
+            self.assertIs(seen[0], porkyhud._NO_ATTEMPT_CONTEXT)
+            self.assertEqual(
+                poller.snapshot().last_attempt.outcome,
+                core.AttemptOutcome.SUCCESS,
+            )
+        finally:
+            poller.close()
+
     def test_gpu_calibration_is_captured_at_attempt_acceptance(self) -> None:
         observed = []
         state = core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0)
         poller = porkyhud.SourcePoller(
             state,
-            lambda: (_ for _ in ()).throw(RuntimeError("stop")),
-            on_attempt_started=lambda revision: observed.append(revision),
+            lambda _context: (_ for _ in ()).throw(RuntimeError("stop")),
+            attempt_context_factory=lambda revision: observed.append(revision),
         )
         try:
             poller.tick(1.0)
@@ -2237,11 +2458,11 @@ class LiveOrchestrationTests(unittest.TestCase):
         finally:
             poller.close()
 
-    def test_attempt_hook_is_linearized_before_worker_collection(self) -> None:
+    def test_attempt_context_is_linearized_before_worker_collection(self) -> None:
         events = []
         done = threading.Event()
-        def collector():
-            events.append("collect")
+        def collector(context):
+            events.append(("collect", context))
             done.set()
             return porkyhud.AdapterResult(
                 core.GpuProcessSample({}, {}, True, False), 1.0, 1.1, self.UTC,
@@ -2249,35 +2470,577 @@ class LiveOrchestrationTests(unittest.TestCase):
             )
         poller = porkyhud.SourcePoller(
             core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0), collector,
-            on_attempt_started=lambda _revision: events.append("accepted"),
+            attempt_context_factory=lambda revision: events.append("accepted") or revision,
         )
         try:
             poller.tick(1.0)
             self.assertTrue(done.wait(1.0))
-            self.assertEqual(events[:2], ["accepted", "collect"])
+            self.assertEqual(events[:2], ["accepted", ("collect", 1)])
         finally:
             poller.close()
 
     def test_cpu_completion_cache_is_generation_and_revision_scoped(self) -> None:
         coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._closed = False
         coordinator._generation = 2
         coordinator._per_core_revision = 3
-        coordinator._cpu_per_core_by_completion = {(1, 1.0): (99.0,)}
-        coordinator._cpu_per_core_by_revision = {
-            (1, 1): (99.0,), (2, 1): (50.0,), (2, 2): (40.0,), (2, 3): (30.0,),
-        }
         coordinator._per_core = (30.0,)
-        coordinator._cpu_per_core_by_revision = {
-            key: value for key, value in coordinator._cpu_per_core_by_revision.items()
-            if key[0] == coordinator._generation and key[1] >= coordinator._per_core_revision - 1
-        }
+        coordinator._cpu_per_core_result = (1, 4, (99.0,))
+        coordinator._commit_cpu_per_core(1, 5, (90.0,))
         self.assertEqual(coordinator._per_core, (30.0,))
-        self.assertEqual(coordinator._cpu_per_core_by_revision, {(2, 2): (40.0,), (2, 3): (30.0,)})
+        self.assertEqual(coordinator._cpu_per_core_result, (1, 4, (99.0,)))
+        coordinator._commit_cpu_per_core(2, 5, (50.0,))
+        self.assertEqual(coordinator._cpu_per_core_result, (2, 5, (50.0,)))
 
     def test_static_collector_is_session_once_and_history_only_updates_on_fresh_frame(self) -> None:
-        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["memory_pressure"], 60)
-        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["process_table"], 24)
-        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["disk_capacity"], 2)
+        history = porkyhud.MetricHistory()
+        last_revision = None
+        for revision in range(1, 61):
+            for _render in range(30):
+                last_revision = porkyhud._record_history_frame(
+                    history, self.live_cpu_frame(revision), last_revision,
+                    [float(revision)],
+                    {"total": 100.0, "used": 50.0}, 0.0,
+                    porkyhud.DiskInfo("data", "/", 100, 50, 50),
+                )
+        self.assertEqual(len(history.cpu), 60)
+        self.assertEqual((history.cpu[0], history.cpu[-1]), (1.0, 60.0))
+        self.assertEqual(last_revision, 60)
+
+    def test_history_rejects_non_live_nonpositive_or_unready_cpu_views(self) -> None:
+        history = porkyhud.MetricHistory()
+        cases = (
+            (core.SourceViewStatus.STALE, True, 1),
+            (core.SourceViewStatus.LIVE, False, 1),
+            (core.SourceViewStatus.LIVE, True, 0),
+            (core.SourceViewStatus.LIVE, True, -1),
+            (core.SourceViewStatus.LIVE, True, True),
+        )
+        for status, ready, revision in cases:
+            with self.subTest(status=status, ready=ready, revision=revision):
+                self.assertIsNone(porkyhud._record_history_frame(
+                    history, self.live_cpu_frame(revision, status, ready),
+                    None, [50.0],
+                    {"total": 100.0, "used": 50.0}, 1.0,
+                    porkyhud.DiskInfo("data", "/", 100, 50, 50),
+                ))
+        self.assertEqual(len(history.cpu), 0)
+
+    def test_hard_reset_clears_history_and_allows_new_revision_one(self) -> None:
+        history = porkyhud.MetricHistory()
+        disk = porkyhud.DiskInfo("data", "/", 100, 50, 50)
+        last_revision = porkyhud._record_history_frame(
+            history, self.live_cpu_frame(1), None, [40.0],
+            {"total": 100.0, "used": 50.0}, 1.0, disk,
+        )
+        checking = porkyhud.initial_health_frame(2.0)
+        last_revision = porkyhud._record_history_frame(
+            history, checking, last_revision, [], {}, 0.0, disk,
+        )
+        self.assertIsNone(last_revision)
+        self.assertEqual(tuple(history.cpu), ())
+        last_revision = porkyhud._record_history_frame(
+            history, self.live_cpu_frame(1), last_revision, [60.0],
+            {"total": 100.0, "used": 70.0}, 2.0, disk,
+        )
+        self.assertEqual(last_revision, 1)
+        self.assertEqual(tuple(history.cpu), (60.0,))
+
+        # A policy-only clock reset retains the same live revision and chart.
+        last_revision = porkyhud._record_history_frame(
+            history, self.live_cpu_frame(1), last_revision, [99.0],
+            {"total": 100.0, "used": 99.0}, 9.0, disk,
+        )
+        self.assertEqual(last_revision, 1)
+        self.assertEqual(tuple(history.cpu), (60.0,))
+
+    def test_hud_refresh_never_restarts_static_and_records_sixty_fresh_revisions(self) -> None:
+        frames = [self.live_cpu_frame(revision) for revision in range(1, 61)]
+        frames.append(self.live_cpu_frame(1))
+
+        class Coordinator:
+            def __init__(self):
+                self.index = 0
+                self.current = 0
+                self.generation = 1
+                self.closed = False
+            def observe_time(self, _now, _utc):
+                if self.index == 60:
+                    self.generation = 2
+                return False
+            def source_generation(self):
+                return self.generation
+            def tick(self, _now, _force=False):
+                frame = frames[self.index]
+                self.index += 1
+                self.current = frame.source_views[core.SourceId.CPU_USAGE].last_valid_revision
+                return frame
+            def per_core(self):
+                return (float(self.current),)
+            def process_rows(self, _now):
+                return ()
+            def set_system_gpu_percent(self, _percent):
+                pass
+            def close(self):
+                self.closed = True
+
+        histories = []
+        real_history = porkyhud.MetricHistory
+
+        def make_history():
+            history = real_history()
+            histories.append(history)
+            return history
+
+        static_calls = []
+        coordinator = Coordinator()
+        screen = FakeScreen(
+            10, 80,
+            keys=[ord("r") if index % 7 == 0 else -1 for index in range(61)]
+            + [ord("q")],
+        )
+        with mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator), \
+                mock.patch.object(porkyhud, "AsyncPoller", self.SyncPoller), \
+                mock.patch.object(porkyhud, "MetricHistory", side_effect=make_history), \
+                mock.patch.object(porkyhud, "collect_static_info", side_effect=lambda: static_calls.append(1) or {"model": "Mac"}), \
+                mock.patch.object(porkyhud, "boot_seconds", return_value=12), \
+                mock.patch.object(porkyhud, "init_colors"), \
+                mock.patch.object(porkyhud, "apply_dark_screen"), \
+                mock.patch.object(porkyhud.curses, "curs_set"), \
+                mock.patch.object(porkyhud.time, "sleep"):
+            porkyhud.hud(screen)
+        self.assertEqual(static_calls, [1])
+        self.assertEqual(len(histories), 1)
+        self.assertEqual(tuple(histories[0].cpu), (1.0,))
+        self.assertTrue(coordinator.closed)
+
+    def test_attempt_context_failure_retries_without_publishing_stale_gpu_value(self) -> None:
+        factory_calls = []
+        used_contexts = []
+        calibration = [10.0]
+        collected = threading.Event()
+
+        def context_factory(revision: int):
+            context = (revision, calibration[0])
+            factory_calls.append(context)
+            if len(factory_calls) == 1:
+                raise RuntimeError("capture failed")
+            return context
+
+        def collector(context):
+            used_contexts.append(context)
+            collected.set()
+            return self.adapter_success("ready", 1.0, 1.1)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            collector, attempt_context_factory=context_factory,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                poller.tick(1.0)
+            state = poller.snapshot()
+            self.assertEqual(state.revision, 0)
+            self.assertIsNone(state.active_revision)
+            calibration[0] = 25.0
+            poller.tick(1.0)
+            self.assertTrue(collected.wait(1.0))
+            self.assertEqual(factory_calls, [(1, 10.0), (1, 25.0)])
+            self.assertEqual(used_contexts, [(1, 25.0)])
+        finally:
+            poller.close()
+
+    def test_context_factory_reentrant_snapshot_and_close_do_not_deadlock(self) -> None:
+        for action in ("snapshot", "close"):
+            with self.subTest(action=action):
+                holder, observed = [], []
+                collector = mock.Mock(return_value=self.adapter_success("ready", 0.0, 0.1))
+                def context_factory(revision, action=action):
+                    if action == "snapshot":
+                        observed.append(holder[0].snapshot().revision)
+                    else:
+                        holder[0].close()
+                    return revision
+                poller = porkyhud.SourcePoller(
+                    core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                    collector, attempt_context_factory=context_factory,
+                )
+                holder.append(poller)
+                worker, done, errors = self.threaded_call(lambda: poller.tick(0.0))
+                self.assertTrue(done.wait(1.0))
+                worker.join(1.0)
+                if action == "snapshot":
+                    self.assertEqual((errors, observed), ([], [0]))
+                    poller.close()
+                else:
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], RuntimeError)
+                    self.assertEqual(poller.snapshot().revision, 0)
+                    collector.assert_not_called()
+
+    def test_close_while_context_factory_is_blocked_never_publishes_work(self) -> None:
+        factory_started = threading.Event()
+        release_factory = threading.Event()
+        collector = mock.Mock()
+
+        def context_factory(revision: int):
+            factory_started.set()
+            if not release_factory.wait(1.0):
+                raise RuntimeError("context factory was not released")
+            return (revision, None)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0),
+            collector, attempt_context_factory=context_factory,
+        )
+
+        worker, tick_finished, errors = self.threaded_call(lambda: poller.tick(0.0))
+        self.assertTrue(factory_started.wait(1.0))
+        poller.close()
+        release_factory.set()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(tick_finished.is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(poller.snapshot().revision, 0)
+        collector.assert_not_called()
+
+    def test_force_during_rejected_acceptance_preserves_prior_backoff(self) -> None:
+        state = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        state, revision = core.start_attempt(state, 0.0)
+        state = core.complete_failure(
+            state, revision, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT, 0.2, self.UTC,
+        )
+        entered, release, captures = threading.Event(), threading.Event(), []
+        def context_factory(revision):
+            captures.append(revision); entered.set(); release.wait(1.0)
+            raise RuntimeError("capture rejected")
+        poller = porkyhud.SourcePoller(state, mock.Mock(), context_factory)
+        worker, done, errors = self.threaded_call(lambda: poller.tick(0.3, force=True))
+        self.assertTrue(entered.wait(1.0))
+        poller.tick(0.4, force=True)
+        release.set(); worker.join(1.0)
+        self.assertTrue(done.is_set())
+        self.assertEqual(len(errors), 1)
+        poller.tick(1.199)
+        self.assertEqual(captures, [2])
+        poller.close()
+
+    def test_forced_followup_binds_context_and_coalesces_force_at_acceptance(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_finished = threading.Event()
+        accepted_contexts = []
+        used_contexts = []
+        calibration = [10.0]
+        calls = [0]
+
+        def context_factory(revision: int):
+            context = (revision, calibration[0])
+            accepted_contexts.append(context)
+            return context
+
+        def collector(context):
+            used_contexts.append(context)
+            calls[0] += 1
+            if calls[0] == 1:
+                first_started.set()
+                self.assertTrue(release_first.wait(1.0))
+                return self.adapter_success("first", 1.0, 1.1)
+            second_finished.set()
+            return self.adapter_success("second", 1.1, 1.2)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            collector, attempt_context_factory=context_factory,
+        )
+        try:
+            poller.tick(1.0)
+            self.assertTrue(first_started.wait(1.0))
+            calibration[0] = 25.0
+            poller.tick(1.05, force=True)
+            poller.tick(1.06, force=True)
+            release_first.set()
+            self.assertTrue(second_finished.wait(1.0))
+            self.assertEqual(accepted_contexts, [(1, 10.0), (2, 25.0)])
+            self.assertEqual(used_contexts, accepted_contexts)
+        finally:
+            release_first.set()
+            poller.close()
+
+    def test_queued_followup_context_failure_keeps_worker_recoverable(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        rejected_followup = threading.Event()
+        recovered = threading.Event()
+        factory_calls = []
+        used_contexts = []
+        collector_calls = [0]
+
+        def context_factory(revision: int):
+            context = (revision, len(factory_calls) + 1)
+            factory_calls.append(context)
+            if len(factory_calls) == 2:
+                rejected_followup.set()
+                raise RuntimeError("queued context failed")
+            return context
+
+        def collector(context):
+            used_contexts.append(context)
+            collector_calls[0] += 1
+            if collector_calls[0] == 1:
+                first_started.set()
+                if not release_first.wait(1.0):
+                    raise RuntimeError("first attempt was not released")
+                return self.adapter_success("first", 0.0, 0.2)
+            recovered.set()
+            return self.adapter_success("recovered", 1.2, 1.3)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            collector, attempt_context_factory=context_factory,
+        )
+        try:
+            worker = poller._worker
+            poller.tick(0.0)
+            self.assertTrue(first_started.wait(1.0))
+            poller.tick(0.1, force=True)
+            release_first.set()
+            self.assertTrue(rejected_followup.wait(1.0))
+            state = poller.snapshot()
+            self.assertEqual(state.revision, 1)
+            self.assertIsNone(state.active_revision)
+            self.assertTrue(worker.is_alive())
+
+            poller.tick(1.199)
+            self.assertEqual(factory_calls, [(1, 1), (2, 2)])
+            self.assertFalse(recovered.is_set())
+            poller.tick(1.2)
+            self.assertTrue(recovered.wait(1.0))
+            with poller._condition:
+                self.assertTrue(poller._condition.wait_for(
+                    lambda: poller._state.active_revision is None
+                    and poller._state.last_attempt is not None
+                    and poller._state.last_attempt.revision == 2,
+                    1.0,
+                ))
+            self.assertEqual(factory_calls, [(1, 1), (2, 2), (2, 3)])
+            self.assertEqual(used_contexts, [(1, 1), (2, 3)])
+        finally:
+            release_first.set()
+            poller.close()
+
+    def test_cpu_completion_cache_is_exact_revision_scoped_and_pruned(self) -> None:
+        adapter_success = self.adapter_success
+
+        class FakeCpuSampler:
+            instances = []
+
+            def __init__(self):
+                self.last_per_core = ()
+                self.calls = 0
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                FakeCpuSampler.instances.append(self)
+
+            def sample_usage(self):
+                self.calls += 1
+                if self.calls == 1:
+                    self.last_per_core = (10.0,)
+                    self.first_started.set()
+                    if not self.release_first.wait(1.0):
+                        raise RuntimeError("first CPU sample was not released")
+                    return adapter_success(
+                        core.CpuUsage(10.0, 0.0, 1.0), 1.0, 20.0,
+                    )
+                self.last_per_core = (20.0,)
+                return adapter_success(
+                    core.CpuUsage(20.0, 1.0, 2.0), 20.0, 20.0,
+                )
+
+        class FakeGpuSampler:
+            pass
+
+        with mock.patch.object(porkyhud, "MacCpuSampler", FakeCpuSampler), \
+                mock.patch.object(porkyhud, "GPUProcessSampler", FakeGpuSampler):
+            coordinator = porkyhud.LiveHealthCoordinator()
+        cpu_poller = coordinator._pollers[core.SourceId.CPU_USAGE]
+        sampler = FakeCpuSampler.instances[0]
+        try:
+            cpu_poller.tick(1.0)
+            self.assertTrue(sampler.first_started.wait(1.0))
+            cpu_poller.tick(2.0, force=True)
+            sampler.release_first.set()
+            with cpu_poller._condition:
+                self.assertTrue(cpu_poller._condition.wait_for(
+                    lambda: cpu_poller._state.active_revision is None
+                    and cpu_poller._state.last_attempt is not None
+                    and cpu_poller._state.last_attempt.revision == 2,
+                    1.0,
+                ))
+            self.assertEqual(
+                coordinator._cpu_per_core_result,
+                (coordinator._generation, 2, (20.0,)),
+            )
+            coordinator._consume_cpu_per_core_revision(1)
+            self.assertEqual(coordinator.per_core(), ())
+            self.assertEqual(
+                coordinator._cpu_per_core_result,
+                (coordinator._generation, 2, (20.0,)),
+            )
+            coordinator._consume_cpu_per_core_revision(2)
+            self.assertEqual(coordinator.per_core(), (20.0,))
+            self.assertIsNone(coordinator._cpu_per_core_result)
+        finally:
+            sampler.release_first.set()
+            coordinator.close()
+
+    def test_failed_followup_does_not_hide_cached_per_core_for_last_valid_cpu(self) -> None:
+        states = dict(porkyhud._registry_states())
+        cpu = states[core.SourceId.CPU_USAGE]
+        cpu, first = core.start_attempt(cpu, 0.0)
+        cpu = core.complete_success(
+            cpu, first, core.CpuUsage(25.0, 0.0, 1.0), 1.0, self.UTC,
+        )
+        cpu, second = core.start_attempt(cpu, 1.1)
+        cpu = core.complete_failure(
+            cpu, second, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT, 1.2, self.UTC,
+        )
+        states[core.SourceId.CPU_USAGE] = cpu
+
+        class FixedPoller:
+            def __init__(self, state):
+                self.state = state
+
+            def tick(self, _now, _force=False):
+                return self.state
+
+            def snapshot(self):
+                return self.state
+
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._closed = False
+        coordinator._generation = 1
+        coordinator._policy = core.initial_policy_state()
+        coordinator._frame_states = porkyhud._registry_states()
+        coordinator._frame = porkyhud.initial_health_frame(0.0)
+        coordinator._per_core = ()
+        coordinator._per_core_revision = 0
+        coordinator._cpu_per_core_result = (1, first, (25.0, 75.0))
+        coordinator._pollers = {
+            source_id: FixedPoller(states[source_id])
+            for source_id, _cadence, _stale in porkyhud.LIVE_SOURCE_SPECS
+        }
+
+        frame = coordinator.tick(1.2)
+        self.assertIsNone(frame.cpu_percent)
+        self.assertEqual(coordinator.per_core(), (25.0, 75.0))
+        self.assertEqual(coordinator._per_core_revision, first)
+        self.assertIsNone(coordinator._cpu_per_core_result)
+
+    def test_gpu_followup_uses_calibration_from_accepted_revision(self) -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_accepted = threading.Event()
+        release_second_hook = threading.Event()
+        observed = []
+
+        class FakeGpuSampler:
+            pass
+
+        def collect_gpu(_sampler, calibration):
+            observed.append(calibration)
+            if len(observed) == 1:
+                first_started.set()
+                if not release_first.wait(1.0):
+                    raise RuntimeError("first GPU sample was not released")
+                return self.adapter_success(
+                    core.GpuProcessSample({}, {}, True, False), 1.0, 1.1,
+                )
+            return self.adapter_success(
+                core.GpuProcessSample({}, {}, True, False), 1.1, 1.2,
+            )
+
+        with mock.patch.object(porkyhud, "GPUProcessSampler", FakeGpuSampler), \
+                mock.patch.object(porkyhud, "collect_gpu_process_sample", collect_gpu):
+            coordinator = porkyhud.LiveHealthCoordinator()
+            gpu_poller = coordinator._pollers[core.SourceId.PROCESS_GPU]
+            original_factory = gpu_poller._attempt_context_factory
+
+            def gated_factory(revision: int):
+                context = original_factory(revision)
+                if revision == 2:
+                    second_accepted.set()
+                    if not release_second_hook.wait(1.0):
+                        raise RuntimeError("second GPU acceptance was not released")
+                return context
+
+            gpu_poller._attempt_context_factory = gated_factory
+            try:
+                coordinator.set_system_gpu_percent(10.0)
+                gpu_poller.tick(1.0)
+                self.assertTrue(first_started.wait(1.0))
+                coordinator.set_system_gpu_percent(25.0)
+                gpu_poller.tick(1.05, force=True)
+                release_first.set()
+                self.assertTrue(second_accepted.wait(1.0))
+                coordinator.set_system_gpu_percent(75.0)
+                release_second_hook.set()
+                with gpu_poller._condition:
+                    self.assertTrue(gpu_poller._condition.wait_for(
+                        lambda: gpu_poller._state.active_revision is None
+                        and gpu_poller._state.last_attempt is not None
+                        and gpu_poller._state.last_attempt.revision == 2,
+                        1.0,
+                    ))
+                self.assertEqual(observed, [10.0, 25.0])
+            finally:
+                release_first.set()
+                release_second_hook.set()
+                coordinator.close()
+
+    def test_detached_cpu_generation_cannot_commit_per_core(self) -> None:
+        # A completion tagged with an old generation is ignored after rebuild.
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._generation = 2
+        coordinator._closed = False
+        coordinator._cpu_per_core_result = None
+        coordinator._commit_cpu_per_core(1, 7, (77.0,))
+        self.assertIsNone(coordinator._cpu_per_core_result)
+
+    def test_closed_coordinator_wins_two_stage_mutation_races(self) -> None:
+        for operation in ("calibration", "clock"):
+            with self.subTest(operation=operation):
+                coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+                coordinator._lock, coordinator._closed = threading.RLock(), False
+                coordinator._pollers = {}
+                coordinator._system_gpu_percent, coordinator._previous_time = 10.0, None
+                entered, release = threading.Event(), threading.Event()
+                if operation == "calibration":
+                    def gate(_value):
+                        entered.set(); release.wait(1.0); return True
+                    patcher = mock.patch.object(porkyhud.math, "isfinite", side_effect=gate)
+                    callback = lambda: coordinator.set_system_gpu_percent(25.0)
+                else:
+                    def gate(value, _label):
+                        entered.set(); release.wait(1.0); return value
+                    patcher = mock.patch.object(porkyhud, "_normalize_utc_timestamp", side_effect=gate)
+                    callback = lambda: coordinator.observe_time(1.0, self.UTC)
+                with patcher, mock.patch.object(coordinator, "_close_poller_set", return_value=None):
+                    worker, done, errors = self.threaded_call(callback)
+                    self.assertTrue(entered.wait(1.0))
+                    coordinator.close(); release.set(); worker.join(1.0)
+                self.assertTrue(done.is_set())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], RuntimeError)
+                self.assertEqual(coordinator._system_gpu_percent, 10.0)
+                self.assertIsNone(coordinator._previous_time)
 
     def test_future_worker_completion_is_deferred_until_frame_time_catches_up(self) -> None:
         source = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
