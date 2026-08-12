@@ -4781,6 +4781,91 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         self.assertIsNone(snapshot["memory"]["used_bytes"])
         self.assertIsNone(snapshot["memory"]["swap_used_bytes"])
 
+    def test_snapshot_rejects_synthetic_static_defaults_from_empty_legacy_probes(self) -> None:
+        """Empty commands cannot become an OS or physical-memory observation."""
+
+        with mock.patch.object(porkyhud.socket, "gethostname", return_value="proven-host.local"), \
+                mock.patch.object(porkyhud.platform, "release", return_value="26.0.0"), \
+                mock.patch.object(porkyhud.platform, "machine", return_value="arm64"), \
+                mock.patch.object(porkyhud, "run_command", return_value=""), \
+                mock.patch.object(porkyhud, "sysctl_value", return_value=""), \
+                mock.patch.object(porkyhud, "build_core_labels", return_value=([], [], {})), \
+                mock.patch.object(porkyhud, "gpu_core_count_fast", return_value=None), \
+                mock.patch.object(porkyhud, "max_gpu_frequency_mhz", return_value=None):
+            legacy_static = porkyhud.collect_static_info()
+
+        snapshot = self.collect_snapshot_with(
+            descriptive_values={"system": legacy_static},
+        )
+        self.assertEqual(snapshot["system"]["host"], "proven-host")
+        self.assertEqual(snapshot["system"]["kernel"], "26.0.0")
+        for key in ("os", "memory"):
+            with self.subTest(key=key):
+                self.assertEqual(snapshot["system"][key], "unavailable")
+
+    def test_snapshot_preserves_recognized_static_os_and_memory_fields(self) -> None:
+        """Strict static grammar retains nonempty version and positive capacity evidence."""
+
+        snapshot = self.collect_snapshot_with(descriptive_values={
+            "system": {
+                "host": "proven-host", "kernel": "26.0.0",
+                "os": "macOS 26.0", "memory": "16 GB",
+            },
+        })
+        self.assertEqual(snapshot["system"]["os"], "macOS 26.0")
+        self.assertEqual(snapshot["system"]["memory"], "16 GB")
+
+    def test_snapshot_static_nested_rows_drop_unknown_private_fields(self) -> None:
+        """Untrusted static mappings cannot smuggle arbitrary nested diagnostics."""
+
+        marker = "private-exception-secret"
+        snapshot = self.collect_snapshot_with(descriptive_values={
+            "system": {
+                "host": "proven-host",
+                "core_counts": {"E": 4, "P": 6, "private_exception": marker},
+                "cpu_clusters": [{
+                    "code": "P", "label": "Performance", "logical": 6,
+                    "source": "Performance", "stderr": marker,
+                }],
+                "gpus": [{
+                    "name": "Test GPU", "cores": "10", "metal": "Metal 4",
+                    "displays": "Built-in", "max_freq_mhz": "1200",
+                    "private_exception": marker,
+                }],
+            },
+        })
+
+        self.assertEqual(snapshot["system"]["core_counts"], {"E": 4, "P": 6})
+        self.assertEqual(snapshot["system"]["cpu_clusters"], [{
+            "code": "P", "label": "Performance", "logical": 6,
+            "source": "Performance",
+        }])
+        self.assertEqual(snapshot["system"]["gpus"], [{
+            "name": "Test GPU", "cores": "10", "metal": "Metal 4",
+            "displays": "Built-in", "max_freq_mhz": "1200",
+        }])
+        self.assertNotIn(marker, json.dumps(snapshot))
+
+    def test_snapshot_preserves_canonical_legacy_static_nested_shapes(self) -> None:
+        """Every supported legacy nested field survives the strict wire projection."""
+
+        canonical = {
+            "core_counts": {"E": 4, "P": 6, "S": 2},
+            "cpu_clusters": [{
+                "code": "S", "label": "Super", "logical": 2, "source": "Super",
+            }],
+            "gpus": [{
+                "name": "Test GPU", "cores": "12", "metal": "Metal 4",
+                "displays": "Built-in Display", "max_freq_mhz": "1400",
+            }],
+        }
+        snapshot = self.collect_snapshot_with(descriptive_values={
+            "system": {"host": "proven-host", **canonical},
+        })
+        for key, expected in canonical.items():
+            with self.subTest(key=key):
+                self.assertEqual(snapshot["system"][key], expected)
+
     def test_huge_descriptor_integers_fail_closed_at_every_numeric_projection(self) -> None:
         """Numeric validation is total even for integers too large for float coercion."""
 
@@ -5018,10 +5103,11 @@ Pages occupied by compressor: 0.
         self.assertEqual(residual, before)
 
     def test_snapshot_retries_a_failed_waiting_shutdown_until_workers_join(self) -> None:
-        """Failure of the waiting phase itself still gets a later waiting attempt."""
+        """Repeated shutdown interruptions cannot cap the mandatory join phase."""
 
         real_executor = porkyhud.ThreadPoolExecutor
-        marker = KeyboardInterrupt("waiting shutdown")
+        primary = KeyboardInterrupt("primary")
+        cleanup_markers = [KeyboardInterrupt(f"shutdown {index}") for index in range(9)]
         instances = []
         before = {thread.ident for thread in threading.enumerate()
                   if thread.name.startswith("porkyhud-snapshot")}
@@ -5037,22 +5123,24 @@ Pages occupied by compressor: 0.
 
             def shutdown(self, **kwargs):
                 self.shutdown_calls += 1
-                if self.shutdown_calls == 2:
-                    raise marker
+                if cleanup_markers:
+                    raise cleanup_markers.pop(0)
                 return self.executor.shutdown(**kwargs)
 
         residual = None
         try:
             with mock.patch.object(porkyhud, "ThreadPoolExecutor", FailingWaitExecutor), \
                     self.assertRaises(KeyboardInterrupt) as caught:
-                self.collect_snapshot_with()
+                self.collect_snapshot_with(
+                    typed_failure="collect_memory_pressure", interrupt_marker=primary,
+                )
             residual = {thread.ident for thread in threading.enumerate()
                         if thread.name.startswith("porkyhud-snapshot")}
         finally:
             for instance in instances:
                 instance.executor.shutdown(wait=True, cancel_futures=True)
-        self.assertIs(caught.exception, marker)
-        self.assertEqual(instances[0].shutdown_calls, 3)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(instances[0].shutdown_calls, 10)
         self.assertEqual(residual, before)
 
     def test_snapshot_attempts_every_cancel_and_joins_before_cancel_error_propagates(self) -> None:

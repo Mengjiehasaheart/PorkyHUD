@@ -6479,11 +6479,22 @@ def _snapshot_system_projection(value: Any) -> dict[str, Any]:
     except Exception:
         return projected
 
-    for key in ("host", "os", "build", "kernel", "model", "chip", "memory",
-                "model_id", "cpu_cores"):
+    for key in ("host", "build", "kernel", "model", "chip", "model_id",
+                "cpu_cores"):
         candidate = static.get(key)
-        if isinstance(candidate, str) and candidate:
+        if isinstance(candidate, str) and candidate.strip():
             projected[key] = candidate
+    os_name = static.get("os")
+    if isinstance(os_name, str) and re.fullmatch(r"macOS \S+", os_name):
+        projected["os"] = os_name
+    memory_text = static.get("memory")
+    memory_match = (
+        re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:B|KB|MB|GB|TB|PB)", memory_text)
+        if isinstance(memory_text, str) else None
+    )
+    if (memory_match is not None
+            and any(character in "123456789" for character in memory_match.group(1))):
+        projected["memory"] = memory_text
     for key in ("physical_cpu", "logical_cpu"):
         candidate = static.get(key)
         if ((isinstance(candidate, str) and candidate)
@@ -6502,21 +6513,55 @@ def _snapshot_system_projection(value: Any) -> dict[str, Any]:
             and all(type(index) is int and index >= 0 for index in index_map)):
         projected["cpu_index_map"] = list(index_map)
     counts = static.get("core_counts")
-    if (isinstance(counts, Mapping)
-            and all(isinstance(key, str) and type(count) is int and count >= 0
-                    for key, count in counts.items())):
-        projected["core_counts"] = dict(counts)
+    if isinstance(counts, Mapping):
+        try:
+            projected["core_counts"] = {
+                key: count for key in ("E", "P", "S")
+                if type(count := counts.get(key)) is int and count >= 0
+            }
+        except Exception:
+            projected["core_counts"] = {}
 
-    for key in ("cpu_clusters", "gpus"):
-        rows = static.get(key)
-        if (isinstance(rows, list)
-                and all(isinstance(row, Mapping) for row in rows)):
-            try:
-                converted = [dict(row) for row in rows]
-                json.dumps(converted)
-            except (Exception, TypeError, ValueError):
+    clusters = static.get("cpu_clusters")
+    if isinstance(clusters, list):
+        projected_clusters = []
+        for row in clusters:
+            if not isinstance(row, Mapping):
                 continue
-            projected[key] = converted
+            try:
+                code = row.get("code")
+                label = row.get("label")
+                logical = row.get("logical")
+                source = row.get("source")
+            except Exception:
+                continue
+            if (not isinstance(code, str) or re.fullmatch(r"[A-Z]", code) is None
+                    or not isinstance(label, str) or not label
+                    or type(logical) is not int or logical <= 0
+                    or not isinstance(source, str) or not source):
+                continue
+            projected_clusters.append({
+                "code": code, "label": label, "logical": logical, "source": source,
+            })
+        projected["cpu_clusters"] = projected_clusters
+
+    gpus = static.get("gpus")
+    if isinstance(gpus, list):
+        projected_gpus = []
+        for row in gpus:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                candidate = {
+                    key: row.get(key)
+                    for key in ("name", "cores", "metal", "displays", "max_freq_mhz")
+                }
+            except Exception:
+                continue
+            if not all(isinstance(value, str) for value in candidate.values()):
+                continue
+            projected_gpus.append(candidate)
+        projected["gpus"] = projected_gpus
     return projected
 
 
@@ -6822,7 +6867,7 @@ def collect_snapshot() -> dict[str, Any]:
         except BaseException as error:
             if cleanup_error is None:
                 cleanup_error = error
-        for _attempt in range(2):
+        while True:
             try:
                 pool.shutdown(wait=True, cancel_futures=True)
                 break
