@@ -108,7 +108,7 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 - Owns bounded no-shell command execution, typed parser outcomes, source-specific polling/backoff, and conversion from effect results into pure source state.
 - Start at `porkyhud.py::CommandResult`, `porkyhud.py::AdapterResult`, `porkyhud.py::run_structured_command`, `porkyhud.py::collect_memory_pressure`, `porkyhud.py::collect_os_thermal_state`, `porkyhud.py::collect_disk_capacity`, `porkyhud.py::SourcePoller`, and `porkyhud.py::LiveHealthCoordinator`.
 - Primary tests: `tests/test_porkyhud.py::StructuredCommandTests`, `tests/test_porkyhud.py::DecisionAdapterTests`, `tests/test_porkyhud.py::SourcePollerTests`, and `tests/test_porkyhud.py::LiveOrchestrationTests`.
-- Structured results keep outcome and failure class distinct. Raw argv, stderr, private output, PIDs, and monotonic timestamps do not cross into health facts or user-facing errors.
+- Structured results keep outcome and failure class distinct. Raw argv, stderr, and other private command output do not cross into health facts or user-facing errors. `ProcessFact.pid` enters `HealthFacts` for internal contributor continuity; normalized monotonic timing enters for freshness, window, and recovery policy. Those internal values are not projected as command-error detail.
 
 ### `area:terminal-lifecycle`
 

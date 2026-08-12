@@ -1559,6 +1559,8 @@ def _command_worker_signal_group(pgid: int, sig: int) -> _CommandGroupState:
         os.killpg(pgid, sig)
     except ProcessLookupError:
         return _CommandGroupState.ABSENT
+    except PermissionError:
+        return _CommandGroupState.UNCONFIRMED
     return _CommandGroupState.EXISTS
 
 
@@ -1909,6 +1911,12 @@ class _CommandLifecycleWorker:
                 self._capture_failure(exc)
 
         self._retry_reap(cleanup_deadline)
+        if self.leader_reaped and not self.group_absent:
+            state = self._retry_group_operation(
+                _command_worker_probe_group, cleanup_deadline,
+            )
+            if state is _CommandGroupState.ABSENT:
+                self.group_absent = True
 
     def _retry_cleanup(self, operation: Callable[[], bool], deadline: float) -> bool:
         attempts = 0

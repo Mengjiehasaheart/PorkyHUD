@@ -940,6 +940,10 @@ class StructuredCommandTests(unittest.TestCase):
                     porkyhud._command_worker_probe_group(12345),
                     porkyhud._CommandGroupState.UNCONFIRMED,
                 )
+                self.assertIs(
+                    porkyhud._command_worker_signal_group(12345, signal.SIGTERM),
+                    porkyhud._CommandGroupState.UNCONFIRMED,
+                )
 
     def test_kqueue_exit_observation_does_not_reap_the_leader(self) -> None:
         process = subprocess.Popen(
@@ -1422,9 +1426,10 @@ class StructuredCommandTests(unittest.TestCase):
                 "pathlib.Path(%r).write_text(str(child.pid)); time.sleep(1.5)"
             ) % (child_code, pid_path)
             result = self.run_fixture(code, timeout_s=0.2)
-            self.assert_abnormal_or_private_unknown(
-                result, core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT,
-            )
+            self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+            self.assertEqual(result.failure, core.FailureCode.COMMAND_TIMEOUT)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
             self.assertTrue(os.path.exists(pid_path))
             with open(pid_path, encoding="utf-8") as pid_file:
                 grandchild_pid = int(pid_file.read())

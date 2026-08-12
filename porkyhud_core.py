@@ -1231,14 +1231,26 @@ def reduce_memory_latch(
     if level is MemoryPressureLevel.CRITICAL:
         return _active_latch(
             RuleId.MEMORY_CRITICAL, HealthSeverity.CRITICAL, attempt.revision,
-            _trigger(source.source_id, sample, "memory pressure level 4"),
+            _trigger_for_active_rule(
+                latch,
+                RuleId.MEMORY_CRITICAL,
+                source.source_id,
+                sample,
+                "memory pressure level 4",
+            ),
         )
     if level is MemoryPressureLevel.WARN:
         if latch.severity is HealthSeverity.CRITICAL:
             return _memory_noncritical(latch, sample, attempt.revision, level)
         return _active_latch(
             RuleId.MEMORY_WATCH, HealthSeverity.WATCH, attempt.revision,
-            _trigger(source.source_id, sample, "memory pressure level 2"),
+            _trigger_for_active_rule(
+                latch,
+                RuleId.MEMORY_WATCH,
+                source.source_id,
+                sample,
+                "memory pressure level 2",
+            ),
         )
     if latch.phase is LatchPhase.CLEAR:
         return _clear_latch(latch.rule_id, attempt.revision)
@@ -1271,9 +1283,15 @@ def reduce_thermal_latch(
     if value.thermal_warning_level > 0 or value.performance_warning_level > 0:
         return _active_latch(
             RuleId.THERMAL_WATCH, HealthSeverity.WATCH, attempt.revision,
-            _trigger(source.source_id, sample,
-                     "thermal=%d performance=%d" % (
-                         value.thermal_warning_level, value.performance_warning_level)),
+            _trigger_for_active_rule(
+                latch,
+                RuleId.THERMAL_WATCH,
+                source.source_id,
+                sample,
+                "thermal=%d performance=%d" % (
+                    value.thermal_warning_level, value.performance_warning_level
+                ),
+            ),
         )
     if latch.phase is LatchPhase.CLEAR:
         return _clear_latch(latch.rule_id, attempt.revision)
@@ -1304,9 +1322,15 @@ def reduce_storage_latch(
     if _storage_low(disk):
         return _active_latch(
             RuleId.STORAGE_WATCH, HealthSeverity.WATCH, attempt.revision,
-            _trigger(source.source_id, sample,
-                     "%d bytes free of %d bytes on %s" % (
-                         disk.free_bytes, disk.total_bytes, disk.volume_id)),
+            _trigger_for_active_rule(
+                latch,
+                RuleId.STORAGE_WATCH,
+                source.source_id,
+                sample,
+                "%d bytes free of %d bytes on %s" % (
+                    disk.free_bytes, disk.total_bytes, disk.volume_id
+                ),
+            ),
         )
     if latch.phase is LatchPhase.CLEAR:
         return _clear_latch(latch.rule_id, attempt.revision)
@@ -1347,8 +1371,13 @@ def reduce_cpu_latch(
     if entry is not None and entry.mean_percent >= 90.0:
         return _active_latch(
             RuleId.CPU_WATCH, HealthSeverity.WATCH, attempt.revision,
-            _trigger(source.source_id, sample,
-                     "%.1f%% mean over 15s" % entry.mean_percent),
+            _trigger_for_active_rule(
+                latch,
+                RuleId.CPU_WATCH,
+                source.source_id,
+                sample,
+                "%.1f%% mean over 15s" % entry.mean_percent,
+            ),
         )
     if latch.phase is LatchPhase.CLEAR:
         return _clear_latch(latch.rule_id, attempt.revision)
@@ -1468,6 +1497,21 @@ def _trigger(source_id: SourceId, sample: Sample[T], value_text: str) -> Trigger
     return TriggerEvidence(source_id, sample.revision, sample.completed_mono_s, value_text)
 
 
+def _trigger_for_active_rule(
+    latch: RuleLatch,
+    rule_id: RuleId,
+    source_id: SourceId,
+    sample: Sample[T],
+    value_text: str,
+) -> TriggerEvidence:
+    """Keep historical entry evidence while the same rule remains latched."""
+    if latch.phase is not LatchPhase.CLEAR and latch.rule_id is rule_id:
+        if latch.trigger is None:
+            raise ValueError("active latch requires trigger evidence")
+        return latch.trigger
+    return _trigger(source_id, sample, value_text)
+
+
 def _active_latch(
     rule_id: RuleId, severity: HealthSeverity, revision: int,
     trigger: TriggerEvidence,
@@ -1542,7 +1586,11 @@ def _memory_noncritical(
         if level is MemoryPressureLevel.WARN:
             return _active_latch(
                 RuleId.MEMORY_WATCH, HealthSeverity.WATCH, revision,
-                latch.trigger,
+                _trigger(
+                    SourceId.MEMORY_PRESSURE,
+                    sample,
+                    "memory pressure level 2",
+                ),
             )
         if (trailing_normal_count >= 10
                 and completed_mono_s - trailing_normal_started_mono_s >= 9.0):

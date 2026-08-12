@@ -280,6 +280,8 @@ def _signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
         os.killpg(process.pid, sig)
     except ProcessLookupError:
         return
+    except PermissionError:
+        return
     except OSError as error:
         if error.errno != errno.ESRCH:
             raise
@@ -1167,7 +1169,7 @@ def _thread_prefix_counts_at(
     events: Sequence[Tuple[float, str, str, int]], timestamp: float,
 ) -> Dict[str, int]:
     active: Dict[int, str] = {}
-    for occurred, action, prefix, identity in events:
+    for occurred, action, prefix, identity in _ordered_thread_events(events):
         if occurred > timestamp:
             break
         if action == "start":
@@ -1184,7 +1186,7 @@ def _python_thread_count_at(
     events: Sequence[Tuple[float, str, str, int]], timestamp: float,
 ) -> int:
     active = set()
-    for occurred, action, _prefix, identity in events:
+    for occurred, action, _prefix, identity in _ordered_thread_events(events):
         if occurred > timestamp:
             break
         if action == "start":
@@ -1192,6 +1194,19 @@ def _python_thread_count_at(
         else:
             active.discard(identity)
     return 1 + len(active)
+
+
+def _ordered_thread_events(
+    events: Sequence[Tuple[float, str, str, int]],
+) -> List[Tuple[float, str, str, int]]:
+    """Order concurrent records; an equal-time stop closes its prior start."""
+
+    return sorted(
+        events,
+        key=lambda event: (
+            event[0], 0 if event[1] == "start" else 1, event[3], event[2],
+        ),
+    )
 
 
 def _process_identity_alive(identity: int) -> bool:
@@ -1371,73 +1386,82 @@ def _measure_live_window(
                     pass
 
 
-def _await_process_identity(
-    path: Path, process: subprocess.Popen[bytes], *, timeout_s: float,
-) -> int:
-    """Wait for an identity record whose create-and-write is not atomic."""
+def _await_process_identities(
+    path: Path, *, timeout_s: float,
+) -> Tuple[int, int]:
+    """Wait for a complete private direct/grandchild identity record."""
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            identity = int(path.read_text(encoding="ascii"))
+            direct, grandchild = (
+                int(value) for value in path.read_text(encoding="ascii").split()
+            )
         except (OSError, UnicodeError, ValueError):
-            identity = 0
-        if identity > 0:
-            return identity
-        if process.poll() is not None:
-            break
+            direct, grandchild = 0, 0
+        if direct > 0 and grandchild > 0 and direct != grandchild:
+            return direct, grandchild
         time.sleep(0.01)
-    raise MeasurementError("timeout probe did not establish a grandchild identity")
+    raise MeasurementError("timeout probe did not establish process identities")
 
 
 def _timeout_cleanup_probe() -> Dict[str, Any]:
+    import importlib
+
     with private_workspace() as temporary:
         identity_path = temporary / "grandchild.identity"
         grandchild_source = "import time; time.sleep(30)"
         child_source = (
-            "import pathlib,subprocess,sys,time;"
+            "import os,pathlib,subprocess,sys,time;"
             "p=subprocess.Popen([sys.executable,'-c',%r]);"
-            "pathlib.Path(sys.argv[1]).write_text(str(p.pid),encoding='ascii');"
+            "path=pathlib.Path(sys.argv[1]);part=path.with_suffix('.part');"
+            "part.write_text('%%d %%d'%%(os.getpid(),p.pid),encoding='ascii');"
+            "os.replace(str(part),str(path));"
+            "sys.stdout.write('private-timeout-stdout');sys.stdout.flush();"
+            "sys.stderr.write('private-timeout-stderr');sys.stderr.flush();"
             "time.sleep(30)" % grandchild_source
         )
-        process: Optional[subprocess.Popen[bytes]] = None
         started = time.monotonic()
-        try:
-            process = subprocess.Popen(
+        with _repository_import_path():
+            app = _require_repository_module(
+                importlib.import_module("porkyhud"), "porkyhud.py",
+            )
+            result = app.run_structured_command(
                 (sys.executable, "-c", child_source, str(identity_path)),
-                cwd=str(ROOT), stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                shell=False, start_new_session=True,
+                category="release-timeout-probe",
+                timeout_s=1.0,
+                stdout_limit=1024,
+                stderr_limit=1024,
             )
-            grandchild_identity = _await_process_identity(
-                identity_path, process, timeout_s=1.0,
-            )
-            time.sleep(0.05)
-            _cleanup_process(process)
-            direct_reaped = process.poll() is not None
-            grandchild_absent = False
-            absence_deadline = time.monotonic() + REAP_DEADLINE_S
-            while time.monotonic() < absence_deadline:
-                try:
-                    os.kill(grandchild_identity, 0)
-                except ProcessLookupError:
-                    grandchild_absent = True
-                    break
-                except PermissionError:
-                    break
-                time.sleep(0.02)
-            if not direct_reaped or not grandchild_absent:
-                raise MeasurementError("timeout probe left a recorded process identity")
-        finally:
-            if process is not None and process.poll() is None:
-                _cleanup_process(process)
+        if (
+            result.outcome is not app.AttemptOutcome.TIMEOUT
+            or result.failure is not app.FailureCode.COMMAND_TIMEOUT
+        ):
+            raise MeasurementError("application did not return the exact typed timeout")
+        if result.stdout or result.stderr:
+            raise MeasurementError("application exposed private timeout output")
+        direct_identity, grandchild_identity = _await_process_identities(
+            identity_path, timeout_s=1.0,
+        )
+        direct_reaped = not _process_identity_alive(direct_identity)
+        grandchild_absent = not _process_identity_alive(grandchild_identity)
+        absence_deadline = time.monotonic() + REAP_DEADLINE_S
+        while (
+            not direct_reaped or not grandchild_absent
+        ) and time.monotonic() < absence_deadline:
+            time.sleep(0.02)
+            direct_reaped = not _process_identity_alive(direct_identity)
+            grandchild_absent = not _process_identity_alive(grandchild_identity)
+        if not direct_reaped or not grandchild_absent:
+            raise MeasurementError("timeout probe left a recorded process identity")
     payload = _base_payload("timeout-cleanup", "deterministic")
     payload.update({
         "cleanup": "process_group_terminated",
-        "direct_reaped": True,
+        "direct_reaped": direct_reaped,
         "elapsed_ms": (time.monotonic() - started) * 1000.0,
-        "grandchild_absent": True,
-        "outcome": "timeout",
+        "failure": result.failure.value,
+        "grandchild_absent": grandchild_absent,
+        "outcome": result.outcome.value,
     })
     return payload
 

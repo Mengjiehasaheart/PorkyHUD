@@ -457,6 +457,26 @@ class MeasurementHarnessTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertTrue(identity_is_absent(identity))
 
+    def test_cleanup_waits_through_unconfirmed_signal_until_group_absence(self) -> None:
+        measure = self.measure()
+        process = mock.Mock(pid=12345)
+        process.poll.return_value = 0
+        with mock.patch.object(
+            measure.os, "killpg",
+            side_effect=(None, PermissionError(), ProcessLookupError(),
+                         ProcessLookupError()),
+        ) as killpg:
+            measure._cleanup_process(process)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(12345, 0),
+                mock.call(12345, signal.SIGTERM),
+                mock.call(12345, 0),
+                mock.call(12345, 0),
+            ],
+        )
+
     def test_snapshot_redaction_is_checked_for_each_process_command(self) -> None:
         measure = self.measure()
         accepted = snapshot_fixture(
@@ -559,27 +579,73 @@ class MeasurementHarnessTests(unittest.TestCase):
         self.assertEqual(comparison["final"]["prefixes"]["Other"], 1)
         self.assertFalse(comparison["stable"])
 
+    def test_thread_projections_order_events_by_their_recorded_time(self) -> None:
+        measure = self.measure()
+        events = (
+            (2.0, "start", "SourcePoller", 1),
+            (1.0, "start", "Other", 2),
+        )
+        prefixes = measure._thread_prefix_counts_at(events, 1.5)
+        self.assertEqual(prefixes["SourcePoller"], 0)
+        self.assertEqual(prefixes["Other"], 1)
+        self.assertEqual(measure._python_thread_count_at(events, 1.5), 2)
+
+    def test_thread_projections_apply_equal_time_start_before_stop(self) -> None:
+        measure = self.measure()
+        events = (
+            (1.0, "stop", "AsyncPoller", 7),
+            (1.0, "start", "AsyncPoller", 7),
+        )
+        prefixes = measure._thread_prefix_counts_at(events, 1.0)
+        self.assertEqual(prefixes["AsyncPoller"], 0)
+        self.assertEqual(measure._python_thread_count_at(events, 1.0), 1)
+
     def test_timeout_cleanup_proves_direct_reap_and_grandchild_absence(self) -> None:
         measure = self.measure()
-        result = measure._timeout_cleanup_probe()
+        with mock.patch.object(
+            measure, "_cleanup_process", wraps=measure._cleanup_process,
+        ) as simulated_cleanup, mock.patch.object(
+            measure, "_base_payload",
+            return_value={"mode": "timeout-cleanup"},
+        ):
+            result = measure._timeout_cleanup_probe()
+        self.assertEqual(simulated_cleanup.call_count, 0)
         self.assertEqual(result["outcome"], "timeout")
+        self.assertEqual(result["failure"], "command_timeout")
         self.assertIs(result["direct_reaped"], True)
         self.assertIs(result["grandchild_absent"], True)
         self.assertEqual(result["cleanup"], "process_group_terminated")
         encoded = json.dumps(measure.sanitize_public(result), sort_keys=True)
         self.assertNotIn('"pid"', encoded)
         self.assertNotIn('"argv"', encoded)
+        self.assertNotIn('"stdout"', encoded)
+        self.assertNotIn('"stderr"', encoded)
+
+    def test_timeout_probe_requires_exact_command_timeout_classification(self) -> None:
+        measure = self.measure()
+        with measure._repository_import_path():
+            app = measure._require_repository_module(
+                importlib.import_module("porkyhud"), "porkyhud.py",
+            )
+        wrong_timeout = mock.Mock(
+            outcome=app.AttemptOutcome.TIMEOUT,
+            failure=app.FailureCode.DEADLINE_EXCEEDED,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch.object(
+            app, "run_structured_command", return_value=wrong_timeout,
+        ), self.assertRaisesRegex(measure.MeasurementError, "typed timeout"):
+            measure._timeout_cleanup_probe()
 
     def test_timeout_probe_waits_for_a_complete_identity_record(self) -> None:
         measure = self.measure()
         identity_path = mock.Mock()
-        identity_path.read_text.side_effect = ["", "123"]
-        process = mock.Mock()
-        process.poll.return_value = None
+        identity_path.read_text.side_effect = ["", "123 456"]
         with mock.patch.object(measure.time, "sleep"):
             self.assertEqual(
-                measure._await_process_identity(identity_path, process, timeout_s=1.0),
-                123,
+                measure._await_process_identities(identity_path, timeout_s=1.0),
+                (123, 456),
             )
         self.assertEqual(identity_path.read_text.call_count, 2)
 
