@@ -6,10 +6,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from dataclasses import replace
-from datetime import timedelta
+from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import porkyhud
@@ -244,10 +245,30 @@ class StructuredCommandTests(unittest.TestCase):
         self.assertEqual(result.outcome, core.AttemptOutcome.COMMAND_ERROR)
         self.assertEqual(result.failure, failure)
 
-    def descendant_fixture(self, directory: str, emit_invalid_utf8: bool) -> tuple[str, str, str]:
+    def assert_private_unknown(self, result: object) -> None:
+        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+        self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def assert_abnormal_or_private_unknown(
+        self, result: object, outcome: core.AttemptOutcome, failure: core.FailureCode,
+    ) -> None:
+        if result.outcome is core.AttemptOutcome.UNKNOWN_ERROR:
+            self.assert_private_unknown(result)
+        else:
+            self.assertEqual(result.outcome, outcome)
+            self.assertEqual(result.failure, failure)
+
+    def descendant_fixture(
+        self,
+        directory: str,
+        emit_invalid_utf8: bool,
+        safety_seconds: float = 1.5,
+        parent_lingers: bool = True,
+    ) -> tuple[str, str, str]:
         pid_path = os.path.join(directory, "pids")
         heartbeat_path = os.path.join(directory, "heartbeat")
-        safety_seconds = 1.5
         descendant_code = (
             "import os, pathlib, signal, time\n"
             "os.close(1)\n"
@@ -273,7 +294,7 @@ class StructuredCommandTests(unittest.TestCase):
         ) % (pid_path, descendant_code, heartbeat_path)
         if emit_invalid_utf8:
             parent_code += "sys.stdout.buffer.write(b'\\xff'); sys.stdout.flush()"
-        else:
+        elif parent_lingers:
             parent_code += "time.sleep(%r)" % safety_seconds
         return parent_code, pid_path, heartbeat_path
 
@@ -309,6 +330,481 @@ class StructuredCommandTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail("recorded process remained after structured cleanup")
 
+    def assert_traceback_contains(self, actual: object, expected: object) -> None:
+        current = actual
+        while current is not None:
+            if current is expected:
+                return
+            current = current.tb_next
+        self.fail("the original interruption traceback was not preserved")
+
+    def assert_no_command_workers(self) -> None:
+        workers = [
+            thread.name for thread in threading.enumerate()
+            if thread.name.startswith("PorkyHUD-command-")
+        ]
+        self.assertEqual(workers, [])
+
+    def assert_command_workers_eventually_gone(self, timeout_s: float = 1.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not any(
+                thread.name.startswith("PorkyHUD-command-")
+                for thread in threading.enumerate()
+            ):
+                return
+            time.sleep(0.01)
+        self.assert_no_command_workers()
+
+    def run_capturing_base_exception(self, action: object) -> tuple[BaseException, object]:
+        try:
+            action()
+        except BaseException as caught:
+            return caught, sys.exc_info()[2]
+        self.fail("expected a BaseException")
+
+    def raise_with_traceback(
+        self, interruption: BaseException, tracebacks: list[object],
+    ) -> None:
+        try:
+            raise interruption
+        except BaseException:
+            tracebacks.append(sys.exc_info()[2])
+            raise
+
+    def test_thread_start_interruptions_have_no_spawn_ownership_gap(self) -> None:
+        real_start = porkyhud._command_start_thread
+        for timing in ("before", "after", "delayed", "ordinary-after"):
+            with self.subTest(timing=timing):
+                fd_before = len(os.listdir("/dev/fd"))
+                interruption = (
+                    RuntimeError("ordinary start failure")
+                    if timing == "ordinary-after"
+                    else KeyboardInterrupt("thread start interruption")
+                )
+                original_tb: list[object] = []
+                popen_calls: list[object] = []
+                delayed_start_done = threading.Event()
+
+                def interrupted_start(thread: threading.Thread) -> None:
+                    if timing in ("after", "ordinary-after"):
+                        real_start(thread)
+                    elif timing == "delayed":
+                        def start_later() -> None:
+                            time.sleep(0.03)
+                            real_start(thread)
+                            delayed_start_done.set()
+
+                        threading.Thread(target=start_later, daemon=True).start()
+                    self.raise_with_traceback(interruption, original_tb)
+
+                def forbidden_popen(*_args: object, **_kwargs: object) -> object:
+                    popen_calls.append(object())
+                    raise AssertionError("worker spawned despite interrupted start")
+
+                with mock.patch.object(
+                    porkyhud, "_command_start_thread", side_effect=interrupted_start,
+                ), mock.patch.object(
+                    porkyhud, "_command_worker_popen", side_effect=forbidden_popen,
+                ):
+                    if isinstance(interruption, Exception):
+                        self.assert_private_unknown(
+                            self.run_fixture("print('must not spawn')")
+                        )
+                    else:
+                        caught_exception, caught_tb = self.run_capturing_base_exception(
+                            lambda: self.run_fixture("print('must not spawn')")
+                        )
+                        self.assertIs(caught_exception, interruption)
+                        self.assert_traceback_contains(caught_tb, original_tb[0])
+                self.assertEqual(popen_calls, [])
+                if timing == "delayed":
+                    self.assertTrue(delayed_start_done.wait(1.0))
+                self.assert_command_workers_eventually_gone()
+                self.assertEqual(len(os.listdir("/dev/fd")), fd_before)
+
+    def test_each_event_setup_failure_closes_the_cancel_socketpair(self) -> None:
+        real_event = threading.Event
+        for failure_index in (1, 2):
+            with self.subTest(failure_index=failure_index):
+                calls = 0
+                fd_before = len(os.listdir("/dev/fd"))
+
+                def fail_selected_event() -> threading.Event:
+                    nonlocal calls
+                    calls += 1
+                    if calls == failure_index:
+                        raise RuntimeError("private event construction failure")
+                    return real_event()
+
+                with mock.patch.object(
+                    porkyhud.threading, "Event", side_effect=fail_selected_event,
+                ), mock.patch.object(porkyhud, "_command_worker_popen") as popen:
+                    result = self.run_fixture("print('must not spawn')")
+                self.assert_private_unknown(result)
+                self.assertEqual(len(os.listdir("/dev/fd")), fd_before)
+                popen.assert_not_called()
+
+        interruption = KeyboardInterrupt("event construction interruption")
+        calls = 0
+
+        def interrupt_second_event() -> threading.Event:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise interruption
+            return real_event()
+
+        fd_before = len(os.listdir("/dev/fd"))
+        with mock.patch.object(
+            porkyhud.threading, "Event", side_effect=interrupt_second_event,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.run_fixture("print('must not spawn')")
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(len(os.listdir("/dev/fd")), fd_before)
+
+    def test_first_caller_interruption_wins_while_publication_cleans_group(self) -> None:
+        first = KeyboardInterrupt("first caller interruption")
+        later = SystemExit("later caller interruption")
+        original_tb: list[object] = []
+        wait_calls = 0
+        spawned = threading.Event()
+        real_popen = porkyhud._command_worker_popen
+        real_wait = porkyhud._command_wait_publication
+        real_notify = porkyhud._command_notify_cancel
+        notify_calls = 0
+
+        def tracked_popen(*args: object, **kwargs: object) -> object:
+            process = real_popen(*args, **kwargs)
+            spawned.set()
+            return process
+
+        def interrupting_wait(event: threading.Event, timeout_s: float) -> bool:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                self.assertTrue(spawned.wait(1.0))
+                self.wait_for_heartbeat(heartbeat_path)
+                self.raise_with_traceback(first, original_tb)
+            if wait_calls == 2:
+                raise later
+            return real_wait(event, timeout_s)
+
+        def interrupt_notify_once(cancel_writer: object) -> bool:
+            nonlocal notify_calls
+            notify_calls += 1
+            if notify_calls == 1:
+                raise SystemExit("later cancel notification interruption")
+            return real_notify(cancel_writer)
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(
+                directory, emit_invalid_utf8=False,
+            )
+            with mock.patch.object(
+                porkyhud, "_command_worker_popen", side_effect=tracked_popen,
+            ), mock.patch.object(
+                porkyhud, "_command_wait_publication", side_effect=interrupting_wait,
+            ), mock.patch.object(
+                porkyhud, "_command_notify_cancel", side_effect=interrupt_notify_once,
+            ):
+                caught_exception, caught_tb = self.run_capturing_base_exception(
+                    lambda: self.run_fixture(code, timeout_s=1.0)
+                )
+            self.assertIs(caught_exception, first)
+            self.assert_traceback_contains(caught_tb, original_tb[0])
+            self.assert_recorded_processes_are_gone(pid_path)
+        self.assertGreaterEqual(wait_calls, 3)
+        self.assertGreaterEqual(notify_calls, 2)
+        self.assert_no_command_workers()
+
+    def test_normal_start_waits_for_publication_and_join_despite_interrupt(self) -> None:
+        interruption = KeyboardInterrupt("join interruption")
+        real_entry = porkyhud._command_worker_entry
+        real_join = porkyhud._command_join_thread
+        join_calls = 0
+
+        def publish_then_linger(*args: object, **kwargs: object) -> None:
+            real_entry(*args, **kwargs)
+            time.sleep(0.05)
+
+        def interrupt_join_once(thread: threading.Thread, timeout_s: float) -> None:
+            nonlocal join_calls
+            join_calls += 1
+            if join_calls == 1:
+                raise interruption
+            real_join(thread, timeout_s)
+
+        with mock.patch.object(
+            porkyhud, "_command_worker_entry", side_effect=publish_then_linger,
+        ), mock.patch.object(
+            porkyhud, "_command_join_thread", side_effect=interrupt_join_once,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.run_fixture("print('published')")
+        self.assertIs(raised.exception, interruption)
+        self.assertGreaterEqual(join_calls, 2)
+        self.assert_no_command_workers()
+
+    def test_first_worker_interruption_wins_over_later_publication_interruption(self) -> None:
+        first = KeyboardInterrupt("first worker interruption")
+        later = SystemExit("later publication interruption")
+        real_publish = porkyhud._command_publish_report
+        select_calls = 0
+        publish_calls = 0
+
+        def interrupt_select_once(selector: object, timeout_s: float) -> object:
+            nonlocal select_calls
+            select_calls += 1
+            if select_calls == 1:
+                raise first
+            return selector.select(timeout_s)
+
+        def interrupt_publish_once(
+            request: object, reports: object, report: object,
+        ) -> None:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                raise later
+            real_publish(request, reports, report)
+
+        with mock.patch.object(
+            porkyhud, "_command_worker_select", side_effect=interrupt_select_once,
+        ), mock.patch.object(
+            porkyhud, "_command_publish_report", side_effect=interrupt_publish_once,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.run_fixture("import time; time.sleep(0.4)")
+        self.assertIs(raised.exception, first)
+        self.assertGreaterEqual(publish_calls, 2)
+        self.assert_no_command_workers()
+
+    def test_hundred_run_lifecycle_stress_has_no_worker_fd_or_child_growth(self) -> None:
+        def process_counts() -> tuple[int, int]:
+            completed = subprocess.run(
+                ["ps", "-axo", "ppid=,stat="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+            )
+            children = 0
+            zombies = 0
+            for line in completed.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and int(fields[0]) == os.getpid():
+                    children += 1
+                    zombies += fields[1].startswith("Z")
+            return children, zombies
+
+        fd_before = len(os.listdir("/dev/fd"))
+        children_before = process_counts()
+        for index in range(100):
+            kind = index % 5
+            with mock.patch.object(
+                porkyhud,
+                "_command_worker_signal_group",
+                return_value=porkyhud._CommandGroupState.ABSENT,
+            ):
+                if kind == 0:
+                    result = self.run_fixture("print('ok')")
+                    self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+                elif kind == 1:
+                    result = self.run_fixture("import time; time.sleep(0.03)", timeout_s=0.005)
+                    self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+                elif kind == 2:
+                    result = self.run_fixture(
+                        "import sys; sys.stdout.buffer.write(b'x' * 9)",
+                        stdout_limit=8,
+                    )
+                    self.assert_command_error(result, core.FailureCode.OUTPUT_LIMIT)
+                elif kind == 3:
+                    result = self.run_fixture(
+                        "import sys; sys.stdout.buffer.write(b'\\xff')"
+                    )
+                    self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+                else:
+                    interruption = KeyboardInterrupt("stress cancellation")
+                    spawned = threading.Event()
+                    real_popen = porkyhud._command_worker_popen
+                    real_wait = porkyhud._command_wait_publication
+                    wait_calls = 0
+
+                    def tracked_popen(*args: object, **kwargs: object) -> object:
+                        process = real_popen(*args, **kwargs)
+                        spawned.set()
+                        return process
+
+                    def cancel_once(event: threading.Event, timeout_s: float) -> bool:
+                        nonlocal wait_calls
+                        wait_calls += 1
+                        if wait_calls == 1:
+                            self.assertTrue(spawned.wait(1.0))
+                            raise interruption
+                        return real_wait(event, timeout_s)
+
+                    with mock.patch.object(
+                        porkyhud, "_command_worker_popen", side_effect=tracked_popen,
+                    ), mock.patch.object(
+                        porkyhud, "_command_wait_publication", side_effect=cancel_once,
+                    ):
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            self.run_fixture("import time; time.sleep(0.03)")
+                    self.assertIs(raised.exception, interruption)
+            self.assert_no_command_workers()
+
+        self.assertEqual(len(os.listdir("/dev/fd")), fd_before)
+        self.assertEqual(process_counts(), children_before)
+
+    def test_group_probe_uses_only_captured_pgid_and_exact_errno_semantics(self) -> None:
+        with mock.patch.object(porkyhud.os, "getpgid", side_effect=AssertionError("unsafe getpgid")):
+            with mock.patch.object(porkyhud.os, "killpg", return_value=None) as killpg:
+                self.assertIs(
+                    porkyhud._command_worker_probe_group(12345),
+                    porkyhud._CommandGroupState.EXISTS,
+                )
+                killpg.assert_called_once_with(12345, 0)
+            with mock.patch.object(porkyhud.os, "killpg", side_effect=ProcessLookupError()):
+                self.assertIs(
+                    porkyhud._command_worker_probe_group(12345),
+                    porkyhud._CommandGroupState.ABSENT,
+                )
+            with mock.patch.object(porkyhud.os, "killpg", side_effect=PermissionError()):
+                self.assertIs(
+                    porkyhud._command_worker_probe_group(12345),
+                    porkyhud._CommandGroupState.UNCONFIRMED,
+                )
+
+    def test_kqueue_exit_observation_does_not_reap_the_leader(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        owner = mock.Mock(exit_watch=None)
+        try:
+            observed = porkyhud._command_worker_open_exit_watch(owner, process.pid)
+            deadline = time.monotonic() + 1.0
+            while not observed and time.monotonic() < deadline:
+                observed = porkyhud._command_worker_observe_exit(
+                    owner.exit_watch, process.pid,
+                )
+                if not observed:
+                    time.sleep(0.01)
+            self.assertTrue(observed)
+            self.assertIsNone(process.returncode)
+        finally:
+            if owner.exit_watch is not None:
+                owner.exit_watch.close()
+            process.wait(timeout=1.0)
+
+    def test_cancellation_before_normal_commit_cleans_waitable_leader_group(self) -> None:
+        entered_commit = threading.Event()
+        cancellation_recorded = threading.Event()
+        real_commit = porkyhud._command_try_normal_commit
+        real_cancel = porkyhud._command_request_cancellation
+        real_wait = porkyhud._command_wait_publication
+        wait_calls = 0
+        interruption = KeyboardInterrupt("cancel before normal commit")
+
+        def commit_after_cancellation(control: object) -> bool:
+            entered_commit.set()
+            self.assertTrue(cancellation_recorded.wait(1.0))
+            return real_commit(control)
+
+        def record_cancellation(control: object) -> bool:
+            result = real_cancel(control)
+            cancellation_recorded.set()
+            return result
+
+        def cancel_during_commit(event: threading.Event, timeout_s: float) -> bool:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                self.assertTrue(entered_commit.wait(1.0))
+                raise interruption
+            return real_wait(event, timeout_s)
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(
+                directory,
+                emit_invalid_utf8=False,
+                safety_seconds=0.4,
+                parent_lingers=False,
+            )
+            with mock.patch.object(
+                porkyhud, "_command_try_normal_commit", side_effect=commit_after_cancellation,
+            ), mock.patch.object(
+                porkyhud, "_command_request_cancellation", side_effect=record_cancellation,
+            ), mock.patch.object(
+                porkyhud, "_command_wait_publication", side_effect=cancel_during_commit,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    self.run_fixture(code, timeout_s=1.0)
+            self.assertIs(raised.exception, interruption)
+            self.assert_heartbeat_stopped(heartbeat_path)
+            self.assert_recorded_processes_are_gone(pid_path)
+
+    def test_cancellation_after_normal_commit_does_not_signal_freed_group(self) -> None:
+        committed = threading.Event()
+        cancellation_recorded = threading.Event()
+        real_commit = porkyhud._command_try_normal_commit
+        real_cancel = porkyhud._command_request_cancellation
+        real_reap = porkyhud._command_worker_reap_leader
+        real_wait = porkyhud._command_wait_publication
+        interruption = KeyboardInterrupt("cancel after normal commit")
+        wait_calls = 0
+        signals: list[tuple[int, int]] = []
+
+        def commit_then_block(control: object) -> bool:
+            result = real_commit(control)
+            if result:
+                committed.set()
+            return result
+
+        def delayed_reap(process: object, deadline: float) -> bool:
+            self.assertTrue(cancellation_recorded.wait(1.0))
+            return real_reap(process, deadline)
+
+        def record_cancellation(control: object) -> bool:
+            result = real_cancel(control)
+            cancellation_recorded.set()
+            return result
+
+        def interrupt_after_commit(event: threading.Event, timeout_s: float) -> bool:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                self.assertTrue(committed.wait(1.0))
+                raise interruption
+            return real_wait(event, timeout_s)
+
+        def forbidden_signal(pgid: int, sig: int) -> object:
+            signals.append((pgid, sig))
+            raise AssertionError("normal-committed command was signaled")
+
+        with mock.patch.object(
+            porkyhud, "_command_try_normal_commit", side_effect=commit_then_block,
+        ), mock.patch.object(
+            porkyhud, "_command_worker_reap_leader", side_effect=delayed_reap,
+        ), mock.patch.object(
+            porkyhud, "_command_request_cancellation", side_effect=record_cancellation,
+        ), mock.patch.object(
+            porkyhud, "_command_wait_publication", side_effect=interrupt_after_commit,
+        ), mock.patch.object(
+            porkyhud, "_command_worker_signal_group", side_effect=forbidden_signal,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.run_fixture("print('committed')")
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(signals, [])
+        self.assert_no_command_workers()
+
     def test_success_is_bounded_classified_and_uses_c_locale(self) -> None:
         original_locale = os.environ.get("LC_ALL")
         result = self.run_fixture(
@@ -323,6 +819,49 @@ class StructuredCommandTests(unittest.TestCase):
         self.assertLessEqual(result.started_mono_s, result.completed_mono_s)
         self.assertIsNotNone(result.completed_at_utc.tzinfo)
         self.assertEqual(result.completed_at_utc.utcoffset(), timedelta(0))
+
+    def test_command_result_is_frozen_validated_and_normalizes_utc(self) -> None:
+        result = porkyhud.CommandResult(
+            category="fixture",
+            stdout="",
+            stderr="",
+            returncode=0,
+            started_mono_s=1.0,
+            completed_mono_s=2.0,
+            completed_at_utc=datetime(
+                2026, 8, 12, 2, 0, tzinfo=timezone(timedelta(hours=-5)),
+            ),
+            outcome=core.AttemptOutcome.SUCCESS,
+            failure=None,
+        )
+        self.assertEqual(result.completed_at_utc.utcoffset(), timedelta(0))
+        with self.assertRaises(FrozenInstanceError):
+            result.stdout = "changed"
+
+        invalid_overrides = (
+            {"category": "unsafe category"},
+            {"stdout": b"bytes"},
+            {"returncode": True},
+            {"started_mono_s": float("nan")},
+            {"completed_mono_s": 0.5},
+            {"completed_at_utc": datetime(2026, 8, 12)},
+            {"outcome": core.AttemptOutcome.SUCCESS, "failure": core.FailureCode.NONZERO_EXIT},
+            {"outcome": core.AttemptOutcome.COMMAND_ERROR, "failure": None},
+        )
+        values = {
+            "category": "fixture",
+            "stdout": "",
+            "stderr": "",
+            "returncode": 0,
+            "started_mono_s": 1.0,
+            "completed_mono_s": 2.0,
+            "completed_at_utc": datetime.now(timezone.utc),
+            "outcome": core.AttemptOutcome.SUCCESS,
+            "failure": None,
+        }
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides), self.assertRaises((TypeError, ValueError)):
+                porkyhud.CommandResult(**{**values, **overrides})
 
     def test_missing_executable_is_classified_without_echoing_arguments(self) -> None:
         secret = "never-display-this-argument"
@@ -360,11 +899,16 @@ class StructuredCommandTests(unittest.TestCase):
                 self.assertEqual(getattr(result, stream), "x" * 8)
             with self.subTest(stream=stream, size="crossing"):
                 target = "sys.stdout.buffer" if stream == "stdout" else "sys.stderr.buffer"
-                result = self.run_fixture(
-                    "import sys; %s.write(b'x' * 9)" % target,
-                    stdout_limit=8,
-                    stderr_limit=8,
-                )
+                with mock.patch.object(
+                    porkyhud,
+                    "_command_worker_signal_group",
+                    return_value=porkyhud._CommandGroupState.ABSENT,
+                ):
+                    result = self.run_fixture(
+                        "import sys; %s.write(b'x' * 9)" % target,
+                        stdout_limit=8,
+                        stderr_limit=8,
+                    )
                 self.assert_command_error(result, core.FailureCode.OUTPUT_LIMIT)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, "")
@@ -388,10 +932,15 @@ class StructuredCommandTests(unittest.TestCase):
         )
         self.assertEqual(valid.outcome, core.AttemptOutcome.SUCCESS)
         self.assertEqual(valid.stdout, "€")
-        invalid = self.run_fixture(
-            "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
-            "time.sleep(0.03); sys.stdout.buffer.write(b'X')"
-        )
+        with mock.patch.object(
+            porkyhud,
+            "_command_worker_signal_group",
+            return_value=porkyhud._CommandGroupState.ABSENT,
+        ):
+            invalid = self.run_fixture(
+                "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
+                "time.sleep(0.03); sys.stdout.buffer.write(b'X')"
+            )
         self.assert_command_error(invalid, core.FailureCode.DECODE_ERROR)
         self.assertEqual(invalid.stdout, "")
         self.assertEqual(invalid.stderr, "")
@@ -400,7 +949,9 @@ class StructuredCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
             result = self.run_fixture(code, timeout_s=1.0)
-            self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+            self.assert_abnormal_or_private_unknown(
+                result, core.AttemptOutcome.COMMAND_ERROR, core.FailureCode.DECODE_ERROR,
+            )
             self.assert_heartbeat_stopped(heartbeat_path)
             self.assert_recorded_processes_are_gone(pid_path)
 
@@ -438,232 +989,15 @@ class StructuredCommandTests(unittest.TestCase):
             self.assert_heartbeat_stopped(heartbeat_path)
             self.assert_recorded_processes_are_gone(pid_path)
 
-    def test_cleanup_fault_does_not_replace_prepared_timeout_result(self) -> None:
-        class CleanupFault(Exception):
-            pass
-
-        events: list[str] = []
-        with tempfile.TemporaryDirectory() as directory:
-            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
-            original_grace = porkyhud._command_terminate_grace_delay
-
-            def grace_then_fault() -> None:
-                original_grace()
-                events.append("grace")
-                raise CleanupFault()
-
-            original_selector_close = porkyhud._close_command_selector
-
-            def close_selector(selector: object) -> None:
-                events.append("selector")
-                original_selector_close(selector)
-
-            with mock.patch.object(
-                porkyhud, "_command_terminate_grace_delay", side_effect=grace_then_fault,
-            ), mock.patch.object(
-                porkyhud, "_close_command_selector", side_effect=close_selector,
-            ):
-                result = self.run_fixture(code, timeout_s=0.1)
-            self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
-            self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
-            self.assertEqual(events, ["grace", "selector"])
-
-    def test_cleanup_fault_preserves_pending_keyboard_interrupt_identity(self) -> None:
-        class CleanupFault(Exception):
-            pass
-
-        with tempfile.TemporaryDirectory() as directory:
-            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
-            interruption = KeyboardInterrupt("fixture interruption")
-            real_selector = porkyhud.selectors.DefaultSelector
-
-            class InterruptingSelector:
-                def __init__(self) -> None:
-                    self._selector = real_selector()
-
-                def register(self, *args: object, **kwargs: object) -> object:
-                    return self._selector.register(*args, **kwargs)
-
-                def unregister(self, *args: object, **kwargs: object) -> object:
-                    return self._selector.unregister(*args, **kwargs)
-
-                def get_map(self) -> object:
-                    return self._selector.get_map()
-
-                def select(self, _timeout: float | None = None) -> object:
-                    self_outer.wait_for_heartbeat(heartbeat_path)
-                    raise interruption
-
-                def close(self) -> None:
-                    self._selector.close()
-
-            self_outer = self
-            original_grace = porkyhud._command_terminate_grace_delay
-
-            def grace_then_fault() -> None:
-                original_grace()
-                raise CleanupFault()
-
-            with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector), mock.patch.object(
-                porkyhud, "_command_terminate_grace_delay", side_effect=grace_then_fault,
-            ):
-                with self.assertRaises(KeyboardInterrupt) as raised:
-                    self.run_fixture(code, timeout_s=1.0)
-            self.assertIs(raised.exception, interruption)
-
-    def test_ready_success_suppresses_cleanup_faults_and_attempts_every_step(self) -> None:
-        class CleanupFault(Exception):
-            pass
-
-        events: list[str] = []
-
-        def fail_after_recording(name: str) -> object:
-            def fault(*_args: object) -> None:
-                events.append(name)
-                raise CleanupFault(name)
-            return fault
-
-        secret = "cleanup-fixture-secret"
-        with mock.patch.object(
-            porkyhud, "_unregister_command_stream", side_effect=fail_after_recording("unregister"),
-        ), mock.patch.object(
-            porkyhud, "_close_command_stream", side_effect=fail_after_recording("stream-close"),
-        ), mock.patch.object(
-            porkyhud, "_close_command_selector", side_effect=fail_after_recording("selector-close"),
-        ):
-            result = self.run_fixture("print('ok') # " + secret)
-        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
-        self.assertEqual(result.stdout, "ok\n")
-        self.assertNotIn(secret, repr(result))
-        self.assertEqual(events.count("unregister"), 2)
-        self.assertEqual(events.count("stream-close"), 2)
-        self.assertEqual(events.count("selector-close"), 1)
-
-    def test_grace_keyboard_interrupt_still_kills_reaps_and_preserves_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
-            interruption = KeyboardInterrupt("grace interruption")
-            signals: list[int] = []
-            original_signal = porkyhud._signal_process_group
-
-            def trace_signal(process: object, sig: int) -> None:
-                signals.append(sig)
-                original_signal(process, sig)
-
-            def interrupt_grace() -> None:
-                raise interruption
-
-            with mock.patch.object(porkyhud, "_command_terminate_grace_delay", side_effect=interrupt_grace), mock.patch.object(
-                porkyhud, "_signal_process_group", side_effect=trace_signal,
-            ):
-                with self.assertRaises(KeyboardInterrupt) as raised:
-                    self.run_fixture(code, timeout_s=0.1)
-            self.assertIs(raised.exception, interruption)
-            self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
-            self.assert_recorded_processes_are_gone(pid_path)
-
-    def test_signal_permission_errors_make_timeout_a_private_unknown_after_reap(self) -> None:
-        calls: list[str] = []
-        original_wait = porkyhud._wait_for_process
-
-        def permission_denied(_process: object, sig: int) -> None:
-            calls.append("term" if sig == signal.SIGTERM else "kill")
-            raise PermissionError("fixture permission failure")
-
-        def trace_reap(process: object, deadline: float) -> None:
-            calls.append("reap")
-            original_wait(process, deadline)
-
-        with mock.patch.object(porkyhud, "_signal_process_group", side_effect=permission_denied), mock.patch.object(
-            porkyhud, "_wait_for_process", side_effect=trace_reap,
-        ):
-            result = self.run_fixture(
-                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(0.5)",
-                timeout_s=0.1,
-            )
-        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
-        self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "")
-        self.assertEqual(calls, ["term", "kill", "reap"])
-        time.sleep(0.6)
-
-    def test_term_failure_followed_by_kill_is_still_private_unknown(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
-            original_signal = porkyhud._signal_process_group
-            calls: list[int] = []
-
-            def term_fails(process: object, sig: int) -> None:
-                calls.append(sig)
-                if sig == signal.SIGTERM:
-                    raise PermissionError("fixture term failure")
-                original_signal(process, sig)
-
-            with mock.patch.object(porkyhud, "_signal_process_group", side_effect=term_fails):
-                result = self.run_fixture(code, timeout_s=0.1)
-            self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
-            self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
-            self.assert_recorded_processes_are_gone(pid_path)
-
-    def test_kill_failure_after_term_exit_is_private_unknown_and_reaps_leader(self) -> None:
-        original_signal = porkyhud._signal_process_group
-        calls: list[int] = []
-
-        def kill_fails_after_term(process: object, sig: int) -> None:
-            calls.append(sig)
-            if sig == signal.SIGKILL:
-                raise PermissionError("fixture kill failure")
-            original_signal(process, sig)
-
-        with mock.patch.object(porkyhud, "_signal_process_group", side_effect=kill_fails_after_term):
-            result = self.run_fixture("import time; time.sleep(0.5)", timeout_s=0.1)
-        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
-        self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
-        self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
-        self.assertIsNotNone(result.returncode)
-
-    def test_process_lookup_signal_is_benign_after_decode_failure(self) -> None:
-        calls: list[int] = []
-        original_getpgid = porkyhud.os.getpgid
-
-        def tracked_getpgid(pid: int) -> int:
-            return original_getpgid(pid)
-
-        def absent_group(_pgid: int, sig: int) -> None:
-            calls.append(sig)
-            raise ProcessLookupError()
-
-        with mock.patch.object(porkyhud.os, "getpgid", side_effect=tracked_getpgid), mock.patch.object(
-            porkyhud.os, "killpg", side_effect=absent_group,
-        ):
-            result = self.run_fixture("import sys; sys.stdout.buffer.write(b'\\xff')")
-        self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
-        self.assertTrue(calls)
-
-    def test_spawn_result_survives_ordinary_selector_close_fault_and_base_propagates(self) -> None:
-        class SelectorCloseFault(Exception):
-            pass
-
-        class FaultySelector:
-            def close(self) -> None:
-                raise SelectorCloseFault()
-
-        secret = "spawn-close-fixture-secret"
-        with mock.patch.object(porkyhud.selectors, "DefaultSelector", FaultySelector):
-            result = porkyhud.run_structured_command(
-                ["/definitely/not/a/porkyhud-command", secret], "fixture", 1.0, 128, 128,
-            )
-        self.assertEqual(result.outcome, core.AttemptOutcome.MISSING_DEPENDENCY)
-        self.assertNotIn(secret, repr(result))
-
+    def test_spawn_and_setup_failures_are_private_and_never_echo_arguments(self) -> None:
+        secret = "spawn-worker-fixture-secret"
         for spawn_error, outcome, failure in (
             (PermissionError(), core.AttemptOutcome.PERMISSION_DENIED, core.FailureCode.PERMISSION_DENIED),
             (OSError(), core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
         ):
             with self.subTest(error=type(spawn_error).__name__), mock.patch.object(
-                porkyhud.subprocess, "Popen", side_effect=spawn_error,
-            ), mock.patch.object(porkyhud.selectors, "DefaultSelector", FaultySelector):
+                porkyhud, "_command_worker_popen", side_effect=spawn_error,
+            ):
                 result = porkyhud.run_structured_command(
                     ["/fixture/command", secret], "fixture", 1.0, 128, 128,
                 )
@@ -671,74 +1005,136 @@ class StructuredCommandTests(unittest.TestCase):
             self.assertEqual(result.failure, failure)
             self.assertNotIn(secret, repr(result))
 
-        interruption = KeyboardInterrupt("spawn close interruption")
+    def test_popen_helper_publishes_process_ownership_before_post_spawn_interruption(self) -> None:
+        interruption = KeyboardInterrupt("post-spawn interruption")
+        created: list[object] = []
+        real_popen = porkyhud.subprocess.Popen
+        signal_returncodes: list[int | None] = []
+        real_signal = porkyhud._command_worker_signal_group
 
-        class InterruptingSelector:
-            def close(self) -> None:
-                raise interruption
+        def spawn_then_interrupt(
+            owner: object, args: object, **kwargs: object,
+        ) -> object:
+            process = real_popen(args, **kwargs)
+            created.append(process)
+            owner.process = process
+            raise interruption
 
-        with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector):
+        def trace_signal(pgid: int, sig: int) -> object:
+            signal_returncodes.append(created[0].returncode)
+            return real_signal(pgid, sig)
+
+        with mock.patch.object(
+            porkyhud, "_command_worker_popen_owned", side_effect=spawn_then_interrupt,
+        ), mock.patch.object(
+            porkyhud, "_command_worker_signal_group", side_effect=trace_signal,
+        ):
             with self.assertRaises(KeyboardInterrupt) as raised:
-                porkyhud.run_structured_command(
-                    ["/definitely/not/a/porkyhud-command", secret], "fixture", 1.0, 128, 128,
-                )
+                self.run_fixture("import time; time.sleep(1.5)")
         self.assertIs(raised.exception, interruption)
+        self.assertTrue(created)
+        self.assertTrue(signal_returncodes)
+        self.assertTrue(all(returncode is None for returncode in signal_returncodes))
+        self.assertIsNotNone(created[0].returncode)
+        self.assert_no_command_workers()
 
-    def test_decode_cleanup_signals_before_the_leader_is_reaped(self) -> None:
-        original_signal = porkyhud._signal_process_group
+        for error in (FileNotFoundError(), PermissionError(), OSError()):
+            with self.subTest(error=type(error).__name__):
+                created = []
 
-        def traced_result(code: str) -> tuple[object, list[tuple[int, int | None, int | None]]]:
-            signals: list[tuple[int, int | None, int | None]] = []
+                def spawn_then_error(
+                    owner: object, args: object, **kwargs: object,
+                ) -> object:
+                    process = real_popen(args, **kwargs)
+                    created.append(process)
+                    owner.process = process
+                    raise error
 
-            def trace_signal(process: object, sig: int) -> None:
                 try:
-                    pgid = os.getpgid(process.pid)
-                except ProcessLookupError:
-                    pgid = None
-                signals.append((sig, process.returncode, pgid))
-                original_signal(process, sig)
+                    with mock.patch.object(
+                        porkyhud, "_command_worker_popen_owned", side_effect=spawn_then_error,
+                    ):
+                        result = self.run_fixture("import time; time.sleep(0.4)")
+                    self.assert_private_unknown(result)
+                    self.assertTrue(created)
+                    self.assertIsNotNone(created[0].returncode)
+                finally:
+                    for process in created:
+                        process.wait(timeout=1.0)
+                self.assert_no_command_workers()
 
-            with mock.patch.object(porkyhud, "_signal_process_group", side_effect=trace_signal):
-                return self.run_fixture(code), signals
+    def test_selector_register_select_read_and_unregister_faults_are_private(self) -> None:
+        stages = (
+            "_command_worker_register",
+            "_command_worker_select",
+            "_command_worker_read",
+            "_command_worker_unregister",
+            "_command_worker_close_stream",
+            "_command_worker_close_socket",
+            "_command_worker_close_exit_watch",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                target = getattr(porkyhud, stage)
+                calls = 0
 
-        result, signals = traced_result("import sys; sys.stdout.buffer.write(b'\\xff')")
-        self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
-        self.assertEqual([signal_value for signal_value, _returncode, _pgid in signals], [signal.SIGTERM, signal.SIGKILL])
-        self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
+                def fail_once(*args: object, **kwargs: object) -> object:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise OSError("private worker I/O failure")
+                    return target(*args, **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
-            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
-            result, signals = traced_result(code)
-            self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
-            self.assertEqual(
-                [signal_value for signal_value, _returncode, _pgid in signals],
-                [signal.SIGTERM, signal.SIGKILL],
-            )
-            self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
-            self.assert_heartbeat_stopped(heartbeat_path)
-            self.assert_recorded_processes_are_gone(pid_path)
+                with mock.patch.object(porkyhud, stage, side_effect=fail_once):
+                    result = self.run_fixture("print('private output')")
+                self.assert_private_unknown(result)
+                self.assertGreaterEqual(calls, 1)
+                self.assert_no_command_workers()
+
+        with mock.patch.object(
+            porkyhud.selectors, "DefaultSelector", side_effect=OSError("private selector failure"),
+        ), mock.patch.object(porkyhud, "_command_worker_popen") as popen:
+            result = self.run_fixture("print('must not spawn')")
+        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+        popen.assert_not_called()
 
     def test_timeout_terminates_a_child_ignoring_sigterm(self) -> None:
         started = time.monotonic()
         result = self.run_fixture(
-            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1.5)",
             timeout_s=0.15,
         )
+        self.assert_abnormal_or_private_unknown(
+            result, core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT,
+        )
+        self.assertIsNotNone(result.returncode)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_confirmed_cleanup_preserves_prepared_timeout_classification(self) -> None:
+        with mock.patch.object(
+            porkyhud,
+            "_command_worker_signal_group",
+            return_value=porkyhud._CommandGroupState.ABSENT,
+        ):
+            result = self.run_fixture("import time; time.sleep(0.12)", timeout_s=0.02)
         self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
         self.assertEqual(result.failure, core.FailureCode.COMMAND_TIMEOUT)
-        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
 
     def test_timeout_terminates_descendant_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             pid_path = os.path.join(directory, "grandchild.pid")
-            child_code = "import time; time.sleep(60)"
+            child_code = "import time; time.sleep(1.5)"
             code = (
                 "import pathlib, subprocess, sys, time; "
                 "child = subprocess.Popen([sys.executable, '-c', %r]); "
-                "pathlib.Path(%r).write_text(str(child.pid)); time.sleep(60)"
+                "pathlib.Path(%r).write_text(str(child.pid)); time.sleep(1.5)"
             ) % (child_code, pid_path)
             result = self.run_fixture(code, timeout_s=0.2)
-            self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+            self.assert_abnormal_or_private_unknown(
+                result, core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT,
+            )
             self.assertTrue(os.path.exists(pid_path))
             with open(pid_path, encoding="utf-8") as pid_file:
                 grandchild_pid = int(pid_file.read())

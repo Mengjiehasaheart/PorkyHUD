@@ -18,6 +18,7 @@ import math
 import os
 import platform
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -32,6 +33,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+from enum import Enum
 from operator import attrgetter
 from typing import Any, Callable, Optional, Sequence
 
@@ -73,7 +75,8 @@ SENSITIVE_ARGUMENT_PATTERN = re.compile(
 COMMAND_CATEGORY_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 COMMAND_READ_CHUNK_BYTES = 64 * 1024
 COMMAND_TERMINATE_GRACE_SECONDS = 0.2
-COMMAND_KILL_REAP_SECONDS = 0.5
+COMMAND_CLEANUP_SECONDS = 1.0
+COMMAND_CLEANUP_RETRY_SECONDS = 0.01
 THEMES: list[dict[str, Any]] = [
     {
         "name": "Neon Grid",
@@ -473,115 +476,711 @@ def _command_result(
     )
 
 
-def _unregister_command_stream(selector: selectors.BaseSelector, stream: Any) -> None:
-    selector.unregister(stream)
+class _CommandGroupState(Enum):
+    ABSENT = "absent"
+    EXISTS = "exists"
+    UNCONFIRMED = "unconfirmed"
 
 
-def _close_command_stream(stream: Any) -> None:
-    stream.close()
+class _CommandLifecycleState(Enum):
+    RUNNING = "running"
+    CANCELLED = "cancelled"
+    NORMAL_COMMITTED = "normal_committed"
 
 
-def _close_command_selector(selector: selectors.BaseSelector) -> None:
-    selector.close()
+@dataclass
+class _CommandLifecycleControl:
+    state: _CommandLifecycleState = _CommandLifecycleState.RUNNING
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def _run_cleanup_actions(
-    actions: Sequence[tuple[str, Callable[[], None]]],
-    suppress_ordinary_exceptions: bool,
-    preserve_pending_base_exception: bool,
-) -> tuple[str, ...]:
-    """Attempt every cleanup step without losing a result or prior interrupt."""
-
-    cleanup_failure: Optional[BaseException] = None
-    failure_kinds: list[str] = []
-    for kind, action in actions:
-        try:
-            action()
-        except BaseException as exc:
-            failure_kinds.append(kind)
-            if preserve_pending_base_exception:
-                continue
-            if isinstance(exc, Exception) and suppress_ordinary_exceptions:
-                continue
-            if not isinstance(exc, Exception) or cleanup_failure is None:
-                cleanup_failure = exc
-    if cleanup_failure is not None:
-        raise cleanup_failure
-    return tuple(failure_kinds)
+@dataclass(frozen=True)
+class _CommandWorkerReport:
+    result: CommandResult
+    interruption: Optional[BaseException] = None
+    interruption_traceback: Any = None
 
 
-def _cleanup_structured_command(
-    process: subprocess.Popen[bytes],
-    selector: selectors.BaseSelector,
-    streams: Sequence[Any],
-    terminate_process_group: bool,
-    suppress_ordinary_exceptions: bool,
-    preserve_pending_base_exception: bool,
-) -> tuple[str, ...]:
-    actions: list[tuple[str, Callable[[], None]]] = []
-    if terminate_process_group:
-        actions.extend(
-            (
-                ("term", lambda: _signal_process_group(process, signal.SIGTERM)),
-                ("grace", _command_terminate_grace_delay),
-                ("kill", lambda: _signal_process_group(process, signal.SIGKILL)),
-                ("reap", lambda: _wait_for_process(
-                    process, time.monotonic() + COMMAND_KILL_REAP_SECONDS,
-                )),
-            )
-        )
-    for stream in streams:
-        if stream is not None:
-            actions.append(("unregister", lambda stream=stream: _unregister_command_stream(selector, stream)))
-            actions.append(("stream_close", lambda stream=stream: _close_command_stream(stream)))
-    actions.append(("selector_close", lambda: _close_command_selector(selector)))
-    return _run_cleanup_actions(
-        actions,
-        suppress_ordinary_exceptions=suppress_ordinary_exceptions,
-        preserve_pending_base_exception=preserve_pending_base_exception,
-    )
+@dataclass(frozen=True)
+class _CommandWorkerRequest:
+    args: tuple[str, ...]
+    category: str
+    timeout_s: float
+    stdout_limit: int
+    stderr_limit: int
+    started_mono_s: float
+    start_gate: threading.Event
+    cancel_reader: socket.socket
+    published: threading.Event
+    control: _CommandLifecycleControl
 
 
-def _signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
+def _command_start_thread(thread: threading.Thread) -> None:
+    thread.start()
+
+
+def _command_open_start_gate(gate: threading.Event) -> None:
+    gate.set()
+
+
+def _command_wait_publication(event: threading.Event, timeout_s: float) -> bool:
+    return event.wait(timeout_s)
+
+
+def _command_join_thread(thread: threading.Thread, timeout_s: float) -> None:
+    thread.join(timeout_s)
+
+
+def _command_thread_is_alive(thread: threading.Thread) -> bool:
+    return thread.is_alive()
+
+
+def _command_notify_cancel(cancel_writer: socket.socket) -> bool:
     try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        # On macOS, a reaped-from-the-group-but-unreaped-by-us leader can make
-        # a second killpg report EPERM after a successful SIGTERM. Its numeric
-        # PID remains reserved, so use getpgid only to prove that no group is
-        # left; a live group still reports the original permission failure.
-        try:
-            os.getpgid(process.pid)
-        except ProcessLookupError:
-            return
-        raise
+        cancel_writer.send(b"x")
+    except (BlockingIOError, BrokenPipeError):
+        return True
+    except InterruptedError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
-def _wait_for_process(process: subprocess.Popen[bytes], deadline: float) -> None:
-    while process.poll() is None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        try:
-            process.wait(timeout=min(remaining, 0.05))
-        except subprocess.TimeoutExpired:
-            continue
+def _command_wait_start_gate(start_gate: threading.Event) -> None:
+    start_gate.wait()
 
 
-def _command_terminate_grace_delay() -> None:
-    """Keep the leader unreaped so its group ID cannot be reused before SIGKILL."""
+def _command_request_cancellation(control: _CommandLifecycleControl) -> bool:
+    with control.lock:
+        if control.state is _CommandLifecycleState.RUNNING:
+            control.state = _CommandLifecycleState.CANCELLED
+            return True
+        return control.state is _CommandLifecycleState.CANCELLED
 
-    time.sleep(COMMAND_TERMINATE_GRACE_SECONDS)
+
+def _command_try_normal_commit(control: _CommandLifecycleControl) -> bool:
+    with control.lock:
+        if control.state is _CommandLifecycleState.RUNNING:
+            control.state = _CommandLifecycleState.NORMAL_COMMITTED
+            return True
+        return control.state is _CommandLifecycleState.NORMAL_COMMITTED
 
 
-def _cleanup_spawn_selector(selector: selectors.BaseSelector) -> None:
-    _run_cleanup_actions(
-        (("selector_close", lambda: _close_command_selector(selector)),),
-        suppress_ordinary_exceptions=True,
-        preserve_pending_base_exception=False,
+def _command_was_cancelled(control: _CommandLifecycleControl) -> bool:
+    with control.lock:
+        return control.state is _CommandLifecycleState.CANCELLED
+
+
+def _command_normal_was_committed(control: _CommandLifecycleControl) -> bool:
+    with control.lock:
+        return control.state is _CommandLifecycleState.NORMAL_COMMITTED
+
+
+def _command_worker_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(*args, **kwargs)
+
+
+def _command_worker_popen_owned(
+    owner: "_CommandLifecycleWorker", args: tuple[str, ...], **kwargs: Any,
+) -> subprocess.Popen[bytes]:
+    process = _command_worker_popen(args, **kwargs)
+    owner.process = process
+    return process
+
+
+def _command_worker_open_exit_watch(
+    owner: "_CommandLifecycleWorker", pid: int,
+) -> bool:
+    watch = select.kqueue()
+    owner.exit_watch = watch
+    event = select.kevent(
+        pid,
+        filter=select.KQ_FILTER_PROC,
+        flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+        fflags=select.KQ_NOTE_EXIT,
     )
+    try:
+        watch.control([event], 0, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _command_worker_observe_exit(watch: Any, pid: int) -> bool:
+    events = watch.control(None, 1, 0)
+    return any(
+        event.ident == pid and event.fflags & select.KQ_NOTE_EXIT
+        for event in events
+    )
+
+
+def _command_worker_select(
+    selector: selectors.BaseSelector, timeout_s: float,
+) -> list[tuple[selectors.SelectorKey, int]]:
+    return selector.select(timeout_s)
+
+
+def _command_worker_read(fd: int, size: int) -> bytes:
+    return os.read(fd, size)
+
+
+def _command_worker_register(
+    selector: selectors.BaseSelector, fileobj: Any, data: str,
+) -> None:
+    selector.register(fileobj, selectors.EVENT_READ, data)
+
+
+def _command_worker_signal_group(pgid: int, sig: int) -> _CommandGroupState:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return _CommandGroupState.ABSENT
+    return _CommandGroupState.EXISTS
+
+
+def _command_worker_probe_group(pgid: int) -> _CommandGroupState:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return _CommandGroupState.ABSENT
+    except PermissionError:
+        return _CommandGroupState.UNCONFIRMED
+    return _CommandGroupState.EXISTS
+
+
+def _command_worker_grace_wait(deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _command_worker_retry_wait(deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(COMMAND_CLEANUP_RETRY_SECONDS, remaining))
+
+
+def _command_worker_reap_leader(
+    process: subprocess.Popen[bytes], deadline: float,
+) -> bool:
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return process.returncode is not None
+
+
+def _command_worker_unregister(
+    selector: selectors.BaseSelector, fileobj: Any,
+) -> bool:
+    try:
+        selector.unregister(fileobj)
+    except KeyError:
+        pass
+    return True
+
+
+def _command_worker_close_stream(stream: Any) -> bool:
+    stream.close()
+    return bool(getattr(stream, "closed", True))
+
+
+def _command_worker_close_socket(sock: socket.socket) -> bool:
+    sock.close()
+    return sock.fileno() == -1
+
+
+def _command_worker_close_selector(selector: selectors.BaseSelector) -> bool:
+    selector.close()
+    return True
+
+
+def _command_worker_close_exit_watch(watch: Any) -> bool:
+    watch.close()
+    return bool(getattr(watch, "closed", True))
+
+
+class _CommandLifecycleWorker:
+    """Sole owner of one command process group and all of its I/O resources."""
+
+    def __init__(self, request: _CommandWorkerRequest) -> None:
+        self.request = request
+        self.process: Optional[subprocess.Popen[bytes]] = None
+        self.selector: Optional[selectors.BaseSelector] = None
+        self.exit_watch: Any = None
+        self.leader_exit_observed = False
+        self.streams: list[Any] = []
+        self.prepared: Optional[
+            tuple[str, str, AttemptOutcome, Optional[FailureCode]]
+        ] = None
+        self.abnormal = False
+        self.group_absent = False
+        self.leader_reaped = False
+        self.owned_resources_closed = False
+        self.cleanup_fault = False
+        self.interruption_info: Optional[tuple[BaseException, Any]] = None
+
+    def _capture_failure(self, exc: BaseException) -> None:
+        self.cleanup_fault = True
+        if not isinstance(exc, Exception) and self.interruption_info is None:
+            self.interruption_info = (exc, sys.exc_info()[2])
+
+    def _prepare_unknown(self) -> None:
+        self.prepared = (
+            "", "", AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+        )
+
+    def _prepare_abnormal(
+        self, outcome: AttemptOutcome, failure: FailureCode,
+    ) -> None:
+        self.abnormal = True
+        self.prepared = ("", "", outcome, failure)
+
+    def _spawn(self) -> bool:
+        environment = dict(os.environ)
+        environment["LC_ALL"] = "C"
+        try:
+            _command_worker_popen_owned(
+                self,
+                self.request.args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                env=environment,
+            )
+        except FileNotFoundError:
+            if self.process is None:
+                self.prepared = (
+                    "", "", AttemptOutcome.MISSING_DEPENDENCY,
+                    FailureCode.MISSING_EXECUTABLE,
+                )
+            else:
+                self.abnormal = True
+                self._prepare_unknown()
+            return False
+        except PermissionError:
+            if self.process is None:
+                self.prepared = (
+                    "", "", AttemptOutcome.PERMISSION_DENIED,
+                    FailureCode.PERMISSION_DENIED,
+                )
+            else:
+                self.abnormal = True
+                self._prepare_unknown()
+            return False
+        except OSError:
+            if self.process is not None:
+                self.abnormal = True
+            self._prepare_unknown()
+            return False
+        assert self.process is not None
+        self.leader_exit_observed = _command_worker_open_exit_watch(
+            self, self.process.pid,
+        )
+        return True
+
+    def _normal_wait(self, deadline: float) -> bool:
+        assert self.process is not None
+        while True:
+            if _command_was_cancelled(self.request.control):
+                self._prepare_abnormal(
+                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                )
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._prepare_abnormal(
+                    AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
+                )
+                return False
+            if not self.leader_exit_observed:
+                events = _command_worker_select(self.selector, min(remaining, 0.05))
+                for key, _mask in events:
+                    if key.data == "cancel":
+                        _command_request_cancellation(self.request.control)
+                    elif key.data == "leader-exit":
+                        self.leader_exit_observed = _command_worker_observe_exit(
+                            self.exit_watch, self.process.pid,
+                        )
+                if not self.leader_exit_observed:
+                    continue
+            if not _command_try_normal_commit(self.request.control):
+                self._prepare_abnormal(
+                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                )
+                return False
+            self.leader_reaped = _command_worker_reap_leader(
+                self.process, deadline,
+            )
+            return self.leader_reaped
+
+    def _collect_output(self) -> None:
+        assert self.process is not None
+        assert self.process.stdout is not None and self.process.stderr is not None
+        assert self.selector is not None
+        self.streams.extend((self.process.stdout, self.process.stderr))
+        _command_worker_register(self.selector, self.request.cancel_reader, "cancel")
+        _command_worker_register(self.selector, self.process.stdout, "stdout")
+        _command_worker_register(self.selector, self.process.stderr, "stderr")
+        assert self.exit_watch is not None
+        _command_worker_register(self.selector, self.exit_watch, "leader-exit")
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        limits = {
+            "stdout": self.request.stdout_limit,
+            "stderr": self.request.stderr_limit,
+        }
+        open_streams = {"stdout", "stderr"}
+        deadline = self.request.started_mono_s + self.request.timeout_s
+
+        while open_streams:
+            if _command_was_cancelled(self.request.control):
+                self._prepare_abnormal(
+                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                )
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._prepare_abnormal(
+                    AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
+                )
+                return
+            events = _command_worker_select(self.selector, remaining)
+            if not events:
+                continue
+            for key, _mask in events:
+                name = key.data
+                if name == "cancel":
+                    try:
+                        self.request.cancel_reader.recv(4096)
+                    except BlockingIOError:
+                        pass
+                    _command_request_cancellation(self.request.control)
+                    self._prepare_abnormal(
+                        AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                    )
+                    return
+                if name == "leader-exit":
+                    self.leader_exit_observed = _command_worker_observe_exit(
+                        self.exit_watch, self.process.pid,
+                    )
+                    continue
+                if name not in open_streams:
+                    continue
+                remaining_capacity = limits[name] - len(buffers[name])
+                data = _command_worker_read(
+                    key.fileobj.fileno(),
+                    min(COMMAND_READ_CHUNK_BYTES, remaining_capacity + 1),
+                )
+                if not data:
+                    if not _command_worker_unregister(self.selector, key.fileobj):
+                        raise RuntimeError("command stream unregister was not confirmed")
+                    open_streams.remove(name)
+                    continue
+                if len(data) > remaining_capacity:
+                    self._prepare_abnormal(
+                        AttemptOutcome.COMMAND_ERROR, FailureCode.OUTPUT_LIMIT,
+                    )
+                    return
+                buffers[name].extend(data)
+
+        try:
+            stdout = bytes(buffers["stdout"]).decode("utf-8", "strict")
+            stderr = bytes(buffers["stderr"]).decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            self._prepare_abnormal(
+                AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
+            )
+            return
+
+        if not self._normal_wait(deadline):
+            return
+        if self.process.returncode == 0:
+            self.prepared = (stdout, stderr, AttemptOutcome.SUCCESS, None)
+        else:
+            self.prepared = (
+                stdout, stderr, AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
+            )
+
+    def _retry_group_operation(
+        self, operation: Callable[[int], _CommandGroupState], phase_deadline: float,
+    ) -> _CommandGroupState:
+        assert self.process is not None
+        attempts = 0
+        while attempts < 2 or time.monotonic() < phase_deadline:
+            attempts += 1
+            try:
+                return operation(self.process.pid)
+            except BaseException as exc:
+                self._capture_failure(exc)
+                try:
+                    _command_worker_retry_wait(phase_deadline)
+                except BaseException as wait_exc:
+                    self._capture_failure(wait_exc)
+        return _CommandGroupState.UNCONFIRMED
+
+    def _retry_reap(self, deadline: float) -> None:
+        assert self.process is not None
+        attempts = 0
+        while not self.leader_reaped and (
+            attempts < 2 or time.monotonic() < deadline
+        ):
+            attempts += 1
+            try:
+                self.leader_reaped = _command_worker_reap_leader(
+                    self.process, deadline,
+                )
+            except BaseException as exc:
+                self._capture_failure(exc)
+            if not self.leader_reaped:
+                try:
+                    _command_worker_retry_wait(deadline)
+                except BaseException as wait_exc:
+                    self._capture_failure(wait_exc)
+
+    def _terminate_group(self, cleanup_deadline: float) -> None:
+        assert self.process is not None
+        term_deadline = min(cleanup_deadline, time.monotonic() + 0.05)
+        term_state = self._retry_group_operation(
+            lambda pgid: _command_worker_signal_group(pgid, signal.SIGTERM),
+            term_deadline,
+        )
+        if term_state is _CommandGroupState.ABSENT:
+            self.group_absent = True
+
+        if not self.group_absent:
+            grace_deadline = min(
+                cleanup_deadline,
+                time.monotonic() + COMMAND_TERMINATE_GRACE_SECONDS,
+            )
+            while time.monotonic() < grace_deadline:
+                try:
+                    _command_worker_grace_wait(grace_deadline)
+                except BaseException as exc:
+                    self._capture_failure(exc)
+
+        kill_deadline = max(time.monotonic(), cleanup_deadline - 0.08)
+        first_kill = True
+        while not self.group_absent and (
+            first_kill or time.monotonic() < kill_deadline
+        ):
+            first_kill = False
+            state = self._retry_group_operation(
+                lambda pgid: _command_worker_signal_group(pgid, signal.SIGKILL),
+                kill_deadline,
+            )
+            if state is _CommandGroupState.ABSENT:
+                self.group_absent = True
+                break
+            state = self._retry_group_operation(
+                _command_worker_probe_group, kill_deadline,
+            )
+            if state is _CommandGroupState.ABSENT:
+                self.group_absent = True
+                break
+            try:
+                _command_worker_retry_wait(kill_deadline)
+            except BaseException as exc:
+                self._capture_failure(exc)
+
+        self._retry_reap(cleanup_deadline)
+
+    def _retry_cleanup(self, operation: Callable[[], bool], deadline: float) -> bool:
+        attempts = 0
+        while attempts < 2 or time.monotonic() < deadline:
+            attempts += 1
+            try:
+                if operation():
+                    return True
+                self.cleanup_fault = True
+            except BaseException as exc:
+                self._capture_failure(exc)
+            try:
+                _command_worker_retry_wait(deadline)
+            except BaseException as exc:
+                self._capture_failure(exc)
+        return False
+
+    def _close_owned_resources(self, deadline: float) -> bool:
+        operations: list[Callable[[], bool]] = []
+        if self.selector is not None:
+            for stream in self.streams:
+                operations.append(
+                    lambda stream=stream: _command_worker_unregister(
+                        self.selector, stream,
+                    )
+                )
+            if self.exit_watch is not None:
+                operations.append(
+                    lambda: _command_worker_unregister(
+                        self.selector, self.exit_watch,
+                    )
+                )
+            operations.append(
+                lambda: _command_worker_unregister(
+                    self.selector, self.request.cancel_reader,
+                )
+            )
+        for stream in self.streams:
+            operations.append(
+                lambda stream=stream: _command_worker_close_stream(stream)
+            )
+        operations.append(
+            lambda: _command_worker_close_socket(self.request.cancel_reader)
+        )
+        if self.exit_watch is not None:
+            operations.append(
+                lambda: _command_worker_close_exit_watch(self.exit_watch)
+            )
+        if self.selector is not None:
+            operations.append(lambda: _command_worker_close_selector(self.selector))
+        results = [self._retry_cleanup(operation, deadline) for operation in operations]
+        return all(results)
+
+    def execute(self) -> _CommandWorkerReport:
+        cleanup_deadline: Optional[float] = None
+        try:
+            _command_wait_start_gate(self.request.start_gate)
+            if _command_was_cancelled(self.request.control):
+                self._prepare_unknown()
+            else:
+                self.selector = selectors.DefaultSelector()
+                if self._spawn():
+                    self._collect_output()
+        except BaseException as exc:
+            self._capture_failure(exc)
+            if (
+                self.process is not None
+                and not self.leader_reaped
+                and not _command_normal_was_committed(self.request.control)
+            ):
+                self.abnormal = True
+            self._prepare_unknown()
+        finally:
+            cleanup_deadline = time.monotonic() + COMMAND_CLEANUP_SECONDS
+            if self.process is not None:
+                for stream in (self.process.stdout, self.process.stderr):
+                    if stream is not None and stream not in self.streams:
+                        self.streams.append(stream)
+            if self.process is not None and not self.leader_reaped:
+                if _command_normal_was_committed(self.request.control):
+                    self._retry_reap(cleanup_deadline)
+                elif self.abnormal:
+                    termination_attempts = 0
+                    while termination_attempts < 2:
+                        termination_attempts += 1
+                        try:
+                            self._terminate_group(cleanup_deadline)
+                            break
+                        except BaseException as exc:
+                            self._capture_failure(exc)
+            try:
+                self.owned_resources_closed = self._close_owned_resources(
+                    cleanup_deadline,
+                )
+            except BaseException as exc:
+                self._capture_failure(exc)
+                self.owned_resources_closed = False
+
+        if self.prepared is None:
+            self._prepare_unknown()
+        verified = self.owned_resources_closed
+        if self.process is not None:
+            verified = verified and self.leader_reaped
+            if self.abnormal:
+                verified = verified and self.group_absent
+        if self.cleanup_fault or not verified:
+            self._prepare_unknown()
+        assert self.prepared is not None
+        stdout, stderr, outcome, failure = self.prepared
+        returncode = self.process.returncode if self.process is not None else None
+        result = _command_result(
+            self.request.category,
+            stdout,
+            stderr,
+            returncode,
+            self.request.started_mono_s,
+            outcome,
+            failure,
+        )
+        interruption: Optional[BaseException] = None
+        interruption_traceback: Any = None
+        if self.interruption_info is not None:
+            interruption, interruption_traceback = self.interruption_info
+        return _CommandWorkerReport(result, interruption, interruption_traceback)
+
+
+def _private_unknown_command_result(category: str, started_mono_s: float) -> CommandResult:
+    return _command_result(
+        category,
+        "",
+        "",
+        None,
+        started_mono_s,
+        AttemptOutcome.UNKNOWN_ERROR,
+        FailureCode.UNEXPECTED_EXCEPTION,
+    )
+
+
+def _command_publish_report(
+    request: _CommandWorkerRequest,
+    reports: list[_CommandWorkerReport],
+    report: _CommandWorkerReport,
+) -> None:
+    reports[:] = [report]
+    request.published.set()
+
+
+def _command_worker_entry(
+    request: _CommandWorkerRequest, reports: list[_CommandWorkerReport],
+) -> None:
+    try:
+        report = _CommandLifecycleWorker(request).execute()
+    except BaseException as exc:
+        interruption = None if isinstance(exc, Exception) else exc
+        traceback = None if interruption is None else sys.exc_info()[2]
+        try:
+            request.cancel_reader.close()
+        except BaseException:
+            pass
+        report = _CommandWorkerReport(
+            _private_unknown_command_result(
+                request.category, request.started_mono_s,
+            ),
+            interruption,
+            traceback,
+        )
+    publication_interruption: Optional[tuple[BaseException, Any]] = None
+    if report.interruption is not None:
+        publication_interruption = (
+            report.interruption, report.interruption_traceback,
+        )
+    while True:
+        try:
+            _command_publish_report(request, reports, report)
+            return
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and publication_interruption is None:
+                publication_interruption = (exc, sys.exc_info()[2])
+            report = _CommandWorkerReport(
+                _private_unknown_command_result(
+                    request.category, request.started_mono_s,
+                ),
+                report.interruption,
+                report.interruption_traceback,
+            )
+            if publication_interruption is not None:
+                report = _CommandWorkerReport(
+                    report.result,
+                    publication_interruption[0],
+                    publication_interruption[1],
+                )
+
+def _close_command_socket_in_caller(sock: socket.socket) -> bool:
+    sock.close()
+    return sock.fileno() == -1
 
 
 def run_structured_command(
@@ -597,148 +1196,170 @@ def run_structured_command(
         args, category, timeout_s, stdout_limit, stderr_limit
     )
     started_mono_s = time.monotonic()
-    deadline = started_mono_s + timeout_s
-    process: Optional[subprocess.Popen[bytes]] = None
-    selector: selectors.BaseSelector = selectors.DefaultSelector()
-    streams: list[Any] = []
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
-    failure: Optional[FailureCode] = None
-    outcome: Optional[AttemptOutcome] = None
-    result_payload: Optional[tuple[str, str, AttemptOutcome, Optional[FailureCode]]] = None
-    terminate_process_group = False
-    pending_base_exception: Optional[BaseException] = None
+    interruption_info: Optional[tuple[BaseException, Any]] = None
+    caller_fault = False
 
-    try:
-        process = subprocess.Popen(
-            normalized_args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-    except FileNotFoundError:
-        _cleanup_spawn_selector(selector)
-        return _command_result(
-            category, "", "", None, started_mono_s,
-            AttemptOutcome.MISSING_DEPENDENCY, FailureCode.MISSING_EXECUTABLE,
-        )
-    except PermissionError:
-        _cleanup_spawn_selector(selector)
-        return _command_result(
-            category, "", "", None, started_mono_s,
-            AttemptOutcome.PERMISSION_DENIED, FailureCode.PERMISSION_DENIED,
-        )
-    except OSError:
-        _cleanup_spawn_selector(selector)
-        return _command_result(
-            category, "", "", None, started_mono_s,
-            AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
-        )
+    def capture(exc: BaseException) -> None:
+        nonlocal interruption_info, caller_fault
+        caller_fault = True
+        if not isinstance(exc, Exception) and interruption_info is None:
+            interruption_info = (exc, sys.exc_info()[2])
 
-    try:
-        assert process.stdout is not None and process.stderr is not None
-        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
-            streams.append(stream)
-            selector.register(stream, selectors.EVENT_READ, name)
-
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                outcome = AttemptOutcome.TIMEOUT
-                failure = FailureCode.COMMAND_TIMEOUT
-                break
-            events = selector.select(remaining)
-            if not events:
-                continue
-            for key, _mask in events:
-                name = key.data
-                remaining_capacity = limits[name] - len(buffers[name])
-                data = os.read(key.fileobj.fileno(), min(COMMAND_READ_CHUNK_BYTES, remaining_capacity + 1))
-                if not data:
-                    selector.unregister(key.fileobj)
-                    continue
-                if len(data) > remaining_capacity:
-                    outcome = AttemptOutcome.COMMAND_ERROR
-                    failure = FailureCode.OUTPUT_LIMIT
-                    break
-                buffers[name].extend(data)
-            if failure is not None:
-                break
-
-        if failure is not None:
-            terminate_process_group = True
-            result_payload = (
-                "", "", outcome or AttemptOutcome.UNKNOWN_ERROR, failure,
-            )
-        else:
+    def close_caller_socket(sock: socket.socket) -> bool:
+        nonlocal caller_fault
+        deadline = time.monotonic() + 0.2
+        attempts = 0
+        while attempts < 2 or time.monotonic() < deadline:
+            attempts += 1
             try:
-                stdout = bytes(buffers["stdout"]).decode("utf-8", "strict")
-                stderr = bytes(buffers["stderr"]).decode("utf-8", "strict")
-            except UnicodeDecodeError:
-                terminate_process_group = True
-                result_payload = (
-                    "", "", AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
-                )
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    terminate_process_group = True
-                    result_payload = (
-                        "", "", AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
-                    )
-                else:
-                    try:
-                        process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        terminate_process_group = True
-                        result_payload = (
-                            "", "", AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
-                        )
-                    else:
-                        if process.returncode != 0:
-                            result_payload = (
-                                stdout, stderr, AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
-                            )
-                        else:
-                            result_payload = (stdout, stderr, AttemptOutcome.SUCCESS, None)
-    except Exception:
-        terminate_process_group = True
-        result_payload = (
-            "", "", AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
-        )
-    except BaseException as exc:
-        terminate_process_group = True
-        pending_base_exception = exc
-        raise
-    finally:
-        cleanup_failure_kinds = _cleanup_structured_command(
-            process,
-            selector,
-            streams,
-            terminate_process_group=terminate_process_group,
-            suppress_ordinary_exceptions=(
-                pending_base_exception is not None or result_payload is not None
-            ),
-            preserve_pending_base_exception=pending_base_exception is not None,
-        )
+                if _close_command_socket_in_caller(sock):
+                    return True
+                caller_fault = True
+            except BaseException as exc:
+                capture(exc)
+            try:
+                time.sleep(0)
+            except BaseException as exc:
+                capture(exc)
+        return False
 
-    assert result_payload is not None
-    stdout, stderr, result_outcome, result_failure = result_payload
-    if terminate_process_group and (
-        any(kind in {"term", "grace", "kill", "reap"} for kind in cleanup_failure_kinds)
-        or process.returncode is None
-    ):
-        stdout = ""
-        stderr = ""
-        result_outcome = AttemptOutcome.UNKNOWN_ERROR
-        result_failure = FailureCode.UNEXPECTED_EXCEPTION
-    return _command_result(
-        category, stdout, stderr, process.returncode, started_mono_s,
-        result_outcome, result_failure,
-    )
+    cancel_reader: Optional[socket.socket] = None
+    cancel_writer: Optional[socket.socket] = None
+    start_gate: Optional[threading.Event] = None
+    published: Optional[threading.Event] = None
+    control: Optional[_CommandLifecycleControl] = None
+    reports: list[_CommandWorkerReport] = []
+    thread: Optional[threading.Thread] = None
+    request: Optional[_CommandWorkerRequest] = None
+    start_returned = False
+    start_attempted = False
+    setup_ready = False
+    lifecycle_complete = False
+    report: Optional[_CommandWorkerReport] = None
+
+    def request_cancel() -> None:
+        if control is None:
+            return
+        while True:
+            try:
+                _command_request_cancellation(control)
+                return
+            except BaseException as exc:
+                capture(exc)
+
+    def open_gate() -> None:
+        if start_gate is None:
+            return
+        while True:
+            try:
+                _command_open_start_gate(start_gate)
+                return
+            except BaseException as exc:
+                capture(exc)
+                request_cancel()
+
+    notified = False
+
+    def notify_cancellation() -> None:
+        nonlocal notified
+        request_cancel()
+        if cancel_writer is None:
+            return
+        while not notified:
+            try:
+                notified = _command_notify_cancel(cancel_writer)
+            except BaseException as exc:
+                capture(exc)
+
+    try:
+        try:
+            cancel_reader, cancel_writer = socket.socketpair()
+            assert cancel_reader is not None and cancel_writer is not None
+            cancel_reader.setblocking(False)
+            cancel_writer.setblocking(False)
+            start_gate = threading.Event()
+            published = threading.Event()
+            control = _CommandLifecycleControl()
+            request = _CommandWorkerRequest(
+                normalized_args,
+                category,
+                float(timeout_s),
+                stdout_limit,
+                stderr_limit,
+                started_mono_s,
+                start_gate,
+                cancel_reader,
+                published,
+                control,
+            )
+            thread = threading.Thread(
+                target=_command_worker_entry,
+                args=(request, reports),
+                name="PorkyHUD-command-%x" % id(published),
+                daemon=False,
+            )
+        except BaseException as exc:
+            capture(exc)
+        setup_ready = request is not None and thread is not None
+
+        while setup_ready and not lifecycle_complete:
+            try:
+                if not start_attempted:
+                    start_attempted = True
+                    assert thread is not None
+                    _command_start_thread(thread)
+                    start_returned = True
+                if caller_fault:
+                    notify_cancellation()
+                open_gate()
+                if not start_returned:
+                    lifecycle_complete = True
+                    continue
+                publication_ready = False
+                while not publication_ready:
+                    if caller_fault:
+                        notify_cancellation()
+                    assert published is not None
+                    publication_ready = _command_wait_publication(published, 0.05)
+                assert thread is not None
+                while _command_thread_is_alive(thread):
+                    _command_join_thread(thread, 0.05)
+                if reports:
+                    report = reports[0]
+                lifecycle_complete = True
+            except BaseException as exc:
+                capture(exc)
+                try:
+                    notify_cancellation()
+                except BaseException as later_exc:
+                    capture(later_exc)
+                try:
+                    open_gate()
+                except BaseException as later_exc:
+                    capture(later_exc)
+    finally:
+        while True:
+            try:
+                if setup_ready and not lifecycle_complete:
+                    request_cancel()
+                    open_gate()
+                if not start_returned and cancel_reader is not None:
+                    close_caller_socket(cancel_reader)
+                if cancel_writer is not None:
+                    close_caller_socket(cancel_writer)
+                break
+            except BaseException as exc:
+                capture(exc)
+
+    if interruption_info is not None:
+        raise interruption_info[0].with_traceback(interruption_info[1])
+    if not setup_ready or not start_returned or report is None:
+        return _private_unknown_command_result(category, started_mono_s)
+    if report.interruption is not None:
+        raise report.interruption.with_traceback(report.interruption_traceback)
+    if caller_fault:
+        return _private_unknown_command_result(category, started_mono_s)
+    return report.result
 
 
 def sysctl_value(name: str) -> str:
