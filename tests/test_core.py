@@ -9,6 +9,7 @@ from porkyhud_core import (
     AttemptOutcome,
     CpuUsage,
     CpuWindow,
+    CpuWindowSummary,
     DiskCapacity,
     FailureCode,
     MemoryPressure,
@@ -347,15 +348,39 @@ class CpuWindowTests(unittest.TestCase):
                 )
                 self.assertEqual(summary.mean_percent, percent)
 
-    def test_gap_of_exactly_2_5_seconds_is_retained_but_not_represented(self):
+    def test_gap_of_exactly_2_5_seconds_preserves_10_represented_seconds(self):
         source = self.complete_cpu(
-            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 100.0
         )
         window = reduce_cpu_window(CpuWindow(), source)
-        source = self.complete_cpu(source, 7.5, 12.5, 60.0)
+        source = self.complete_cpu(source, 7.5, 12.5, 0.0)
         retained = reduce_cpu_window(window, source)
         self.assertEqual(len(retained.samples), 2)
-        self.assertIsNone(cpu_window_summary(retained, 12.5))
+        summary = cpu_window_summary(retained, 10.0)
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary.duration_s, 10.0)
+        self.assertEqual(summary.mean_percent, 50.0)
+        self.assertEqual(summary.started_mono_s, 0.0)
+        self.assertEqual(summary.completed_mono_s, 12.5)
+
+    def test_allowed_gaps_preserve_15_represented_seconds_and_clip_oldest(self):
+        source = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        window = CpuWindow()
+        for start, end, percent in ((0.0, 6.0, 100.0),
+                                    (8.0, 14.0, 50.0),
+                                    (16.5, 22.5, 100.0)):
+            source = self.complete_cpu(source, start, end, percent)
+            window = reduce_cpu_window(window, source)
+        summary = cpu_window_summary(window, 15.0)
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary.duration_s, 15.0)
+        self.assertEqual(summary.mean_percent, 80.0)
+        self.assertEqual(summary.started_mono_s, 3.0)
+        self.assertEqual(summary.completed_mono_s, 22.5)
+
+    def test_summary_span_may_include_unrepresented_observation_gaps(self):
+        summary = CpuWindowSummary(10.0, 50.0, 0.0, 12.5)
+        self.assertEqual(summary.completed_mono_s - summary.started_mono_s, 12.5)
 
     def test_gap_strictly_greater_than_2_5_seconds_resets_to_current_sample(self):
         source = self.complete_cpu(
@@ -415,6 +440,32 @@ class CpuWindowTests(unittest.TestCase):
         reset = reduce_cpu_window(window, source)
         self.assertEqual(reset.samples, (source.last_valid,))
         self.assertEqual(reset.last_attempt_revision, 1)
+
+    def test_skipped_failed_revision_cannot_be_bridged_by_later_success(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 1.0, 50.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        source = self.failed_cpu(source, 1.0, 2.0)
+        source = self.complete_cpu(source, 2.0, 3.0, 70.0)
+
+        reset = reduce_cpu_window(window, source)
+
+        self.assertEqual(tuple(sample.revision for sample in reset.samples), (3,))
+        self.assertEqual(reset.last_attempt_revision, 3)
+
+    def test_skipped_successful_revision_cannot_be_assumed_contiguous(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 1.0, 50.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        source = self.complete_cpu(source, 1.0, 2.0, 60.0)
+        source = self.complete_cpu(source, 2.0, 3.0, 70.0)
+
+        reset = reduce_cpu_window(window, source)
+
+        self.assertEqual(tuple(sample.revision for sample in reset.samples), (3,))
+        self.assertEqual(reset.last_attempt_revision, 3)
 
     def test_cpu_window_rejects_source_mismatches_and_corrupt_successes(self):
         with self.assertRaises(ValueError):
@@ -493,12 +544,18 @@ class CpuWindowTests(unittest.TestCase):
                                              (True, "App", 1.0, None),
                                              (1, "", 1.0, None),
                                              (1, "App", True, None),
-                                             (1, "App", 100.1, None),
                                              (1, "App", 1.0, -1),
                                              (1, "App", 1.0, True)):
             with self.subTest(pid=pid, name=name, percent=percent, elapsed=elapsed):
                 with self.assertRaises(ValueError):
                     ProcessFact(pid, name, percent, elapsed)
+
+    def test_process_cpu_allows_multithreaded_ps_values_but_rejects_nonfinite(self):
+        self.assertEqual(ProcessFact(1, "compiler", 250.0, 3).cpu_percent, 250.0)
+        for percent in (-0.1, True, nan, inf, -inf):
+            with self.subTest(percent=percent):
+                with self.assertRaises(ValueError):
+                    ProcessFact(1, "compiler", percent, 3)
 
 
 if __name__ == "__main__":

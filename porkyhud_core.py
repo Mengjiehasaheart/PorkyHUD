@@ -147,7 +147,7 @@ class ProcessFact:
             raise ValueError("pid must be a positive int")
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("name must be a non-empty string")
-        _require_percent(self.cpu_percent, "cpu_percent")
+        _require_finite_nonnegative(self.cpu_percent, "cpu_percent")
         if self.elapsed_seconds is not None:
             _require_nonnegative_int(self.elapsed_seconds, "elapsed_seconds")
 
@@ -235,13 +235,6 @@ class CpuWindowSummary:
         _require_finite_mono(self.completed_mono_s, "completed_mono_s")
         if self.completed_mono_s <= self.started_mono_s:
             raise ValueError("summary window must have positive duration")
-        if not math.isclose(
-            self.completed_mono_s - self.started_mono_s,
-            self.duration_s,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ):
-            raise ValueError("summary duration does not match its time window")
 
 
 _LEGAL_FAILURES = {
@@ -421,7 +414,11 @@ def source_view(state: SourceState[T], now_mono_s: float) -> SourceView:
 def reduce_cpu_window(
     window: CpuWindow, source: SourceState[CpuUsage]
 ) -> CpuWindow:
-    """Incorporate one completed CPU attempt without inventing coverage."""
+    """Incorporate one completed CPU attempt without inventing coverage.
+
+    Observation gaps up to 2.5 seconds preserve continuity eligibility, but
+    the gap itself never becomes represented CPU time.
+    """
     if not isinstance(window, CpuWindow):
         raise ValueError("window must be a CpuWindow")
     if not isinstance(source, SourceState) or source.source_id is not SourceId.CPU_USAGE:
@@ -438,10 +435,10 @@ def reduce_cpu_window(
         return CpuWindow((), attempt.revision)
 
     sample = _validated_cpu_success(source, attempt)
-    if attempt.revision < window.last_attempt_revision:
+    if not window.samples:
         return CpuWindow((sample,), attempt.revision)
 
-    if not window.samples:
+    if attempt.revision != window.last_attempt_revision + 1:
         return CpuWindow((sample,), attempt.revision)
 
     previous = window.samples[-1]
@@ -463,7 +460,7 @@ def reduce_cpu_window(
 def cpu_window_summary(
     window: CpuWindow, duration_s: float
 ) -> Optional[CpuWindowSummary]:
-    """Summarize a fully represented continuous CPU interval by elapsed time."""
+    """Summarize represented CPU time, excluding allowed observation gaps."""
     if not isinstance(window, CpuWindow):
         raise ValueError("window must be a CpuWindow")
     _require_finite_positive(duration_s, "duration_s")
@@ -471,26 +468,26 @@ def cpu_window_summary(
         return None
 
     completed_mono_s = window.samples[-1].value.window_completed_mono_s
-    started_mono_s = completed_mono_s - duration_s
-    represented_until = started_mono_s
+    remaining_duration_s = duration_s
     weighted_percent_seconds = 0.0
+    started_mono_s = None
 
-    for sample in window.samples:
+    for sample in reversed(window.samples):
         usage = sample.value
-        if usage.window_completed_mono_s <= represented_until:
-            continue
-        if usage.window_started_mono_s > represented_until:
-            return None
-        segment_started_mono_s = max(
-            usage.window_started_mono_s, represented_until
+        sample_duration_s = (
+            usage.window_completed_mono_s - usage.window_started_mono_s
         )
-        segment_duration_s = (
-            usage.window_completed_mono_s - segment_started_mono_s
-        )
-        weighted_percent_seconds += usage.percent * segment_duration_s
-        represented_until = usage.window_completed_mono_s
+        if sample_duration_s >= remaining_duration_s:
+            started_mono_s = (
+                usage.window_completed_mono_s - remaining_duration_s
+            )
+            weighted_percent_seconds += usage.percent * remaining_duration_s
+            remaining_duration_s = 0.0
+            break
+        weighted_percent_seconds += usage.percent * sample_duration_s
+        remaining_duration_s -= sample_duration_s
 
-    if represented_until < completed_mono_s:
+    if remaining_duration_s > 0.0 or started_mono_s is None:
         return None
     return CpuWindowSummary(
         duration_s,
@@ -503,12 +500,18 @@ def cpu_window_summary(
 def _retain_cpu_samples(
     samples: Tuple[Sample[CpuUsage], ...]
 ) -> Tuple[Sample[CpuUsage], ...]:
-    cutoff_mono_s = samples[-1].value.window_completed_mono_s - 15.0
-    return tuple(
-        sample
-        for sample in samples
-        if sample.value.window_completed_mono_s > cutoff_mono_s
-    )
+    """Keep 15 represented seconds plus the intact clipped-boundary sample."""
+    represented_duration_s = 0.0
+    first_retained_index = len(samples)
+    for index in range(len(samples) - 1, -1, -1):
+        usage = samples[index].value
+        represented_duration_s += (
+            usage.window_completed_mono_s - usage.window_started_mono_s
+        )
+        first_retained_index = index
+        if represented_duration_s >= 15.0:
+            break
+    return samples[first_retained_index:]
 
 
 def _validated_cpu_success(
@@ -580,6 +583,12 @@ def _require_percent(value: float, name: str) -> None:
     _require_finite_mono(value, name)
     if value < 0 or value > 100:
         raise ValueError("%s must be within 0..100" % name)
+
+
+def _require_finite_nonnegative(value: float, name: str) -> None:
+    _require_finite_mono(value, name)
+    if value < 0:
+        raise ValueError("%s must be finite and nonnegative" % name)
 
 
 def _require_nonnegative_int(value: int, name: str) -> None:
