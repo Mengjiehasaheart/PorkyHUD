@@ -459,6 +459,88 @@ def is_decision_ready(state: SourceState[T], now_mono_s: float) -> bool:
     )
 
 
+def validate_source_state(
+    state: SourceState[T],
+    now_mono_s: float,
+    expected_source_id: Optional[SourceId] = None,
+) -> Optional[CollectionAttempt]:
+    """Validate generic source chronology before a consumer trusts its value."""
+
+    _require_finite_mono(now_mono_s, "now_mono_s")
+    if not isinstance(state, SourceState) or not isinstance(state.source_id, SourceId):
+        raise ValueError("state must be a SourceState with a SourceId")
+    if expected_source_id is not None and state.source_id is not expected_source_id:
+        raise ValueError("source has the wrong SourceId")
+    _require_finite_positive(state.expected_cadence_s, "source.expected_cadence_s")
+    _require_finite_positive(state.stale_after_s, "source.stale_after_s")
+    if state.stale_after_s < state.expected_cadence_s:
+        raise ValueError("source stale_after_s is shorter than cadence")
+    if type(state.revision) is not int or state.revision < 0:
+        raise ValueError("source revision must be a nonnegative int")
+    if state.active_revision is None:
+        if state.active_started_mono_s is not None:
+            raise ValueError("inactive source cannot retain an active start time")
+    else:
+        if (
+            type(state.active_revision) is not int
+            or state.active_revision <= 0
+            or state.active_revision != state.revision
+            or state.active_started_mono_s is None
+        ):
+            raise ValueError("active source revision is inconsistent")
+        _require_finite_mono(state.active_started_mono_s, "source.active_started_mono_s")
+        if now_mono_s < state.active_started_mono_s:
+            raise ValueError("now_mono_s cannot precede the active attempt")
+
+    attempt = state.last_attempt
+    if attempt is None:
+        if state.last_valid is not None:
+            raise ValueError("source cannot retain a sample without an attempt")
+        if state.active_revision is None and state.revision != 0:
+            raise ValueError("inactive source cannot have an uncompleted revision")
+        if state.active_revision is not None and state.revision != 1:
+            raise ValueError("initial active source must have revision one")
+        return None
+    _validate_generic_attempt(attempt)
+    if now_mono_s < attempt.completed_mono_s:
+        raise ValueError("now_mono_s cannot precede the completed attempt")
+    if state.active_revision is None:
+        if attempt.revision != state.revision:
+            raise ValueError("completed attempt must match source revision")
+    elif (
+        attempt.revision != state.active_revision - 1
+        or state.active_started_mono_s < attempt.completed_mono_s
+    ):
+        raise ValueError("active source cannot skip or precede an attempt")
+
+    sample = state.last_valid
+    if sample is not None:
+        _validate_generic_sample(sample)
+        if sample.revision > attempt.revision:
+            raise ValueError("retained sample cannot follow the latest attempt")
+        if now_mono_s < sample.completed_mono_s:
+            raise ValueError("now_mono_s cannot precede the retained sample")
+        if attempt.outcome is AttemptOutcome.SUCCESS:
+            if sample.revision != attempt.revision:
+                raise ValueError("successful attempt lacks matching sample revision")
+            if (
+                sample.started_mono_s != attempt.started_mono_s
+                or sample.completed_mono_s != attempt.completed_mono_s
+                or sample.completed_at_utc != attempt.completed_at_utc
+            ):
+                raise ValueError("successful sample does not match completed attempt")
+        else:
+            if sample.revision == attempt.revision:
+                raise ValueError("failed attempt cannot own a valid sample")
+            if sample.completed_mono_s > attempt.started_mono_s:
+                raise ValueError("retained sample cannot complete after a later attempt starts")
+            if sample.completed_at_utc > attempt.completed_at_utc:
+                raise ValueError("retained sample wall time cannot follow a later attempt")
+    elif attempt.outcome is AttemptOutcome.SUCCESS:
+        raise ValueError("successful attempt lacks a sample")
+    return attempt
+
+
 def source_view(state: SourceState[T], now_mono_s: float) -> SourceView:
     """Derive a presentation view without mutating source evidence."""
     age_s = sample_age_s(state, now_mono_s)
@@ -889,41 +971,13 @@ def _validated_cpu_success(
 
 
 def _validate_cpu_attempt(attempt: CollectionAttempt) -> None:
-    if not isinstance(attempt, CollectionAttempt):
-        raise ValueError("last_attempt must be a CollectionAttempt")
-    if type(attempt.revision) is not int or attempt.revision <= 0:
-        raise ValueError("CPU attempt revision must be a positive int")
-    _require_finite_mono(attempt.started_mono_s, "attempt.started_mono_s")
-    _require_finite_mono(attempt.completed_mono_s, "attempt.completed_mono_s")
-    if attempt.completed_mono_s < attempt.started_mono_s:
-        raise ValueError("CPU attempt completion cannot precede its start")
-    if (type(attempt.completed_at_utc) is not datetime
-            or attempt.completed_at_utc.tzinfo is not timezone.utc):
-        raise ValueError("CPU attempt completion timestamp must be normalized UTC")
-    if type(attempt.outcome) is not AttemptOutcome:
-        raise ValueError("CPU attempt outcome must be an AttemptOutcome")
-    if attempt.failure is not None and type(attempt.failure) is not FailureCode:
-        raise ValueError("CPU attempt failure must be a FailureCode or None")
-    if attempt.outcome is AttemptOutcome.SUCCESS:
-        if attempt.failure is not None:
-            raise ValueError("successful CPU attempt cannot have a failure code")
-    elif attempt.failure not in _LEGAL_FAILURES.get(attempt.outcome, set()):
-        raise ValueError("CPU attempt failure code is incompatible with its outcome")
+    _validate_generic_attempt(attempt)
 
 
 def _validate_cpu_sample(sample: Sample[CpuUsage]) -> None:
-    if not isinstance(sample, Sample):
-        raise ValueError("CPU window samples must be Samples")
-    if type(sample.revision) is not int or sample.revision <= 0:
-        raise ValueError("CPU sample revision must be a positive int")
+    _validate_generic_sample(sample)
     if not isinstance(sample.value, CpuUsage):
         raise ValueError("CPU sample value must be CpuUsage")
-    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
-    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
-    if sample.completed_mono_s < sample.started_mono_s:
-        raise ValueError("CPU sample completion cannot precede its start")
-    if type(sample.completed_at_utc) is not datetime or sample.completed_at_utc.tzinfo is not timezone.utc:
-        raise ValueError("CPU sample completion timestamp must be normalized UTC")
 
 
 def _require_finite_positive(value: float, name: str) -> None:
@@ -952,6 +1006,40 @@ def _require_finite_nonnegative(value: float, name: str) -> None:
 def _require_nonnegative_int(value: int, name: str) -> None:
     if type(value) is not int or value < 0:
         raise ValueError("%s must be a nonnegative int" % name)
+
+
+def _validate_utc_timestamp(value: datetime, name: str) -> None:
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
+        raise ValueError("%s must be normalized UTC" % name)
+
+
+def _validate_generic_attempt(attempt: CollectionAttempt) -> None:
+    if type(attempt) is not CollectionAttempt or type(attempt.revision) is not int or attempt.revision <= 0:
+        raise ValueError("last_attempt must have a positive revision")
+    _require_finite_mono(attempt.started_mono_s, "attempt.started_mono_s")
+    _require_finite_mono(attempt.completed_mono_s, "attempt.completed_mono_s")
+    if attempt.completed_mono_s < attempt.started_mono_s:
+        raise ValueError("attempt completion cannot precede its start")
+    _validate_utc_timestamp(attempt.completed_at_utc, "attempt.completed_at_utc")
+    if type(attempt.outcome) is not AttemptOutcome:
+        raise ValueError("attempt outcome must be an AttemptOutcome")
+    if attempt.failure is not None and type(attempt.failure) is not FailureCode:
+        raise ValueError("attempt failure must be a FailureCode or None")
+    if attempt.outcome is AttemptOutcome.SUCCESS:
+        if attempt.failure is not None:
+            raise ValueError("successful attempt cannot have a failure code")
+    elif attempt.failure not in _LEGAL_FAILURES.get(attempt.outcome, set()):
+        raise ValueError("attempt failure code is incompatible with its outcome")
+
+
+def _validate_generic_sample(sample: Sample[T]) -> None:
+    if type(sample) is not Sample or type(sample.revision) is not int or sample.revision <= 0:
+        raise ValueError("last_valid must be a Sample with a positive revision")
+    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
+    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
+    if sample.completed_mono_s < sample.started_mono_s:
+        raise ValueError("sample completion cannot precede its start")
+    _validate_utc_timestamp(sample.completed_at_utc, "sample.completed_at_utc")
 
 
 def _validate_completion(
@@ -1322,62 +1410,9 @@ def _rule_attempt(
     source: SourceState[T], source_id: SourceId, value_type: type,
     now_mono_s: float,
 ) -> Optional[CollectionAttempt]:
-    _require_finite_mono(now_mono_s, "now_mono_s")
-    if not isinstance(source, SourceState) or source.source_id is not source_id:
-        raise ValueError("source has the wrong SourceId")
-    _require_finite_positive(source.expected_cadence_s, "source.expected_cadence_s")
-    _require_finite_positive(source.stale_after_s, "source.stale_after_s")
-    if source.stale_after_s < source.expected_cadence_s:
-        raise ValueError("source stale_after_s is shorter than cadence")
-    if type(source.revision) is not int or source.revision < 0:
-        raise ValueError("source revision must be a nonnegative int")
-    if source.active_revision is None:
-        if source.active_started_mono_s is not None:
-            raise ValueError("inactive source cannot retain an active start time")
-    else:
-        if (type(source.active_revision) is not int or source.active_revision <= 0
-                or source.active_revision != source.revision):
-            raise ValueError("active source revision is inconsistent")
-        if source.active_started_mono_s is None:
-            raise ValueError("active source requires an active start time")
-        _require_finite_mono(source.active_started_mono_s,
-                             "source.active_started_mono_s")
-        if now_mono_s < source.active_started_mono_s:
-            raise ValueError("now_mono_s cannot precede the active attempt")
-    attempt = source.last_attempt
-    if attempt is None:
-        if source.last_valid is not None:
-            raise ValueError("source cannot retain a sample without an attempt")
-        if source.active_revision is None and source.revision != 0:
-            raise ValueError("inactive source cannot have an uncompleted revision")
-        if source.active_revision is not None and source.revision != 1:
-            raise ValueError("initial active source must have revision one")
-        return None
-    _validate_cpu_attempt(attempt)
-    if now_mono_s < attempt.completed_mono_s:
-        raise ValueError("now_mono_s cannot precede the completed attempt")
-    if source.active_revision is None:
-        if attempt.revision != source.revision:
-            raise ValueError("completed attempt must match source revision")
-    elif (attempt.revision != source.active_revision - 1
-          or source.active_started_mono_s < attempt.completed_mono_s):
-        raise ValueError("active source cannot skip or precede an attempt")
+    attempt = validate_source_state(source, now_mono_s, source_id)
     if source.last_valid is not None:
-        sample = source.last_valid
-        _validate_rule_sample(sample, value_type)
-        if sample.revision > attempt.revision:
-            raise ValueError("retained sample cannot follow the latest attempt")
-        if now_mono_s < sample.completed_mono_s:
-            raise ValueError("now_mono_s cannot precede the retained sample")
-        if attempt.outcome is not AttemptOutcome.SUCCESS:
-            if sample.revision == attempt.revision:
-                raise ValueError("failed attempt cannot own a valid sample")
-            if sample.completed_mono_s > attempt.started_mono_s:
-                raise ValueError("retained sample cannot complete after a later attempt starts")
-            if sample.completed_at_utc > attempt.completed_at_utc:
-                raise ValueError("retained sample wall time cannot follow a later attempt")
-    if attempt.outcome is AttemptOutcome.SUCCESS:
-        _rule_success(source, attempt, value_type)
+        _validate_rule_sample(source.last_valid, value_type)
     return attempt
 
 
@@ -1398,18 +1433,9 @@ def _rule_success(
 
 
 def _validate_rule_sample(sample: Sample[T], value_type: type) -> None:
-    if not isinstance(sample, Sample):
-        raise ValueError("source last_valid must be a Sample")
+    _validate_generic_sample(sample)
     if not isinstance(sample.value, value_type):
         raise ValueError("sample value has the wrong normalized fact type")
-    if type(sample.revision) is not int or sample.revision <= 0:
-        raise ValueError("sample revision must be a positive int")
-    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
-    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
-    if sample.completed_mono_s < sample.started_mono_s:
-        raise ValueError("sample completion cannot precede its start")
-    if type(sample.completed_at_utc) is not datetime or sample.completed_at_utc.tzinfo is not timezone.utc:
-        raise ValueError("sample completion timestamp must be normalized UTC")
 
 
 def _validate_latch_now(latch: RuleLatch, now_mono_s: float) -> None:

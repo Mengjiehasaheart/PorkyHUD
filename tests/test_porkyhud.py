@@ -2233,16 +2233,25 @@ class ProcessEvidenceTests(unittest.TestCase):
         "   7  4.0 1.5 S 01:02 /usr/bin/worker --mode test\n"
     )
     AGX_FIRST = """
- +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, registered, matched, active, busy 0 (1 ms), retain 8> {
-     \"IOUserClientCreator\" = \"pid 42, Xcode\"
-     \"accumulatedGPUTime\" = 100000000
- }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, !registered, !matched, active, busy 0, retain 5>
+{
+  \"AppUsage\" = ({\"accumulatedGPUTime\"=40000000},{\"unknown\"=7,\"accumulatedGPUTime\"=60000000})
+  \"IOUserClientCreator\" = \"pid 42, Xcode\"
+}
 """
     AGX_SECOND = """
- +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, registered, matched, active, busy 0 (1 ms), retain 8> {
-     \"IOUserClientCreator\" = \"pid 42, Xcode\"
-     \"accumulatedGPUTime\" = 200000000
- }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x2, !registered, !matched, active, busy 0, retain 5>
+{
+  \"IOUserClientCreator\" = \"pid 42, Xcode\"
+  \"AppUsage\" = ({\"accumulatedGPUTime\"=125000000},{\"accumulatedGPUTime\"=75000000})
+}
+"""
+    AGX_EMPTY_USAGE = """
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x3, !registered, !matched, active, busy 0, retain 5>
+{
+  \"AppUsage\" = ()
+  \"IOUserClientCreator\" = \"pid 7, Cisco Secure Client\"
+}
 """
 
     def command_result(
@@ -2310,16 +2319,30 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.assertEqual(porkyhud.parse_elapsed_seconds("2-01:02:03"), 176523)
         self.assertIsNone(porkyhud.parse_elapsed_seconds("tomorrow"))
         self.assertEqual(
-            porkyhud.process_identity(" /Applications/My App.app/Contents/MacOS/My App --secret yes"),
+            porkyhud.process_identity('"/Applications/My App.app/Contents/MacOS/My App" --secret yes'),
+            "My App",
+        )
+        self.assertEqual(
+            porkyhud.process_identity("/Applications/My App.app/Contents/MacOS/My App --secret yes"),
+            "My App",
+        )
+        self.assertEqual(
+            porkyhud.process_identity(
+                '"/Users/me/Tools/My App.app/Contents/MacOS/My App" --secret yes'
+            ),
             "My App",
         )
         self.assertEqual(porkyhud.process_identity("/usr/bin/wo\u200brker\n--flag"), "worker")
+        self.assertEqual(
+            porkyhud.process_identity("/usr/bin/python --input /Applications/Decoy.app/file"),
+            "python",
+        )
         self.assertEqual(porkyhud.display_cell_width("e\u0301界"), 3)
         self.assertEqual(porkyhud.truncate_display_cells("a" * 32 + "界", 32), "a" * 32)
         self.assertEqual(porkyhud.truncate_display_cells("界" * 17, 32), "界" * 16)
 
     def test_process_facts_remove_raw_arguments_and_cap_only_the_display_name(self) -> None:
-        command = "/Applications/Very Long\u200b Application.app/Contents/MacOS/Main --api-key leaked"
+        command = '"/Applications/Very Long\u200b Application.app/Contents/MacOS/Main" --api-key leaked'
         facts = porkyhud.process_facts((porkyhud.ProcessRow(3, 4.0, 1.0, None, "R", "bad", command),))
         self.assertEqual(facts[0].name, "Very Long Application")
         self.assertIsNone(facts[0].elapsed_seconds)
@@ -2332,26 +2355,78 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.assertEqual(dict(parsed.counters_ns), {42: 100000000})
         with self.assertRaises(TypeError):
             parsed.counters_ns[42] = 1  # type: ignore[index]
-        valid_empty = porkyhud.parse_agx_counters("+-o IORegistryEntry <class IORegistryEntry> {\n}\n")
+        valid_empty = porkyhud.parse_agx_counters(self.AGX_EMPTY_USAGE)
         self.assertTrue(valid_empty.complete)
-        self.assertEqual(dict(valid_empty.counters_ns), {})
+        self.assertEqual(dict(valid_empty.counters_ns), {7: 0})
+        self.assertEqual(dict(valid_empty.identities), {7: "Cisco Secure Client"})
+        nested_unknown = self.AGX_EMPTY_USAGE.replace(
+            '  "AppUsage" = ()',
+            '  "Unknown" = {\n    "nested" = {}\n  }\n  "AppUsage" = ()',
+        )
+        self.assertEqual(dict(porkyhud.parse_agx_counters(nested_unknown).counters_ns), {7: 0})
         for raw in (
             "\n",
-            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 42, Xcode"\n',
+            "nonsense {\n}\n",
+            '"IOUserClientCreator" = "pid 42, Xcode"\n' + self.AGX_FIRST,
+            '"AppUsage" = ()\n' + self.AGX_FIRST,
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 42, Xcode"\n',
             '"accumulatedGPUTime" = 9\n',
-            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 0, Xcode"\n "accumulatedGPUTime" = 9\n }\n',
-            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 42, Xcode"\n "accumulatedGPUTime" = -9\n }\n',
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 0, Xcode"\n "AppUsage" = ()\n}\n',
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 42, Xcode"\n "AppUsage" = ({"accumulatedGPUTime"=-9})\n}\n',
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 42, Xcode"\n "AppUsage" = ()\n "accumulatedGPUTime" = 9\n}\n',
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 42, Xcode"\n "AppUsage" = ({"accumulatedGPUTime"=9)\n}\n',
+            '+-o AGXDeviceUserClient <class AGXDeviceUserClient>\n{\n "IOUserClientCreator" = "pid 42, Xcode"\n}\n',
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 porkyhud.parse_agx_counters(raw)
 
     def test_agx_parser_sums_matching_clients_and_rejects_identity_conflicts(self) -> None:
-        repeated = self.AGX_FIRST + self.AGX_SECOND.replace("200000000", "25")
+        repeated = self.AGX_FIRST + self.AGX_SECOND.replace("125000000", "15").replace("75000000", "10")
         parsed = porkyhud.parse_agx_counters(repeated)
         self.assertEqual(dict(parsed.counters_ns), {42: 100000025})
         conflicting = repeated.replace("Xcode", "Other", 1)
         with self.assertRaises(ValueError):
             porkyhud.parse_agx_counters(conflicting)
+
+    def test_agx_creator_identity_preserves_spaced_labels_for_process_merge(self) -> None:
+        parsed = porkyhud.parse_agx_counters(self.AGX_EMPTY_USAGE)
+        self.assertEqual(parsed.identities[7], "Cisco Secure Client")
+        row = porkyhud.ProcessRow(
+            7, 1.0, 1.0, None, "S", "00:01",
+            '"/Applications/Cisco Secure Client.app/Contents/MacOS/Cisco Secure Client"',
+        )
+        sample = porkyhud.GpuProcessSample({7: 0.0}, parsed.identities, True, True)
+        self.assertEqual(
+            porkyhud.merge_gpu_process_rows((row,), self.successful_gpu_state(sample), 10.5)[0].gpu,
+            0.0,
+        )
+
+    def test_gpu_merge_fails_closed_for_forged_source_states(self) -> None:
+        row = porkyhud.ProcessRow(9, 1.0, 1.0, None, "S", "00:01", "/bin/task")
+        sample = porkyhud.GpuProcessSample({}, {}, True, True)
+        valid = self.successful_gpu_state(sample)
+        forged = (
+            replace(valid, source_id=core.SourceId.PROCESS_TABLE),
+            replace(valid, expected_cadence_s=0.0),
+            replace(valid, stale_after_s=1.0),
+            replace(valid, revision=2),
+            replace(valid, active_revision=1, active_started_mono_s=None),
+            replace(
+                valid,
+                last_attempt=replace(
+                    valid.last_attempt,
+                    outcome=core.AttemptOutcome.TIMEOUT,
+                    failure=core.FailureCode.COMMAND_TIMEOUT,
+                ),
+            ),
+            replace(valid, last_valid=replace(valid.last_valid, revision=2)),
+            replace(valid, last_valid=replace(valid.last_valid, value="not a GPU sample")),
+            replace(valid, last_valid=replace(valid.last_valid, started_mono_s=8.0)),
+            replace(valid, last_valid=replace(valid.last_valid, completed_at_utc=datetime(2026, 8, 12, 13, tzinfo=timezone.utc))),
+        )
+        for state in forged:
+            with self.subTest(state=state):
+                self.assertIsNone(porkyhud.merge_gpu_process_rows((row,), state, 10.5)[0].gpu)
 
     def test_gpu_sample_defensively_copies_mutable_input_maps(self) -> None:
         percentages = {42: 1.0}

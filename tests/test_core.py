@@ -51,6 +51,7 @@ from porkyhud_core import (
     source_view,
     start_attempt,
     select_cpu_contributor,
+    validate_source_state,
 )
 
 
@@ -125,6 +126,54 @@ class SourceStateTests(unittest.TestCase):
     def test_source_id_must_be_an_enum_member(self):
         with self.assertRaises(ValueError):
             new_source(SourceId.SENSOR_POWERMETRICS.value, 1.0, 2.5)
+
+    def test_generic_source_validator_accepts_reducer_state_and_rejects_forgery(self):
+        state = new_source(SourceId.PROCESS_GPU, 5.0, 15.0)
+        state, revision = start_attempt(state, 10.0)
+        state = complete_success(state, revision, "sample", 10.2, UTC_NOW)
+        self.assertIs(
+            validate_source_state(state, 10.5, SourceId.PROCESS_GPU),
+            state.last_attempt,
+        )
+
+        forged = {
+            "cadence": replace(state, expected_cadence_s=0.0),
+            "stale budget": replace(state, stale_after_s=1.0),
+            "source revision": replace(state, revision=2),
+            "active attempt": replace(
+                state, revision=2, active_revision=2, active_started_mono_s=10.1
+            ),
+            "outcome/failure": replace(
+                state,
+                last_attempt=replace(
+                    state.last_attempt,
+                    outcome=AttemptOutcome.TIMEOUT,
+                    failure=None,
+                ),
+            ),
+            "sample ownership": replace(state, last_valid=None),
+            "sample revision": replace(
+                state, last_valid=replace(state.last_valid, revision=2)
+            ),
+            "sample start equality": replace(
+                state, last_valid=replace(state.last_valid, started_mono_s=8.0)
+            ),
+            "sample completion equality": replace(
+                state, last_valid=replace(state.last_valid, completed_mono_s=10.1)
+            ),
+            "sample UTC equality": replace(
+                state,
+                last_valid=replace(
+                    state.last_valid,
+                    completed_at_utc=UTC_NOW + timedelta(hours=1),
+                ),
+            ),
+        }
+        for case, invalid in forged.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                validate_source_state(invalid, 10.5, SourceId.PROCESS_GPU)
+        with self.assertRaises(ValueError):
+            validate_source_state(state, 10.1, SourceId.PROCESS_GPU)
 
     def test_source_configuration_rejects_boolean_values(self):
         for cadence, stale_after in ((True, 2.5), (1.0, True)):

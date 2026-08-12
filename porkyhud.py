@@ -21,6 +21,7 @@ import re
 import select
 import selectors
 import shutil
+import shlex
 import signal
 import socket
 import struct
@@ -49,6 +50,7 @@ from porkyhud_core import (
     ProcessFact,
     SourceId,
     SourceState,
+    validate_source_state,
 )
 
 
@@ -3330,11 +3332,82 @@ def process_identity(command: str) -> str:
     """Return a compact, comparison-safe process identity without arguments."""
 
     normalized = _normalized_process_text(command)
-    app_match = re.search(r"/([^/]+)\.app(?:/|$)", normalized)
+    if not normalized:
+        return "a process"
+    anchored_app = re.match(
+        r'^(?:["\'](/.*?\.app)(?:/[^"\']*)?["\']|'
+        r'(/(?:Applications|System/Applications)/.*?\.app)(?:/[^\s"\']*)?)'
+        r'(?:\s|$)',
+        normalized,
+    )
+    if anchored_app:
+        app_path = anchored_app.group(1) or anchored_app.group(2)
+        return os.path.basename(app_path)[:-4] or "a process"
+    try:
+        executable = shlex.split(normalized, posix=True)[0]
+    except (ValueError, IndexError):
+        executable = normalized.split(" ", 1)[0]
+    app_match = re.search(r"/([^/]+)\.app(?:/|$)", executable)
     if app_match:
         return app_match.group(1) or "a process"
-    executable = normalized.split(" ", 1)[0] if normalized else ""
     return os.path.basename(executable) or executable or "a process"
+
+
+def _agx_creator_identity(raw: str) -> str:
+    """Normalize the full creator label; it is not a shell command or path."""
+
+    return _normalized_process_text(raw)
+
+
+def _ioreg_brace_delta(raw: str) -> int:
+    """Count structural object braces while ignoring quoted property values."""
+
+    delta = 0
+    quoted = False
+    escaped = False
+    for character in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character == "{":
+            delta += 1
+        elif character == "}":
+            delta -= 1
+    if quoted or escaped:
+        raise ValueError("unterminated AGX string")
+    return delta
+
+
+def _balanced_agx_usage(raw: str) -> bool:
+    """Recognize one complete AppUsage container, including nested dictionaries."""
+
+    stack: list[str] = []
+    pairs = {")": "(", "}": "{"}
+    quoted = False
+    escaped = False
+    for character in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character in "({":
+            stack.append(character)
+        elif character in ")}":
+            if not stack or stack.pop() != pairs[character]:
+                return False
+    return not quoted and not escaped and not stack
 
 
 def parse_elapsed_seconds(raw: str) -> Optional[int]:
@@ -3429,49 +3502,75 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
     counters: dict[int, int] = {}
     identities: dict[int, str] = {}
     current: Optional[dict[str, Any]] = None
-    structure_depth = 0
-    saw_structure = False
+    outer_depth = 0
+    expecting_outer = False
+    saw_client = False
     for line in raw.splitlines():
-        opened = line.count("{")
-        closed = line.count("}")
-        if opened or closed:
-            saw_structure = True
-        structure_depth += opened - closed
-        if structure_depth < 0:
-            raise ValueError("unbalanced AGX structure")
-        is_agx = "AGXDeviceUserClient" in line
+        stripped = line.strip()
+        is_header = bool(
+            re.match(r"^\+-o\s+AGXDeviceUserClient\s+<class\s+AGXDeviceUserClient(?:,|>)", stripped)
+        )
         if current is None:
-            if "accumulatedGPUTime" in line:
-                raise ValueError("orphan AGX counter")
-            if is_agx:
-                if "{" not in line:
-                    raise ValueError("unterminated AGX object")
-                current = {"pid": None, "identity": None, "counter": None}
+            if any(
+                property_name in line
+                for property_name in (
+                    '"IOUserClientCreator"',
+                    '"AppUsage"',
+                    '"accumulatedGPUTime"',
+                )
+            ):
+                raise ValueError("orphan AGX property")
+            if expecting_outer:
+                if stripped != "{":
+                    raise ValueError("missing AGX outer object")
+                current = {"pid": None, "identity": None, "app_usage": None}
+                outer_depth = 1
+                expecting_outer = False
+            elif is_header:
+                saw_client = True
+                expecting_outer = True
             continue
-        if "AGXDeviceUserClient" in line and "{" in line:
+        if is_header:
             raise ValueError("nested AGX object")
-        if "IOUserClientCreator" in line:
+        top_level = outer_depth == 1
+        if top_level and "IOUserClientCreator" in line:
             match = re.search(r'"IOUserClientCreator"\s*=\s*"pid\s+(\d+)\s*,\s*(.*?)"\s*$', line.strip())
             if match is None or current["pid"] is not None:
                 raise ValueError("malformed AGX creator")
             pid = int(match.group(1))
-            identity = process_identity(match.group(2))
-            if pid <= 0 or identity == "a process":
+            identity = _agx_creator_identity(match.group(2))
+            if pid <= 0 or not identity:
                 raise ValueError("invalid AGX creator")
             current["pid"] = pid
             current["identity"] = identity
-        if "accumulatedGPUTime" in line:
-            match = re.search(r'"accumulatedGPUTime"\s*=\s*(-?\d+)\s*$', line.strip())
-            if match is None or current["counter"] is not None:
+        if top_level and '"AppUsage"' in line:
+            if current["app_usage"] is not None:
+                raise ValueError("duplicate AGX AppUsage")
+            match = re.fullmatch(r'"AppUsage"\s*=\s*(\(.*\))', stripped)
+            if match is None:
+                raise ValueError("malformed AGX AppUsage")
+            usage = match.group(1)
+            if not _balanced_agx_usage(usage):
+                raise ValueError("malformed AGX AppUsage structure")
+            counter_tokens = re.findall(r'"accumulatedGPUTime"\s*=\s*(-?\d+)', usage)
+            if usage != "()" and not counter_tokens:
+                raise ValueError("nonempty AGX AppUsage lacks counters")
+            residue = re.sub(r'"accumulatedGPUTime"\s*=\s*-?\d+', "", usage)
+            if "accumulatedGPUTime" in residue:
                 raise ValueError("malformed AGX counter")
-            counter = int(match.group(1))
-            if counter < 0:
+            values = [int(token) for token in counter_tokens]
+            if any(value < 0 for value in values):
                 raise ValueError("negative AGX counter")
-            current["counter"] = counter
-        if "}" in line:
+            current["app_usage"] = sum(values)
+        elif "accumulatedGPUTime" in line:
+            raise ValueError("orphan AGX counter")
+        outer_depth += _ioreg_brace_delta(line)
+        if outer_depth < 0:
+            raise ValueError("unbalanced AGX object")
+        if outer_depth == 0:
             pid = current["pid"]
             identity = current["identity"]
-            counter = current["counter"]
+            counter = current["app_usage"]
             if pid is None or identity is None or counter is None:
                 raise ValueError("incomplete AGX object")
             previous_identity = identities.get(pid)
@@ -3480,8 +3579,10 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
             identities[pid] = identity
             counters[pid] = counters.get(pid, 0) + counter
             current = None
-    if current is not None or not saw_structure or structure_depth != 0:
+    if current is not None or expecting_outer:
         raise ValueError("unterminated AGX object")
+    if not saw_client:
+        raise ValueError("output did not enumerate AGX clients")
     return GpuCounterSnapshot(counters, identities, complete=True)
 
 
@@ -3584,12 +3685,12 @@ def merge_gpu_process_rows(
     now_mono_s: float,
 ) -> tuple[ProcessRow, ...]:
     unknown = tuple(replace(row, gpu=None) for row in rows)
+    try:
+        validate_source_state(gpu_state, now_mono_s, SourceId.PROCESS_GPU)
+    except (TypeError, ValueError):
+        return unknown
     if (
-        gpu_state.source_id is not SourceId.PROCESS_GPU
-        or not isinstance(now_mono_s, (int, float))
-        or isinstance(now_mono_s, bool)
-        or not math.isfinite(now_mono_s)
-        or gpu_state.last_attempt is None
+        gpu_state.last_attempt is None
         or gpu_state.last_attempt.outcome is not AttemptOutcome.SUCCESS
         or gpu_state.last_valid is None
         or gpu_state.last_valid.revision != gpu_state.last_attempt.revision
@@ -3599,6 +3700,8 @@ def merge_gpu_process_rows(
     if age < 0 or age > 15.0:
         return unknown
     sample = gpu_state.last_valid.value
+    if not isinstance(sample, GpuProcessSample):
+        return unknown
     if not sample.complete or not sample.baseline_ready:
         return unknown
     merged: list[ProcessRow] = []
