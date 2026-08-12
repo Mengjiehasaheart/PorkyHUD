@@ -6636,8 +6636,7 @@ def draw_overview_body(
             body_w, color_pair(PAIR_PRIMARY) | curses.A_BOLD,
         )
         next_y += 1
-    screen_h, _screen_w = screen.getmaxyx()
-    if screen_h >= 24 and width >= 80 and next_y < body_y + body_h:
+    if body_y + body_h + 1 >= 24 and width >= 80 and next_y < body_y + body_h:
         _body_add(
             screen, next_y, 1,
             "CPU 60s · %s" % sparkline(history.cpu, max(8, body_w - 10), 100.0),
@@ -6658,11 +6657,10 @@ def draw_mode_body(
 
     if mode not in LAYOUTS:
         raise ValueError("unknown display mode")
-    screen_h, screen_w = screen.getmaxyx()
     if (type(body_y) is not int or type(body_h) is not int or type(width) is not int
             or body_y < 0 or body_h < 0 or width < 2
-            or body_y + body_h > screen_h or width > screen_w):
-        raise ValueError("body geometry must fit the viewport")
+            or body_y + body_h + 1 < 22 or width < 76):
+        raise ValueError("body geometry must describe a supported viewport")
     body_w = width - 2
     if body_w < 8:
         return 0
@@ -6677,7 +6675,7 @@ def draw_mode_body(
             sensor,
         )
     if mode == "cinema":
-        if width < 118 or screen_h < 34 or body_h < 7:
+        if width < 118 or body_y + body_h + 1 < 34 or body_h < 7:
             raise ValueError("Cinema requires 118×34")
         brand_lines = (
             "PORKYHUD CINEMA · SIGNAL FIRST",
@@ -7080,11 +7078,6 @@ def _hud_impl(
         controls_enabled = height >= 22 and width >= 76
         if not controls_enabled and key != 27:
             key = -1
-        resized_message = normalize_mode_for_viewport(config, height, width)
-        if resized_message:
-            scroll = 0
-            set_message(config, resized_message)
-            ui_changed = True
         if config.show_help:
             if key in (27, ord("h"), ord("H"), ord("?")):
                 config.show_help = False
@@ -7267,6 +7260,15 @@ def _hud_impl(
         force_sensor = False
         force_disk_activity = False
 
+        # Collection can overlap a terminal resize. Reacquire one geometry for
+        # mode normalization, render-state comparison, body layout, and footer.
+        height, width = screen.getmaxyx()
+        resized_message = normalize_mode_for_viewport(config, height, width)
+        if resized_message:
+            scroll = 0
+            set_message(config, resized_message)
+            ui_changed = True
+
         active_message = (
             config.message if config.message and now < config.message_until else ""
         )
@@ -7306,27 +7308,38 @@ def _hud_impl(
             phase = int(now * 16)
         else:
             phase = int(now * 3)
-        screen.erase()
-        header_h = draw_decision_header(screen, frame, config, now)
-        header_h = draw_evidence_ribbon(screen, header_h, frame, now)
-        body_rows = cpu_rows if config.layout_name == "compute" else rows
-        scroll = draw_mode_body(
-            screen, config.layout_name, header_h, height - 4, width, frame,
-            per_core, static, mem, battery, sensor, disk, activity, net_down,
-            net_up, history, body_rows, scroll, sort_mode, phase,
-        )
+        for _render_attempt in range(3):
+            height, width = screen.getmaxyx()
+            resized_message = normalize_mode_for_viewport(config, height, width)
+            if resized_message:
+                scroll = 0
+                set_message(config, resized_message)
+            screen.erase()
+            if height < 22 or width < 76:
+                draw_small_screen(screen, height, width)
+            else:
+                header_h = draw_decision_header(screen, frame, config, now)
+                header_h = draw_evidence_ribbon(screen, header_h, frame, now)
+                body_rows = cpu_rows if config.layout_name == "compute" else rows
+                scroll = draw_mode_body(
+                    screen, config.layout_name, header_h, height - 4, width, frame,
+                    per_core, static, mem, battery, sensor, disk, activity, net_down,
+                    net_up, history, body_rows, scroll, sort_mode, phase,
+                )
 
-        if config.show_help:
-            draw_help_overlay(screen, config, sensor)
+                if config.show_help:
+                    draw_help_overlay(screen, config, sensor)
 
-        status = shortcut_status(width)
-        if config.message and now < config.message_until:
-            status = semantic_text(config.message + " · q quit", unicode_ok())
-        safe_add(
-            screen, height - 1, 1,
-            truncate_display_cells(status, width - 2), color_pair(PAIR_STRUCTURE),
-        )
-        screen.refresh()
+                status = shortcut_status(width)
+                if config.message and now < config.message_until:
+                    status = semantic_text(config.message + " · q quit", unicode_ok())
+                safe_add(
+                    screen, height - 1, 1,
+                    truncate_display_cells(status, width - 2), color_pair(PAIR_STRUCTURE),
+                )
+            if screen.getmaxyx() == (height, width):
+                screen.refresh()
+                break
         time.sleep(0.03)
 
 

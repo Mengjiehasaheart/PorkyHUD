@@ -3897,6 +3897,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         frames: list[porkyhud.HealthFrame] | None = None,
         poller_snapshots: list[tuple[object, float, str]] | None = None,
         on_refresh=None,
+        screen: FakeScreen | None = None,
     ) -> tuple[FakeScreen, mock.Mock, mock.Mock, mock.Mock]:
         frame = make_health_frame_for_test()
         coordinator = mock.Mock()
@@ -3918,7 +3919,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         else:
             poller.snapshot.side_effect = poller_snapshots
         unlock = mock.Mock(return_value=True)
-        screen = FakeScreen(height, width, keys=keys)
+        screen = screen or FakeScreen(height, width, keys=keys)
         if on_refresh is not None:
             screen.on_refresh = lambda: on_refresh(screen)
         default_sensor = sensor or settled_sensor()
@@ -3954,6 +3955,111 @@ class LayoutAndRenderingTests(unittest.TestCase):
         )
         self.assertNotIn("SHORTCUTS", screen.text())
         self.assertIn("shortcut panel closed", screen.row(23))
+
+    def test_hud_rechecks_geometry_after_collection_before_drawing(self) -> None:
+        """A Cinema resize during collection must redraw Overview, not crash."""
+
+        class ResizeBeforeFirstLiveDrawScreen(FakeScreen):
+            def __init__(self) -> None:
+                super().__init__(34, 118, keys=[ord("6"), ord("q")])
+                self.geometry_reads = 0
+
+            def getmaxyx(self) -> tuple[int, int]:
+                self.geometry_reads += 1
+                if self.geometry_reads == 6:
+                    self.height, self.width = 33, 117
+                return super().getmaxyx()
+
+        resized = ResizeBeforeFirstLiveDrawScreen()
+        screen, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [], screen=resized,
+        )
+
+        self.assertIn("1 OVERVIEW", screen.row(0))
+        self.assertIn("EVIDENCE DETAIL", screen.text())
+        self.assertEqual(
+            screen.row(32).strip(),
+            "Cinema requires 118x34 | returned to Overview | q quit",
+        )
+
+    def test_hud_restarts_a_frame_when_geometry_changes_during_any_draw_stage(self) -> None:
+        """Only a frame built for one stable viewport may reach refresh."""
+
+        class GeometryCountingScreen(FakeScreen):
+            def __init__(self) -> None:
+                super().__init__(34, 118, keys=[ord("6"), ord("q")])
+                self.geometry_reads = 0
+
+            def getmaxyx(self) -> tuple[int, int]:
+                self.geometry_reads += 1
+                return super().getmaxyx()
+
+        baseline = GeometryCountingScreen()
+        self.run_hud_fixture([], screen=baseline)
+        first_loop_final_read = baseline.geometry_reads - 1
+
+        failures = []
+        for resize_read in range(6, first_loop_final_read + 1):
+            class ResizeDuringDrawScreen(FakeScreen):
+                def __init__(self) -> None:
+                    super().__init__(34, 118, keys=[ord("6"), ord("q")])
+                    self.geometry_reads = 0
+                    self.committed = []
+
+                def getmaxyx(self) -> tuple[int, int]:
+                    self.geometry_reads += 1
+                    if self.geometry_reads == resize_read:
+                        self.height, self.width = 33, 117
+                    return super().getmaxyx()
+
+                def refresh(self) -> None:
+                    super().refresh()
+                    self.committed.append(self.text())
+
+            screen = ResizeDuringDrawScreen()
+            try:
+                self.run_hud_fixture([], screen=screen)
+            except ValueError as error:
+                failures.append((resize_read, str(error)))
+                continue
+            final_frame = screen.committed[-1]
+            if ("1 OVERVIEW" not in final_frame
+                    or "Cinema requires 118x34 | returned to Overview" not in final_frame
+                    or "6 CINEMA" in final_frame):
+                failures.append((resize_read, "mixed or stale committed frame"))
+
+        self.assertEqual(failures, [])
+
+    def test_hud_does_not_commit_a_frame_while_geometry_keeps_changing(self) -> None:
+        """A resize storm may skip a frame but never refresh mixed geometry."""
+
+        class ChurningGeometryScreen(FakeScreen):
+            def __init__(self) -> None:
+                super().__init__(34, 118, keys=[ord("6"), ord("q")])
+                self.geometry_reads = 0
+                self.refresh_geometry = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                self.geometry_reads += 1
+                if 6 <= self.geometry_reads <= 180:
+                    self.height, self.width = (
+                        (33, 117) if self.geometry_reads % 2 else (34, 118)
+                    )
+                return super().getmaxyx()
+
+            def refresh(self) -> None:
+                self.refresh_geometry.append((self.height, self.width, self.text()))
+                super().refresh()
+
+        screen = ChurningGeometryScreen()
+        self.run_hud_fixture([], screen=screen)
+
+        self.assertGreaterEqual(len(screen.refresh_geometry), 2)
+        final_height, final_width, final_text = screen.refresh_geometry[-1]
+        self.assertEqual((final_height, final_width), (33, 117))
+        self.assertIn("1 OVERVIEW", final_text)
+        self.assertIn("returned to Overview", final_text)
+        self.assertNotIn("6 CINEMA", final_text)
 
     def test_hud_direct_keys_change_mode_label_and_body_at_minimum_view(self) -> None:
         expected = {
