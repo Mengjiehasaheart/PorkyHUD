@@ -1724,3 +1724,362 @@ def _storage_recovered(disk: DiskCapacity) -> bool:
 
 def _volume_identity(disk: DiskCapacity) -> Tuple[str, str]:
     return disk.volume_id, disk.mount_point
+
+
+class EvidenceRole(str, Enum):
+    CURRENT = "current"
+    TRIGGER = "trigger"
+
+
+class EvidenceState(str, Enum):
+    LIVE = "live"
+    DEGRADED = "degraded"
+    INCOMPLETE = "incomplete"
+    DELAYED = "delayed"
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    source_id: SourceId
+    revision: int
+    role: EvidenceRole
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_id, SourceId):
+            raise ValueError("evidence source_id must be a SourceId")
+        if type(self.revision) is not int or self.revision <= 0:
+            raise ValueError("evidence revision must be a positive int")
+        if not isinstance(self.role, EvidenceRole):
+            raise ValueError("evidence role must be an EvidenceRole")
+
+
+@dataclass(frozen=True)
+class HealthFacts:
+    cpu: SourceState[CpuUsage]
+    memory: SourceState[MemoryPressure]
+    thermal: SourceState[OsThermalState]
+    disk: SourceState[DiskCapacity]
+    processes: SourceState[Tuple[ProcessFact, ...]]
+
+    def __post_init__(self) -> None:
+        expected = (
+            (self.cpu, SourceId.CPU_USAGE),
+            (self.memory, SourceId.MEMORY_PRESSURE),
+            (self.thermal, SourceId.THERMAL_OS),
+            (self.disk, SourceId.DISK_CAPACITY),
+            (self.processes, SourceId.PROCESS_TABLE),
+        )
+        for source, source_id in expected:
+            if not isinstance(source, SourceState) or source.source_id is not source_id:
+                raise ValueError("HealthFacts field has the wrong SourceId")
+
+
+@dataclass(frozen=True)
+class PolicyState:
+    cpu_window: CpuWindow
+    cpu_latch: RuleLatch
+    memory_latch: RuleLatch
+    thermal_latch: RuleLatch
+    storage_latch: RuleLatch
+    process_history: ProcessHistory
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cpu_window, CpuWindow):
+            raise ValueError("cpu_window must be a CpuWindow")
+        _validate_latch_for(self.cpu_latch, (RuleId.CPU_WATCH,))
+        _validate_latch_for(
+            self.memory_latch,
+            (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL),
+        )
+        _validate_latch_for(self.thermal_latch, (RuleId.THERMAL_WATCH,))
+        _validate_latch_for(self.storage_latch, (RuleId.STORAGE_WATCH,))
+        if not isinstance(self.process_history, ProcessHistory):
+            raise ValueError("process_history must be a ProcessHistory")
+
+
+@dataclass(frozen=True)
+class HealthAssessment:
+    severity: HealthSeverity
+    evidence_state: EvidenceState
+    reason: str
+    evidence: Tuple[EvidenceRef, ...]
+    active_rules: Tuple[RuleId, ...]
+    contributor_name: Optional[str]
+    evidence_age_s: Optional[float]
+    blockers: Tuple[SourceId, ...]
+    cpu_coverage_s: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.severity, HealthSeverity):
+            raise ValueError("severity must be a HealthSeverity")
+        if not isinstance(self.evidence_state, EvidenceState):
+            raise ValueError("evidence_state must be an EvidenceState")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("reason must be a non-empty string")
+        if type(self.evidence) is not tuple or any(
+                not isinstance(ref, EvidenceRef) for ref in self.evidence):
+            raise ValueError("evidence must be a tuple of EvidenceRef values")
+        if type(self.active_rules) is not tuple or any(
+                not isinstance(rule, RuleId) for rule in self.active_rules):
+            raise ValueError("active_rules must be a tuple of RuleId values")
+        if len(set(self.active_rules)) != len(self.active_rules):
+            raise ValueError("active_rules cannot contain duplicates")
+        if self.contributor_name is not None and (
+                type(self.contributor_name) is not str or not self.contributor_name):
+            raise ValueError("contributor_name must be a non-empty string or None")
+        if self.contributor_name is not None and RuleId.CPU_WATCH not in self.active_rules:
+            raise ValueError("a contributor is only valid during CPU pressure")
+        if self.evidence_age_s is not None:
+            _require_finite_nonnegative(self.evidence_age_s, "evidence_age_s")
+        if type(self.blockers) is not tuple or any(
+                not isinstance(source_id, SourceId) for source_id in self.blockers):
+            raise ValueError("blockers must be a tuple of SourceId values")
+        if len(set(self.blockers)) != len(self.blockers):
+            raise ValueError("blockers cannot contain duplicates")
+        _require_finite_nonnegative(self.cpu_coverage_s, "cpu_coverage_s")
+
+
+def initial_policy_state() -> PolicyState:
+    """Return the immutable policy baseline with no inferred health history."""
+    return PolicyState(
+        CpuWindow(),
+        empty_latch(RuleId.CPU_WATCH),
+        empty_latch(RuleId.MEMORY_WATCH),
+        empty_latch(RuleId.THERMAL_WATCH),
+        empty_latch(RuleId.STORAGE_WATCH),
+        ProcessHistory(),
+    )
+
+
+def reset_policy_state() -> PolicyState:
+    """Discard policy history after a lifecycle discontinuity."""
+    return initial_policy_state()
+
+
+def reduce_health(
+    state: PolicyState, facts: HealthFacts, now_mono_s: float
+) -> Tuple[PolicyState, HealthAssessment]:
+    """Reduce independently collected facts into one conservative assessment."""
+    if not isinstance(state, PolicyState):
+        raise ValueError("state must be a PolicyState")
+    if not isinstance(facts, HealthFacts):
+        raise ValueError("facts must be HealthFacts")
+    _require_finite_mono(now_mono_s, "now_mono_s")
+    _validate_policy_facts(facts, now_mono_s)
+
+    cpu_window = reduce_cpu_window(state.cpu_window, facts.cpu)
+    memory_latch = reduce_memory_latch(state.memory_latch, facts.memory, now_mono_s)
+    thermal_latch = reduce_thermal_latch(state.thermal_latch, facts.thermal, now_mono_s)
+    storage_latch = reduce_storage_latch(state.storage_latch, facts.disk, now_mono_s)
+    cpu_latch = reduce_cpu_latch(state.cpu_latch, facts.cpu, cpu_window, now_mono_s)
+    process_history = reduce_process_history(state.process_history, facts.processes)
+    next_state = PolicyState(
+        cpu_window, cpu_latch, memory_latch, thermal_latch, storage_latch,
+        process_history,
+    )
+    if next_state == state:
+        next_state = state
+    return next_state, _health_assessment(next_state, facts, now_mono_s)
+
+
+def _validate_policy_facts(facts: HealthFacts, now_mono_s: float) -> None:
+    """Validate every source before policy uses any early-return path."""
+    for source, source_id, value_type in (
+        (facts.cpu, SourceId.CPU_USAGE, CpuUsage),
+        (facts.memory, SourceId.MEMORY_PRESSURE, MemoryPressure),
+        (facts.thermal, SourceId.THERMAL_OS, OsThermalState),
+        (facts.disk, SourceId.DISK_CAPACITY, DiskCapacity),
+    ):
+        attempt = _rule_attempt(source, source_id, value_type, now_mono_s)
+        if attempt is not None and source.last_valid is not None:
+            # Dataclasses can be forged with replace; re-check their public facts.
+            source.last_valid.value.__post_init__()
+    _process_attempt(facts.processes, now_mono_s)
+
+
+def _health_assessment(
+    state: PolicyState, facts: HealthFacts, now_mono_s: float
+) -> HealthAssessment:
+    coverage_s = _cpu_coverage_s(state.cpu_window)
+    cpu_complete = cpu_window_summary(state.cpu_window, 15.0) is not None
+    domains = (
+        (SourceId.CPU_USAGE, facts.cpu, cpu_complete),
+        (SourceId.MEMORY_PRESSURE, facts.memory, True),
+        (SourceId.THERMAL_OS, facts.thermal, True),
+        (SourceId.DISK_CAPACITY, facts.disk, True),
+    )
+    blockers = tuple(
+        source_id for source_id, source, policy_ready in domains
+        if not is_decision_ready(source, now_mono_s) or not policy_ready
+    )
+    latches = (
+        state.memory_latch,
+        state.thermal_latch,
+        state.storage_latch,
+        state.cpu_latch,
+    )
+    active = tuple(sorted((
+        latch for latch in latches
+        if latch.phase is not LatchPhase.CLEAR
+        and _rule_source_ready(latch.rule_id, facts, now_mono_s)
+    ), key=_rule_precedence))
+    active_rules = tuple(latch.rule_id for latch in active)
+    if active:
+        evidence_state = EvidenceState.LIVE if not blockers else EvidenceState.DEGRADED
+        reason = _latch_reason(active[0], facts)
+        evidence = _latch_evidence(active, facts)
+        severity = active[0].severity
+        contributor_name = _contributor_name(
+            state, facts, now_mono_s, RuleId.CPU_WATCH in active_rules
+        )
+    elif not blockers:
+        evidence_state = EvidenceState.LIVE
+        severity = HealthSeverity.NORMAL
+        reason = "Fresh core evidence shows no active CPU, memory, thermal, or storage pressure."
+        evidence = _normal_evidence(facts)
+        contributor_name = None
+    else:
+        if (SourceId.CPU_USAGE in blockers
+                and is_decision_ready(facts.cpu, now_mono_s)
+                and not cpu_complete):
+            evidence_state = EvidenceState.INCOMPLETE
+        else:
+            evidence_state = _blocked_evidence_state(facts, blockers)
+        severity = HealthSeverity.UNKNOWN
+        reason = _incomplete_reason(facts, blockers, cpu_complete, now_mono_s)
+        evidence = ()
+        contributor_name = None
+    return HealthAssessment(
+        severity, evidence_state, reason, evidence, active_rules, contributor_name,
+        _current_evidence_age_s(evidence, facts, now_mono_s), blockers, coverage_s,
+    )
+
+
+def _rule_source_ready(rule_id: RuleId, facts: HealthFacts, now_mono_s: float) -> bool:
+    source = _fact_source(facts, _rule_source_for(rule_id))
+    return is_decision_ready(source, now_mono_s)
+
+
+def _rule_precedence(latch: RuleLatch) -> int:
+    return (
+        RuleId.MEMORY_CRITICAL,
+        RuleId.THERMAL_WATCH,
+        RuleId.MEMORY_WATCH,
+        RuleId.STORAGE_WATCH,
+        RuleId.CPU_WATCH,
+    ).index(latch.rule_id)
+
+
+def _fact_source(facts: HealthFacts, source_id: SourceId) -> SourceState:
+    return {
+        SourceId.CPU_USAGE: facts.cpu,
+        SourceId.MEMORY_PRESSURE: facts.memory,
+        SourceId.THERMAL_OS: facts.thermal,
+        SourceId.DISK_CAPACITY: facts.disk,
+        SourceId.PROCESS_TABLE: facts.processes,
+    }[source_id]
+
+
+def _latch_reason(latch: RuleLatch, facts: HealthFacts) -> str:
+    if latch.phase is LatchPhase.RECOVERING:
+        if latch.rule_id is RuleId.MEMORY_CRITICAL:
+            memory = facts.memory.last_valid.value
+            if memory.level is MemoryPressureLevel.WARN:
+                return "macOS memory pressure has eased from critical to elevated; recovery confirmation is in progress."
+            return "macOS memory pressure is now normal; recovery confirmation is in progress."
+        if latch.rule_id is RuleId.MEMORY_WATCH:
+            return "macOS memory pressure is now normal; recovery confirmation is in progress."
+        if latch.rule_id is RuleId.THERMAL_WATCH:
+            return "macOS warnings are now clear; thermal recovery confirmation is in progress."
+        if latch.rule_id is RuleId.CPU_WATCH:
+            return "CPU use has eased; recovery confirmation is in progress."
+        return "Storage headroom has improved; recovery confirmation is in progress."
+    if latch.rule_id is RuleId.MEMORY_CRITICAL:
+        return "macOS reports critical memory pressure."
+    if latch.rule_id is RuleId.THERMAL_WATCH:
+        return "macOS reports an active thermal or performance warning."
+    if latch.rule_id is RuleId.MEMORY_WATCH:
+        return "macOS reports elevated memory pressure."
+    if latch.rule_id is RuleId.STORAGE_WATCH:
+        disk = facts.disk.last_valid.value
+        return "Storage headroom is low: %s remains on %s." % (
+            _format_bytes(disk.free_bytes), disk.volume_name)
+    return "CPU capacity has averaged at least 90% for 15 seconds."
+
+
+def _format_bytes(value: int) -> str:
+    return "%.1f GiB" % (value / float(1024 ** 3))
+
+
+def _latch_evidence(
+    latches: Tuple[RuleLatch, ...], facts: HealthFacts
+) -> Tuple[EvidenceRef, ...]:
+    refs = []
+    for latch in latches:
+        source = _fact_source(facts, _rule_source_for(latch.rule_id))
+        refs.append(EvidenceRef(source.source_id, source.last_valid.revision,
+                                EvidenceRole.CURRENT))
+        if latch.phase is LatchPhase.RECOVERING:
+            refs.append(EvidenceRef(latch.trigger.source_id, latch.trigger.revision,
+                                    EvidenceRole.TRIGGER))
+    return tuple(refs)
+
+
+def _normal_evidence(facts: HealthFacts) -> Tuple[EvidenceRef, ...]:
+    return tuple(
+        EvidenceRef(source.source_id, source.last_valid.revision, EvidenceRole.CURRENT)
+        for source in (facts.cpu, facts.memory, facts.thermal, facts.disk)
+    )
+
+
+def _current_evidence_age_s(
+    evidence: Tuple[EvidenceRef, ...], facts: HealthFacts, now_mono_s: float
+) -> Optional[float]:
+    ages = []
+    for ref in evidence:
+        if ref.role is EvidenceRole.CURRENT:
+            source = _fact_source(facts, ref.source_id)
+            ages.append(now_mono_s - source.last_valid.completed_mono_s)
+    return max(ages) if ages else None
+
+
+def _cpu_coverage_s(window: CpuWindow) -> float:
+    return math.fsum(
+        sample.value.window_completed_mono_s - sample.value.window_started_mono_s
+        for sample in window.samples
+    )
+
+
+def _blocked_evidence_state(
+    facts: HealthFacts, blockers: Tuple[SourceId, ...]
+) -> EvidenceState:
+    for source_id in blockers:
+        source = _fact_source(facts, source_id)
+        attempt = source.last_attempt
+        if (source.last_valid is None or attempt is None
+                or attempt.outcome in (AttemptOutcome.NOT_APPLICABLE,
+                                       AttemptOutcome.UNSUPPORTED)):
+            return EvidenceState.INCOMPLETE
+    return EvidenceState.DELAYED
+
+
+def _incomplete_reason(
+    facts: HealthFacts, blockers: Tuple[SourceId, ...], cpu_complete: bool,
+    now_mono_s: float,
+) -> str:
+    if (not cpu_complete and facts.cpu.last_valid is not None
+            and is_decision_ready(facts.cpu, now_mono_s)
+            and all(source_id is SourceId.CPU_USAGE for source_id in blockers)):
+        return "CPU trend requires live monitoring."
+    return "No recommendation is available from incomplete evidence."
+
+
+def _contributor_name(
+    state: PolicyState, facts: HealthFacts, now_mono_s: float, cpu_active: bool
+) -> Optional[str]:
+    if not cpu_active:
+        return None
+    contributor = select_cpu_contributor(state.process_history, facts.processes, now_mono_s)
+    if contributor.state is ContributorState.LEADING:
+        return contributor.name
+    return None

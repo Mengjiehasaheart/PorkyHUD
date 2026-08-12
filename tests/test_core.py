@@ -15,6 +15,11 @@ from porkyhud_core import (
     DiskCapacity,
     FailureCode,
     HealthSeverity,
+    HealthFacts,
+    HealthAssessment,
+    EvidenceRef,
+    EvidenceRole,
+    EvidenceState,
     LatchPhase,
     MemoryPressure,
     MemoryPressureLevel,
@@ -39,6 +44,9 @@ from porkyhud_core import (
     reduce_storage_latch,
     reduce_thermal_latch,
     empty_latch,
+    initial_policy_state,
+    reduce_health,
+    reset_policy_state,
     sample_age_s,
     source_view,
     start_attempt,
@@ -1746,6 +1754,239 @@ class RuleLatchTests(unittest.TestCase):
         source, _ = start_attempt(new_source(SourceId.MEMORY_PRESSURE, 1.0, 2.5), 1.0)
         latch = empty_latch(RuleId.MEMORY_WATCH)
         self.assertIs(reduce_memory_latch(latch, source, 1.0), latch)
+
+
+def make_ready_policy_case():
+    """A deterministic all-fresh, 15-second healthy policy case."""
+    return HealthPolicyTests().ready_facts(), 20.0
+
+
+class HealthPolicyTests(unittest.TestCase):
+    """Whole-policy precedence, provenance, and incomplete-evidence tests."""
+
+    def successful(self, source_id, value, completed=20.0, previous=None):
+        state = previous or new_source(source_id, 1.0, 2.5)
+        active, revision = start_attempt(state, completed - 0.1)
+        return complete_success(active, revision, value, completed, UTC_NOW)
+
+    def failed(self, source, completed=20.0, outcome=AttemptOutcome.TIMEOUT):
+        active, revision = start_attempt(source, completed - 0.1)
+        failure = {
+            AttemptOutcome.TIMEOUT: FailureCode.COMMAND_TIMEOUT,
+            AttemptOutcome.UNSUPPORTED: FailureCode.UNSUPPORTED_CAPABILITY,
+            AttemptOutcome.NOT_APPLICABLE: FailureCode.NOT_APPLICABLE,
+        }[outcome]
+        return complete_failure(active, revision, outcome, failure, completed, UTC_NOW)
+
+    def cpu_source(self, percent=10.0, duration=15.0, completed=20.0):
+        source = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        return self.successful(SourceId.CPU_USAGE,
+                               CpuUsage(percent, completed - duration, completed),
+                               completed, source)
+
+    def ready_facts(self, memory=1, thermal=0, cpu_percent=10.0,
+                    cpu_duration=15.0, storage_low=False, processes=()):
+        free = 1 * 1024 ** 3 if storage_low else 50 * 1024 ** 3
+        return HealthFacts(
+            self.cpu_source(cpu_percent, cpu_duration),
+            self.successful(SourceId.MEMORY_PRESSURE,
+                            MemoryPressure(MemoryPressureLevel(memory))),
+            self.successful(SourceId.THERMAL_OS,
+                            OsThermalState(thermal, 0)),
+            self.successful(SourceId.DISK_CAPACITY,
+                            DiskCapacity("disk", "Data", "/", 100 * 1024 ** 3, free)),
+            self.successful(SourceId.PROCESS_TABLE, tuple(processes)),
+        )
+
+    def test_critical_memory_owns_headline_and_keeps_other_rules(self):
+        policy, assessment = reduce_health(
+            initial_policy_state(),
+            self.ready_facts(memory=4, thermal=1, cpu_percent=95.0,
+                             cpu_duration=15.0, storage_low=True),
+            20.0,
+        )
+        self.assertIsInstance(policy, type(initial_policy_state()))
+        self.assertEqual(assessment.severity, HealthSeverity.CRITICAL)
+        self.assertEqual(assessment.reason,
+                         "macOS reports critical memory pressure.")
+        self.assertEqual(assessment.active_rules,
+                         (RuleId.MEMORY_CRITICAL, RuleId.THERMAL_WATCH,
+                          RuleId.STORAGE_WATCH, RuleId.CPU_WATCH))
+
+    def test_normal_requires_all_four_fresh_and_complete_cpu_window(self):
+        _, incomplete = reduce_health(initial_policy_state(),
+                                      self.ready_facts(cpu_duration=14.999), 20.0)
+        self.assertEqual(incomplete.severity, HealthSeverity.UNKNOWN)
+        self.assertEqual(incomplete.evidence_state, EvidenceState.INCOMPLETE)
+        self.assertEqual(incomplete.reason, "CPU trend requires live monitoring.")
+        _, normal = reduce_health(initial_policy_state(),
+                                  self.ready_facts(cpu_duration=15.0), 20.0)
+        self.assertEqual(normal.severity, HealthSeverity.NORMAL)
+        self.assertEqual(normal.evidence_state, EvidenceState.LIVE)
+        self.assertEqual(normal.reason,
+                         "Fresh core evidence shows no active CPU, memory, thermal, or storage pressure.")
+
+    def test_headline_reasons_and_precedence_are_exact(self):
+        cases = (
+            (dict(thermal=1), HealthSeverity.WATCH,
+             "macOS reports an active thermal or performance warning."),
+            (dict(memory=2), HealthSeverity.WATCH,
+             "macOS reports elevated memory pressure."),
+            (dict(storage_low=True), HealthSeverity.WATCH,
+             "Storage headroom is low: 1.0 GiB remains on Data."),
+            (dict(cpu_percent=90.0), HealthSeverity.WATCH,
+             "CPU capacity has averaged at least 90% for 15 seconds."),
+        )
+        for kwargs, severity, reason in cases:
+            with self.subTest(kwargs=kwargs):
+                _, assessment = reduce_health(initial_policy_state(), self.ready_facts(**kwargs), 20.0)
+                self.assertEqual((assessment.severity, assessment.reason), (severity, reason))
+
+    def test_active_rules_use_canonical_precedence_order(self):
+        _, assessment = reduce_health(
+            initial_policy_state(),
+            self.ready_facts(memory=2, thermal=1, storage_low=True, cpu_percent=95.0),
+            20.0,
+        )
+        self.assertEqual(assessment.active_rules, (
+            RuleId.THERMAL_WATCH, RuleId.MEMORY_WATCH,
+            RuleId.STORAGE_WATCH, RuleId.CPU_WATCH,
+        ))
+
+    def test_warning_with_missing_peer_is_degraded_but_failed_decisive_source_is_not(self):
+        facts = self.ready_facts(memory=2)
+        missing_cpu = HealthFacts(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), facts.memory,
+            facts.thermal, facts.disk, facts.processes)
+        _, warning = reduce_health(initial_policy_state(), missing_cpu, 20.0)
+        self.assertEqual((warning.severity, warning.evidence_state),
+                         (HealthSeverity.WATCH, EvidenceState.DEGRADED))
+        self.assertEqual(warning.blockers, (SourceId.CPU_USAGE,))
+        failed_memory = self.failed(facts.memory, 21.0)
+        _, unknown = reduce_health(initial_policy_state(), HealthFacts(
+            facts.cpu, failed_memory, facts.thermal, facts.disk, facts.processes), 21.0)
+        self.assertEqual((unknown.severity, unknown.evidence_state),
+                         (HealthSeverity.UNKNOWN, EvidenceState.DELAYED))
+
+    def test_incomplete_precedes_delayed_and_overlap_has_one_state(self):
+        facts = self.ready_facts()
+        variants = (
+            HealthFacts(new_source(SourceId.CPU_USAGE, 1.0, 2.5), facts.memory,
+                        facts.thermal, facts.disk, facts.processes),
+            HealthFacts(facts.cpu, self.failed(facts.memory, 21.0, AttemptOutcome.UNSUPPORTED),
+                        facts.thermal, facts.disk, facts.processes),
+            HealthFacts(facts.cpu, self.failed(facts.memory, 21.0), facts.thermal,
+                        facts.disk, facts.processes),
+            HealthFacts(facts.cpu, facts.memory, facts.thermal,
+                        self.successful(SourceId.DISK_CAPACITY, facts.disk.last_valid.value, 0.0),
+                        facts.processes),
+        )
+        expected = (EvidenceState.INCOMPLETE, EvidenceState.INCOMPLETE,
+                    EvidenceState.DELAYED, EvidenceState.DELAYED)
+        for case, evidence_state in zip(variants, expected):
+            with self.subTest(case=evidence_state):
+                _, assessment = reduce_health(initial_policy_state(), case, 21.0)
+                self.assertIn(assessment.evidence_state, tuple(EvidenceState))
+                self.assertEqual(assessment.evidence_state, evidence_state)
+
+    def test_health_facts_source_ids_and_assessment_values_are_nominal_and_structural(self):
+        facts = self.ready_facts()
+        with self.assertRaises(ValueError):
+            HealthFacts(facts.memory, facts.memory, facts.thermal, facts.disk, facts.processes)
+        with self.assertRaises(ValueError):
+            EvidenceRef(SourceId.CPU_USAGE, 0, EvidenceRole.CURRENT)
+        with self.assertRaises(ValueError):
+            EvidenceRef(SourceId.CPU_USAGE, 1, "current")
+        with self.assertRaises(ValueError):
+            HealthAssessment("normal", EvidenceState.LIVE, "x", (), (), None, None, (), 0.0)
+
+    def test_recovery_cites_current_and_historical_trigger_and_excludes_old_trigger_age(self):
+        initial = self.ready_facts(memory=2)
+        policy, _ = reduce_health(initial_policy_state(), initial, 20.0)
+        recovering_memory = self.successful(
+            SourceId.MEMORY_PRESSURE, MemoryPressure(MemoryPressureLevel.NORMAL), 21.0,
+            initial.memory)
+        facts = HealthFacts(initial.cpu, recovering_memory, initial.thermal,
+                            initial.disk, initial.processes)
+        _, assessment = reduce_health(policy, facts, 21.0)
+        self.assertEqual(assessment.reason,
+                         "macOS memory pressure is now normal; recovery confirmation is in progress.")
+        self.assertEqual(assessment.evidence[0].role, EvidenceRole.CURRENT)
+        self.assertIn(EvidenceRole.TRIGGER, tuple(ref.role for ref in assessment.evidence))
+        self.assertLessEqual(assessment.evidence_age_s, 1.0)
+
+    def test_each_recovery_reason_is_truthful_and_exact(self):
+        memory_critical = self.ready_facts(memory=4)
+        policy, _ = reduce_health(initial_policy_state(), memory_critical, 20.0)
+        memory_warn = self.successful(SourceId.MEMORY_PRESSURE,
+                                      MemoryPressure(MemoryPressureLevel.WARN), 21.0,
+                                      memory_critical.memory)
+        _, assessment = reduce_health(policy, HealthFacts(
+            memory_critical.cpu, memory_warn, memory_critical.thermal,
+            memory_critical.disk, memory_critical.processes), 21.0)
+        self.assertEqual(assessment.reason,
+                         "macOS memory pressure has eased from critical to elevated; recovery confirmation is in progress.")
+
+        thermal = self.ready_facts(thermal=1)
+        policy, _ = reduce_health(initial_policy_state(), thermal, 20.0)
+        cleared_thermal = self.successful(SourceId.THERMAL_OS, OsThermalState(0, 0),
+                                           21.0, thermal.thermal)
+        _, assessment = reduce_health(policy, HealthFacts(
+            thermal.cpu, thermal.memory, cleared_thermal, thermal.disk,
+            thermal.processes), 21.0)
+        self.assertEqual(assessment.reason,
+                         "macOS warnings are now clear; thermal recovery confirmation is in progress.")
+
+        storage = self.ready_facts(storage_low=True)
+        policy, _ = reduce_health(initial_policy_state(), storage, 20.0)
+        healed_disk = self.successful(SourceId.DISK_CAPACITY,
+                                      DiskCapacity("disk", "Data", "/", 100 * 1024 ** 3,
+                                                   50 * 1024 ** 3), 50.0, storage.disk)
+        _, assessment = reduce_health(policy, HealthFacts(
+            storage.cpu, storage.memory, storage.thermal, healed_disk,
+            storage.processes), 50.0)
+        self.assertEqual(assessment.reason,
+                         "Storage headroom has improved; recovery confirmation is in progress.")
+
+        cpu = self.ready_facts(cpu_percent=95.0)
+        policy, _ = reduce_health(initial_policy_state(), cpu, 20.0)
+        eased_cpu = self.successful(SourceId.CPU_USAGE,
+                                    CpuUsage(10.0, 20.0, 21.0), 21.0, cpu.cpu)
+        refreshed_memory = self.successful(SourceId.MEMORY_PRESSURE,
+                                           MemoryPressure(MemoryPressureLevel.NORMAL),
+                                           21.0, cpu.memory)
+        refreshed_thermal = self.successful(SourceId.THERMAL_OS, OsThermalState(0, 0),
+                                            21.0, cpu.thermal)
+        refreshed_disk = self.successful(SourceId.DISK_CAPACITY, cpu.disk.last_valid.value,
+                                         21.0, cpu.disk)
+        _, assessment = reduce_health(policy, HealthFacts(
+            eased_cpu, refreshed_memory, refreshed_thermal, refreshed_disk,
+            cpu.processes), 21.0)
+        self.assertEqual(assessment.reason,
+                         "CPU use has eased; recovery confirmation is in progress.")
+
+    def test_cpu_contributor_is_named_only_for_cpu_pressure(self):
+        rows = (ProcessFact(7, "Xcode", 30.0, 100),)
+        facts = self.ready_facts(cpu_percent=95.0, processes=rows)
+        policy, _ = reduce_health(initial_policy_state(), facts, 20.0)
+        # Build two process samples for conservative attribution.
+        process2 = self.successful(SourceId.PROCESS_TABLE,
+                                   (ProcessFact(7, "Xcode", 35.0, 101),), 20.1,
+                                   facts.processes)
+        facts = HealthFacts(facts.cpu, facts.memory, facts.thermal, facts.disk, process2)
+        _, cpu_assessment = reduce_health(policy, facts, 20.1)
+        self.assertEqual(cpu_assessment.contributor_name, "Xcode")
+        _, memory_assessment = reduce_health(initial_policy_state(),
+                                             self.ready_facts(memory=2, processes=rows), 20.0)
+        self.assertIsNone(memory_assessment.contributor_name)
+
+    def test_policy_reducers_are_identity_idempotent_and_reset_is_fresh(self):
+        facts = self.ready_facts()
+        policy, first = reduce_health(initial_policy_state(), facts, 20.0)
+        same, second = reduce_health(policy, facts, 20.0)
+        self.assertIs(same, policy)
+        self.assertEqual(second, first)
+        self.assertEqual(reset_policy_state(), initial_policy_state())
 
 
 if __name__ == "__main__":
