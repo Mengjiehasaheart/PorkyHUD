@@ -3893,14 +3893,14 @@ def disk_activity() -> DiskActivity:
     raw = run_command(["iostat", "-Id", "-c", "2", "-w", "1"], timeout=2.5)
     lines = [line for line in raw.splitlines() if line.strip()]
     if len(lines) < 4:
-        return DiskActivity()
+        return DiskActivity(source="unavailable")
     numeric_lines = [
         line
         for line in lines
         if re.match(r"^\s*[-+]?\d+(?:\.\d+)?\s+", line)
     ]
     if not numeric_lines:
-        return DiskActivity()
+        return DiskActivity(source="unavailable")
     parts = numeric_lines[-1].split()
     values: list[float] = []
     for part in parts:
@@ -6408,6 +6408,15 @@ def _snapshot_battery_fallback() -> dict[str, Any]:
     }
 
 
+def _snapshot_battery_projection(battery: Any) -> dict[str, Any]:
+    if not isinstance(battery, BatteryInfo):
+        return _snapshot_battery_fallback()
+    if (not battery.present and battery.source == "Power"
+            and battery.state == "unknown" and battery.remaining == "unknown"):
+        return _snapshot_battery_fallback()
+    return asdict(battery)
+
+
 def _snapshot_sensor_fallback() -> dict[str, Any]:
     return {
         "thermal_warning": "unavailable", "performance_warning": "unavailable",
@@ -6462,6 +6471,7 @@ def collect_snapshot() -> dict[str, Any]:
 
     futures: list[Any] = []
     pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="porkyhud-snapshot")
+    primary_error: Optional[BaseException] = None
     try:
         try:
             cpu_sampler: Optional[MacCpuSampler] = MacCpuSampler()
@@ -6555,22 +6565,23 @@ def collect_snapshot() -> dict[str, Any]:
             {"label": None, "mount": None, "total": None, "used": None, "free": None}
         )
         activity_projection = (
-            asdict(activity) if isinstance(activity, DiskActivity) else
+            asdict(activity) if isinstance(activity, DiskActivity) and activity.source != "unavailable" else
             {"bytes_per_sec": None, "iops": None, "sample_age": None, "source": "unavailable"}
         )
+        cpu_ready = frame.cpu_percent is not None
         core_values, core_labels = display_core_usage(list(per_core), static)
         return {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "read": legacy_read_projection(frame.assessment),
             "system": static,
             "cpu": {
-                "average_percent": cpu_result.value.percent if cpu_result.value is not None else None,
+                "average_percent": frame.cpu_percent,
                 "cores": ([{"label": label, "percent": percent}
                            for percent, label in zip(core_values, core_labels)]
-                          if cpu_result.value is not None else []),
+                          if cpu_ready else []),
             },
             "memory": _snapshot_memory_projection(memory),
-            "battery": asdict(battery) if isinstance(battery, BatteryInfo) else battery,
+            "battery": _snapshot_battery_projection(battery),
             "sensors": asdict(sensor) if isinstance(sensor, SensorInfo) else sensor,
             "disk": {"capacity": capacity_projection, "activity": activity_projection},
             "processes": [
@@ -6578,10 +6589,24 @@ def collect_snapshot() -> dict[str, Any]:
                 for row in rows
             ],
         }
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        cleanup_error: Optional[BaseException] = None
         for future in futures:
-            future.cancel()
-        pool.shutdown(wait=True, cancel_futures=True)
+            try:
+                future.cancel()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 def print_text_snapshot(snapshot: dict[str, Any]) -> None:

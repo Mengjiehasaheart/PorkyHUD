@@ -4307,6 +4307,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         interrupt_marker: BaseException | None = None,
         process_rows_data: tuple[object, ...] = (),
         agx_results: list[object] | None = None,
+        now_mono_s: float = 2.0,
         ram_used_percent: float = 50.0,
         compressed_bytes: float = 0.0,
         swap_used_bytes: float = 0.0,
@@ -4363,7 +4364,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
                                  total - free, free)
         with mock.patch.object(porkyhud, "MacCpuSampler", FakeCpuSampler), \
                 mock.patch.object(porkyhud.time, "sleep"), \
-                mock.patch.object(porkyhud.time, "monotonic", return_value=2.0), \
+                mock.patch.object(porkyhud.time, "monotonic", return_value=now_mono_s), \
                 mock.patch.object(porkyhud, "collect_static_info", return_value=static,
                                   side_effect=RuntimeError("private") if descriptive_failure == "collect_static_info" else None), \
                 mock.patch.object(porkyhud, "memory_stats", return_value=memory,
@@ -4441,6 +4442,15 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         with mock.patch("builtins.print") as output:
             porkyhud.print_text_snapshot(snapshot)
         self.assertIn("CPU: unavailable", "\n".join(str(call.args[0]) for call in output.call_args_list))
+
+    def test_delayed_post_agx_assessment_does_not_serialize_stale_cpu_raw_values(self) -> None:
+        """The JSON CPU projection must obey the same freshness decision as health."""
+
+        snapshot = self.collect_snapshot_with(cpu_percent=5.0, now_mono_s=4.0)
+
+        self.assertEqual(snapshot["read"]["level"], "unknown")
+        self.assertIsNone(snapshot["cpu"]["average_percent"])
+        self.assertEqual(snapshot["cpu"]["cores"], [])
 
     def test_cpu_adapter_construction_failure_is_an_unavailable_snapshot_projection(self) -> None:
         """Ordinary adapter setup faults stay contained at the one-shot boundary."""
@@ -4667,6 +4677,39 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             {thread.ident for thread in threading.enumerate()
              if thread.name.startswith("porkyhud-snapshot")}, before,
         )
+
+    def test_snapshot_preserves_primary_interrupt_when_future_cancellation_fails(self) -> None:
+        """Cleanup defects must not replace the originating interruption object."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        interrupt = KeyboardInterrupt("primary")
+
+        class FailingCancelFuture:
+            def __init__(self, future):
+                self.future = future
+
+            def result(self):
+                return self.future.result()
+
+            def cancel(self):
+                raise RuntimeError("cleanup failure")
+
+        class FailingCancelExecutor:
+            def __init__(self, **kwargs):
+                self.executor = real_executor(**kwargs)
+
+            def submit(self, function, *args):
+                return FailingCancelFuture(self.executor.submit(function, *args))
+
+            def shutdown(self, **kwargs):
+                self.executor.shutdown(**kwargs)
+
+        with mock.patch.object(porkyhud, "ThreadPoolExecutor", FailingCancelExecutor), \
+                self.assertRaises(KeyboardInterrupt) as caught:
+            self.collect_snapshot_with(
+                typed_failure="collect_memory_pressure", interrupt_marker=interrupt,
+            )
+        self.assertIs(caught.exception, interrupt)
 
     def test_process_gpu_unknown_zero_and_measurement_keep_distinct_json_and_text_values(self) -> None:
         """GPU projection distinguishes absent evidence, stable zero, and measured use."""
