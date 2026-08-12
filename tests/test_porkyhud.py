@@ -247,18 +247,21 @@ class StructuredCommandTests(unittest.TestCase):
     def descendant_fixture(self, directory: str, emit_invalid_utf8: bool) -> tuple[str, str, str]:
         pid_path = os.path.join(directory, "pids")
         heartbeat_path = os.path.join(directory, "heartbeat")
+        safety_seconds = 1.5
         descendant_code = (
             "import os, pathlib, signal, time\n"
             "os.close(1)\n"
             "os.close(2)\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "path = pathlib.Path(%r)\n"
-            "while True:\n"
+            "deadline = time.monotonic() + %r\n"
+            "while time.monotonic() < deadline:\n"
             "    path.write_text(str(time.monotonic()))\n"
             "    time.sleep(0.01)\n"
-        ) % heartbeat_path
+        ) % (heartbeat_path, safety_seconds)
         parent_code = (
-            "import os, pathlib, subprocess, sys, time\n"
+            "import os, pathlib, signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "pids = pathlib.Path(%r)\n"
             "pids.write_text(str(os.getpid()) + '\\n')\n"
             "child = subprocess.Popen([sys.executable, '-c', %r])\n"
@@ -271,7 +274,7 @@ class StructuredCommandTests(unittest.TestCase):
         if emit_invalid_utf8:
             parent_code += "sys.stdout.buffer.write(b'\\xff'); sys.stdout.flush()"
         else:
-            parent_code += "time.sleep(60)"
+            parent_code += "time.sleep(%r)" % safety_seconds
         return parent_code, pid_path, heartbeat_path
 
     def wait_for_heartbeat(self, heartbeat_path: str) -> str:
@@ -289,30 +292,10 @@ class StructuredCommandTests(unittest.TestCase):
         with open(heartbeat_path, encoding="utf-8") as heartbeat:
             self.assertEqual(heartbeat.read(), before)
 
-    def cleanup_recorded_fixture_processes(self, pid_path: str, fixture_token: str) -> None:
-        if not os.path.exists(pid_path):
-            return
+    def assert_recorded_processes_are_gone(self, pid_path: str, timeout_s: float = 1.0) -> None:
         with open(pid_path, encoding="utf-8") as pids:
             values = [int(value) for value in pids.read().splitlines() if value]
-        for pid in values:
-            try:
-                command = subprocess.check_output(
-                    ["ps", "-p", str(pid), "-o", "command="], text=True, timeout=0.2,
-                )
-            except ProcessLookupError:
-                continue
-            except subprocess.CalledProcessError:
-                continue
-            if fixture_token in command:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-    def assert_recorded_processes_are_gone(self, pid_path: str) -> None:
-        with open(pid_path, encoding="utf-8") as pids:
-            values = [int(value) for value in pids.read().splitlines() if value]
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             remaining = []
             for pid in values:
@@ -416,13 +399,10 @@ class StructuredCommandTests(unittest.TestCase):
     def test_decode_failure_terminates_a_live_descendant_after_leader_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
-            try:
-                result = self.run_fixture(code, timeout_s=1.0)
-                self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
-                self.assert_heartbeat_stopped(heartbeat_path)
-                self.assert_recorded_processes_are_gone(pid_path)
-            finally:
-                self.cleanup_recorded_fixture_processes(pid_path, directory)
+            result = self.run_fixture(code, timeout_s=1.0)
+            self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+            self.assert_heartbeat_stopped(heartbeat_path)
+            self.assert_recorded_processes_are_gone(pid_path)
 
     def test_selector_interruption_reaps_group_and_reraises_original_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -451,15 +431,12 @@ class StructuredCommandTests(unittest.TestCase):
                     self._selector.close()
 
             self_outer = self
-            try:
-                with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector):
-                    with self.assertRaises(KeyboardInterrupt) as raised:
-                        self.run_fixture(code, timeout_s=1.0)
-                self.assertIs(raised.exception, interruption)
-                self.assert_heartbeat_stopped(heartbeat_path)
-                self.assert_recorded_processes_are_gone(pid_path)
-            finally:
-                self.cleanup_recorded_fixture_processes(pid_path, directory)
+            with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    self.run_fixture(code, timeout_s=1.0)
+            self.assertIs(raised.exception, interruption)
+            self.assert_heartbeat_stopped(heartbeat_path)
+            self.assert_recorded_processes_are_gone(pid_path)
 
     def test_cleanup_fault_does_not_replace_prepared_timeout_result(self) -> None:
         class CleanupFault(Exception):
@@ -468,31 +445,28 @@ class StructuredCommandTests(unittest.TestCase):
         events: list[str] = []
         with tempfile.TemporaryDirectory() as directory:
             code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
-            try:
-                original_cleanup = porkyhud._terminate_and_reap_process_group
+            original_grace = porkyhud._command_terminate_grace_delay
 
-                def cleanup_then_fault(process: object) -> None:
-                    original_cleanup(process)
-                    events.append("terminate")
-                    raise CleanupFault()
+            def grace_then_fault() -> None:
+                original_grace()
+                events.append("grace")
+                raise CleanupFault()
 
-                original_selector_close = porkyhud._close_command_selector
+            original_selector_close = porkyhud._close_command_selector
 
-                def close_selector(selector: object) -> None:
-                    events.append("selector")
-                    original_selector_close(selector)
+            def close_selector(selector: object) -> None:
+                events.append("selector")
+                original_selector_close(selector)
 
-                with mock.patch.object(
-                    porkyhud, "_terminate_and_reap_process_group", side_effect=cleanup_then_fault,
-                ), mock.patch.object(
-                    porkyhud, "_close_command_selector", side_effect=close_selector,
-                ):
-                    result = self.run_fixture(code, timeout_s=0.1)
-                self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
-                self.assertEqual(result.failure, core.FailureCode.COMMAND_TIMEOUT)
-                self.assertEqual(events, ["terminate", "selector"])
-            finally:
-                self.cleanup_recorded_fixture_processes(pid_path, directory)
+            with mock.patch.object(
+                porkyhud, "_command_terminate_grace_delay", side_effect=grace_then_fault,
+            ), mock.patch.object(
+                porkyhud, "_close_command_selector", side_effect=close_selector,
+            ):
+                result = self.run_fixture(code, timeout_s=0.1)
+            self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+            self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
+            self.assertEqual(events, ["grace", "selector"])
 
     def test_cleanup_fault_preserves_pending_keyboard_interrupt_identity(self) -> None:
         class CleanupFault(Exception):
@@ -524,21 +498,18 @@ class StructuredCommandTests(unittest.TestCase):
                     self._selector.close()
 
             self_outer = self
-            try:
-                original_cleanup = porkyhud._terminate_and_reap_process_group
+            original_grace = porkyhud._command_terminate_grace_delay
 
-                def cleanup_then_fault(process: object) -> None:
-                    original_cleanup(process)
-                    raise CleanupFault()
+            def grace_then_fault() -> None:
+                original_grace()
+                raise CleanupFault()
 
-                with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector), mock.patch.object(
-                    porkyhud, "_terminate_and_reap_process_group", side_effect=cleanup_then_fault,
-                ):
-                    with self.assertRaises(KeyboardInterrupt) as raised:
-                        self.run_fixture(code, timeout_s=1.0)
-                self.assertIs(raised.exception, interruption)
-            finally:
-                self.cleanup_recorded_fixture_processes(pid_path, directory)
+            with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector), mock.patch.object(
+                porkyhud, "_command_terminate_grace_delay", side_effect=grace_then_fault,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    self.run_fixture(code, timeout_s=1.0)
+            self.assertIs(raised.exception, interruption)
 
     def test_ready_success_suppresses_cleanup_faults_and_attempts_every_step(self) -> None:
         class CleanupFault(Exception):
@@ -568,6 +539,151 @@ class StructuredCommandTests(unittest.TestCase):
         self.assertEqual(events.count("stream-close"), 2)
         self.assertEqual(events.count("selector-close"), 1)
 
+    def test_grace_keyboard_interrupt_still_kills_reaps_and_preserves_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
+            interruption = KeyboardInterrupt("grace interruption")
+            signals: list[int] = []
+            original_signal = porkyhud._signal_process_group
+
+            def trace_signal(process: object, sig: int) -> None:
+                signals.append(sig)
+                original_signal(process, sig)
+
+            def interrupt_grace() -> None:
+                raise interruption
+
+            with mock.patch.object(porkyhud, "_command_terminate_grace_delay", side_effect=interrupt_grace), mock.patch.object(
+                porkyhud, "_signal_process_group", side_effect=trace_signal,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    self.run_fixture(code, timeout_s=0.1)
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+            self.assert_recorded_processes_are_gone(pid_path)
+
+    def test_signal_permission_errors_make_timeout_a_private_unknown_after_reap(self) -> None:
+        calls: list[str] = []
+        original_wait = porkyhud._wait_for_process
+
+        def permission_denied(_process: object, sig: int) -> None:
+            calls.append("term" if sig == signal.SIGTERM else "kill")
+            raise PermissionError("fixture permission failure")
+
+        def trace_reap(process: object, deadline: float) -> None:
+            calls.append("reap")
+            original_wait(process, deadline)
+
+        with mock.patch.object(porkyhud, "_signal_process_group", side_effect=permission_denied), mock.patch.object(
+            porkyhud, "_wait_for_process", side_effect=trace_reap,
+        ):
+            result = self.run_fixture(
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(0.5)",
+                timeout_s=0.1,
+            )
+        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+        self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(calls, ["term", "kill", "reap"])
+        time.sleep(0.6)
+
+    def test_term_failure_followed_by_kill_is_still_private_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
+            original_signal = porkyhud._signal_process_group
+            calls: list[int] = []
+
+            def term_fails(process: object, sig: int) -> None:
+                calls.append(sig)
+                if sig == signal.SIGTERM:
+                    raise PermissionError("fixture term failure")
+                original_signal(process, sig)
+
+            with mock.patch.object(porkyhud, "_signal_process_group", side_effect=term_fails):
+                result = self.run_fixture(code, timeout_s=0.1)
+            self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+            self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
+            self.assert_recorded_processes_are_gone(pid_path)
+
+    def test_kill_failure_after_term_exit_is_private_unknown_and_reaps_leader(self) -> None:
+        original_signal = porkyhud._signal_process_group
+        calls: list[int] = []
+
+        def kill_fails_after_term(process: object, sig: int) -> None:
+            calls.append(sig)
+            if sig == signal.SIGKILL:
+                raise PermissionError("fixture kill failure")
+            original_signal(process, sig)
+
+        with mock.patch.object(porkyhud, "_signal_process_group", side_effect=kill_fails_after_term):
+            result = self.run_fixture("import time; time.sleep(0.5)", timeout_s=0.1)
+        self.assertEqual(result.outcome, core.AttemptOutcome.UNKNOWN_ERROR)
+        self.assertEqual(result.failure, core.FailureCode.UNEXPECTED_EXCEPTION)
+        self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
+        self.assertIsNotNone(result.returncode)
+
+    def test_process_lookup_signal_is_benign_after_decode_failure(self) -> None:
+        calls: list[int] = []
+        original_getpgid = porkyhud.os.getpgid
+
+        def tracked_getpgid(pid: int) -> int:
+            return original_getpgid(pid)
+
+        def absent_group(_pgid: int, sig: int) -> None:
+            calls.append(sig)
+            raise ProcessLookupError()
+
+        with mock.patch.object(porkyhud.os, "getpgid", side_effect=tracked_getpgid), mock.patch.object(
+            porkyhud.os, "killpg", side_effect=absent_group,
+        ):
+            result = self.run_fixture("import sys; sys.stdout.buffer.write(b'\\xff')")
+        self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+        self.assertTrue(calls)
+
+    def test_spawn_result_survives_ordinary_selector_close_fault_and_base_propagates(self) -> None:
+        class SelectorCloseFault(Exception):
+            pass
+
+        class FaultySelector:
+            def close(self) -> None:
+                raise SelectorCloseFault()
+
+        secret = "spawn-close-fixture-secret"
+        with mock.patch.object(porkyhud.selectors, "DefaultSelector", FaultySelector):
+            result = porkyhud.run_structured_command(
+                ["/definitely/not/a/porkyhud-command", secret], "fixture", 1.0, 128, 128,
+            )
+        self.assertEqual(result.outcome, core.AttemptOutcome.MISSING_DEPENDENCY)
+        self.assertNotIn(secret, repr(result))
+
+        for spawn_error, outcome, failure in (
+            (PermissionError(), core.AttemptOutcome.PERMISSION_DENIED, core.FailureCode.PERMISSION_DENIED),
+            (OSError(), core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+        ):
+            with self.subTest(error=type(spawn_error).__name__), mock.patch.object(
+                porkyhud.subprocess, "Popen", side_effect=spawn_error,
+            ), mock.patch.object(porkyhud.selectors, "DefaultSelector", FaultySelector):
+                result = porkyhud.run_structured_command(
+                    ["/fixture/command", secret], "fixture", 1.0, 128, 128,
+                )
+            self.assertEqual(result.outcome, outcome)
+            self.assertEqual(result.failure, failure)
+            self.assertNotIn(secret, repr(result))
+
+        interruption = KeyboardInterrupt("spawn close interruption")
+
+        class InterruptingSelector:
+            def close(self) -> None:
+                raise interruption
+
+        with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                porkyhud.run_structured_command(
+                    ["/definitely/not/a/porkyhud-command", secret], "fixture", 1.0, 128, 128,
+                )
+        self.assertIs(raised.exception, interruption)
+
     def test_decode_cleanup_signals_before_the_leader_is_reaped(self) -> None:
         original_signal = porkyhud._signal_process_group
 
@@ -592,18 +708,15 @@ class StructuredCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
-            try:
-                result, signals = traced_result(code)
-                self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
-                self.assertEqual(
-                    [signal_value for signal_value, _returncode, _pgid in signals],
-                    [signal.SIGTERM, signal.SIGKILL],
-                )
-                self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
-                self.assert_heartbeat_stopped(heartbeat_path)
-                self.assert_recorded_processes_are_gone(pid_path)
-            finally:
-                self.cleanup_recorded_fixture_processes(pid_path, directory)
+            result, signals = traced_result(code)
+            self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+            self.assertEqual(
+                [signal_value for signal_value, _returncode, _pgid in signals],
+                [signal.SIGTERM, signal.SIGKILL],
+            )
+            self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
+            self.assert_heartbeat_stopped(heartbeat_path)
+            self.assert_recorded_processes_are_gone(pid_path)
 
     def test_timeout_terminates_a_child_ignoring_sigterm(self) -> None:
         started = time.monotonic()

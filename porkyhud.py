@@ -486,17 +486,19 @@ def _close_command_selector(selector: selectors.BaseSelector) -> None:
 
 
 def _run_cleanup_actions(
-    actions: Sequence[Callable[[], None]],
+    actions: Sequence[tuple[str, Callable[[], None]]],
     suppress_ordinary_exceptions: bool,
     preserve_pending_base_exception: bool,
-) -> None:
+) -> tuple[str, ...]:
     """Attempt every cleanup step without losing a result or prior interrupt."""
 
     cleanup_failure: Optional[BaseException] = None
-    for action in actions:
+    failure_kinds: list[str] = []
+    for kind, action in actions:
         try:
             action()
         except BaseException as exc:
+            failure_kinds.append(kind)
             if preserve_pending_base_exception:
                 continue
             if isinstance(exc, Exception) and suppress_ordinary_exceptions:
@@ -505,6 +507,7 @@ def _run_cleanup_actions(
                 cleanup_failure = exc
     if cleanup_failure is not None:
         raise cleanup_failure
+    return tuple(failure_kinds)
 
 
 def _cleanup_structured_command(
@@ -514,16 +517,25 @@ def _cleanup_structured_command(
     terminate_process_group: bool,
     suppress_ordinary_exceptions: bool,
     preserve_pending_base_exception: bool,
-) -> None:
-    actions: list[Callable[[], None]] = []
+) -> tuple[str, ...]:
+    actions: list[tuple[str, Callable[[], None]]] = []
     if terminate_process_group:
-        actions.append(lambda: _terminate_and_reap_process_group(process))
+        actions.extend(
+            (
+                ("term", lambda: _signal_process_group(process, signal.SIGTERM)),
+                ("grace", _command_terminate_grace_delay),
+                ("kill", lambda: _signal_process_group(process, signal.SIGKILL)),
+                ("reap", lambda: _wait_for_process(
+                    process, time.monotonic() + COMMAND_KILL_REAP_SECONDS,
+                )),
+            )
+        )
     for stream in streams:
         if stream is not None:
-            actions.append(lambda stream=stream: _unregister_command_stream(selector, stream))
-            actions.append(lambda stream=stream: _close_command_stream(stream))
-    actions.append(lambda: _close_command_selector(selector))
-    _run_cleanup_actions(
+            actions.append(("unregister", lambda stream=stream: _unregister_command_stream(selector, stream)))
+            actions.append(("stream_close", lambda stream=stream: _close_command_stream(stream)))
+    actions.append(("selector_close", lambda: _close_command_selector(selector)))
+    return _run_cleanup_actions(
         actions,
         suppress_ordinary_exceptions=suppress_ordinary_exceptions,
         preserve_pending_base_exception=preserve_pending_base_exception,
@@ -533,8 +545,18 @@ def _cleanup_structured_command(
 def _signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
     try:
         os.killpg(process.pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
+    except ProcessLookupError:
         pass
+    except PermissionError:
+        # On macOS, a reaped-from-the-group-but-unreaped-by-us leader can make
+        # a second killpg report EPERM after a successful SIGTERM. Its numeric
+        # PID remains reserved, so use getpgid only to prove that no group is
+        # left; a live group still reports the original permission failure.
+        try:
+            os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+        raise
 
 
 def _wait_for_process(process: subprocess.Popen[bytes], deadline: float) -> None:
@@ -548,15 +570,18 @@ def _wait_for_process(process: subprocess.Popen[bytes], deadline: float) -> None
             continue
 
 
-def _terminate_and_reap_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Stop the dedicated session, including descendants that inherited its pipes."""
+def _command_terminate_grace_delay() -> None:
+    """Keep the leader unreaped so its group ID cannot be reused before SIGKILL."""
 
-    _signal_process_group(process, signal.SIGTERM)
-    # Do not poll or wait here: retaining the zombie leader prevents its numeric
-    # process-group ID from being reused before the SIGKILL escalation.
     time.sleep(COMMAND_TERMINATE_GRACE_SECONDS)
-    _signal_process_group(process, signal.SIGKILL)
-    _wait_for_process(process, time.monotonic() + COMMAND_KILL_REAP_SECONDS)
+
+
+def _cleanup_spawn_selector(selector: selectors.BaseSelector) -> None:
+    _run_cleanup_actions(
+        (("selector_close", lambda: _close_command_selector(selector)),),
+        suppress_ordinary_exceptions=True,
+        preserve_pending_base_exception=False,
+    )
 
 
 def run_structured_command(
@@ -595,19 +620,19 @@ def run_structured_command(
             env={**os.environ, "LC_ALL": "C"},
         )
     except FileNotFoundError:
-        selector.close()
+        _cleanup_spawn_selector(selector)
         return _command_result(
             category, "", "", None, started_mono_s,
             AttemptOutcome.MISSING_DEPENDENCY, FailureCode.MISSING_EXECUTABLE,
         )
     except PermissionError:
-        selector.close()
+        _cleanup_spawn_selector(selector)
         return _command_result(
             category, "", "", None, started_mono_s,
             AttemptOutcome.PERMISSION_DENIED, FailureCode.PERMISSION_DENIED,
         )
     except OSError:
-        selector.close()
+        _cleanup_spawn_selector(selector)
         return _command_result(
             category, "", "", None, started_mono_s,
             AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
@@ -689,7 +714,7 @@ def run_structured_command(
         pending_base_exception = exc
         raise
     finally:
-        _cleanup_structured_command(
+        cleanup_failure_kinds = _cleanup_structured_command(
             process,
             selector,
             streams,
@@ -702,6 +727,14 @@ def run_structured_command(
 
     assert result_payload is not None
     stdout, stderr, result_outcome, result_failure = result_payload
+    if terminate_process_group and (
+        any(kind in {"term", "grace", "kill", "reap"} for kind in cleanup_failure_kinds)
+        or process.returncode is None
+    ):
+        stdout = ""
+        stderr = ""
+        result_outcome = AttemptOutcome.UNKNOWN_ERROR
+        result_failure = FailureCode.UNEXPECTED_EXCEPTION
     return _command_result(
         category, stdout, stderr, process.returncode, started_mono_s,
         result_outcome, result_failure,
