@@ -897,13 +897,13 @@ def _validate_cpu_attempt(attempt: CollectionAttempt) -> None:
     _require_finite_mono(attempt.completed_mono_s, "attempt.completed_mono_s")
     if attempt.completed_mono_s < attempt.started_mono_s:
         raise ValueError("CPU attempt completion cannot precede its start")
-    if (
-        attempt.completed_at_utc.tzinfo is None
-        or attempt.completed_at_utc.utcoffset() is None
-    ):
-        raise ValueError("CPU attempt completion timestamp must be timezone-aware")
-    if not isinstance(attempt.outcome, AttemptOutcome):
+    if (type(attempt.completed_at_utc) is not datetime
+            or attempt.completed_at_utc.tzinfo is not timezone.utc):
+        raise ValueError("CPU attempt completion timestamp must be normalized UTC")
+    if type(attempt.outcome) is not AttemptOutcome:
         raise ValueError("CPU attempt outcome must be an AttemptOutcome")
+    if attempt.failure is not None and type(attempt.failure) is not FailureCode:
+        raise ValueError("CPU attempt failure must be a FailureCode or None")
     if attempt.outcome is AttemptOutcome.SUCCESS:
         if attempt.failure is not None:
             raise ValueError("successful CPU attempt cannot have a failure code")
@@ -922,8 +922,8 @@ def _validate_cpu_sample(sample: Sample[CpuUsage]) -> None:
     _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
     if sample.completed_mono_s < sample.started_mono_s:
         raise ValueError("CPU sample completion cannot precede its start")
-    if sample.completed_at_utc.tzinfo is None or sample.completed_at_utc.utcoffset() is None:
-        raise ValueError("CPU sample completion timestamp must be timezone-aware")
+    if type(sample.completed_at_utc) is not datetime or sample.completed_at_utc.tzinfo is not timezone.utc:
+        raise ValueError("CPU sample completion timestamp must be normalized UTC")
 
 
 def _require_finite_positive(value: float, name: str) -> None:
@@ -1267,6 +1267,12 @@ def reduce_cpu_latch(
     recovery = cpu_window_summary(window, 10.0)
     if recovery is not None and recovery.mean_percent <= 70.0:
         return _clear_latch(latch.rule_id, attempt.revision)
+    if sample.value.percent >= 90.0:
+        # A reset or failed read may leave only a short high-CPU sample.  It
+        # cannot establish a new sustained entry, but it also is not evidence
+        # that use has eased.  Keep the existing watch without recovery copy.
+        return RuleLatch(latch.rule_id, latch.severity, LatchPhase.ACTIVE,
+                         latch.trigger, 0, None, attempt.revision, None)
     return RuleLatch(latch.rule_id, latch.severity, LatchPhase.RECOVERING,
                      latch.trigger, 0, None, attempt.revision, None)
 
@@ -1344,6 +1350,8 @@ def _rule_attempt(
             raise ValueError("source cannot retain a sample without an attempt")
         if source.active_revision is None and source.revision != 0:
             raise ValueError("inactive source cannot have an uncompleted revision")
+        if source.active_revision is not None and source.revision != 1:
+            raise ValueError("initial active source must have revision one")
         return None
     _validate_cpu_attempt(attempt)
     if now_mono_s < attempt.completed_mono_s:
@@ -1400,8 +1408,8 @@ def _validate_rule_sample(sample: Sample[T], value_type: type) -> None:
     _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
     if sample.completed_mono_s < sample.started_mono_s:
         raise ValueError("sample completion cannot precede its start")
-    if sample.completed_at_utc.tzinfo is None or sample.completed_at_utc.utcoffset() is None:
-        raise ValueError("sample completion timestamp must be timezone-aware")
+    if type(sample.completed_at_utc) is not datetime or sample.completed_at_utc.tzinfo is not timezone.utc:
+        raise ValueError("sample completion timestamp must be normalized UTC")
 
 
 def _validate_latch_now(latch: RuleLatch, now_mono_s: float) -> None:
@@ -1866,6 +1874,7 @@ def reduce_health(
         raise ValueError("facts must be HealthFacts")
     _require_finite_mono(now_mono_s, "now_mono_s")
     _validate_policy_facts(facts, now_mono_s)
+    _validate_policy_state_consistency(state, facts, now_mono_s)
 
     cpu_window = reduce_cpu_window(state.cpu_window, facts.cpu)
     memory_latch = reduce_memory_latch(state.memory_latch, facts.memory, now_mono_s)
@@ -1895,6 +1904,130 @@ def _validate_policy_facts(facts: HealthFacts, now_mono_s: float) -> None:
             # Dataclasses can be forged with replace; re-check their public facts.
             source.last_valid.value.__post_init__()
     _process_attempt(facts.processes, now_mono_s)
+
+
+def _validate_policy_state_consistency(
+    state: PolicyState, facts: HealthFacts, now_mono_s: float
+) -> None:
+    """Reject forged state that contradicts source evidence it consumed.
+
+    A caller may retain policy state while an active source refresh advances,
+    but a component which says it already processed a revision must agree with
+    that revision's successful evidence.  This closes same-revision
+    replacement attacks without rejecting legitimate newer source revisions.
+    """
+    _validate_cpu_state_consistency(state, facts.cpu, now_mono_s)
+    _validate_latch_state_consistency(state.memory_latch, facts.memory,
+                                      MemoryPressure, now_mono_s)
+    _validate_latch_state_consistency(state.thermal_latch, facts.thermal,
+                                      OsThermalState, now_mono_s)
+    _validate_latch_state_consistency(state.storage_latch, facts.disk,
+                                      DiskCapacity, now_mono_s)
+    _validate_process_state_consistency(state.process_history, facts.processes,
+                                        now_mono_s)
+
+
+def _validate_cpu_state_consistency(
+    state: PolicyState, source: SourceState[CpuUsage], now_mono_s: float
+) -> None:
+    attempt = _rule_attempt(source, SourceId.CPU_USAGE, CpuUsage, now_mono_s)
+    consumed_revision = state.cpu_window.last_attempt_revision
+    if attempt is None:
+        if consumed_revision or state.cpu_latch.last_processed_revision:
+            raise ValueError("CPU policy state cannot precede an absent attempt")
+        return
+    if consumed_revision > attempt.revision:
+        raise ValueError("CPU window revision cannot exceed source evidence")
+    if state.cpu_latch.last_processed_revision > attempt.revision:
+        raise ValueError("CPU latch revision cannot exceed source evidence")
+    if consumed_revision != attempt.revision:
+        return
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        if state.cpu_window.samples:
+            raise ValueError("failed CPU attempt cannot retain a policy window")
+        return
+    sample = _rule_success(source, attempt, CpuUsage)
+    if not state.cpu_window.samples or state.cpu_window.samples[-1] != sample:
+        raise ValueError("CPU window must retain the matching latest sample")
+    _validate_current_latch_value(state.cpu_latch, sample.value, state.cpu_window)
+
+
+def _validate_latch_state_consistency(
+    latch: RuleLatch, source: SourceState[T], value_type: type,
+    now_mono_s: float,
+) -> None:
+    attempt = _rule_attempt(source, _rule_source_for(latch.rule_id), value_type,
+                            now_mono_s)
+    if attempt is None:
+        if latch.last_processed_revision:
+            raise ValueError("latch revision cannot precede an absent attempt")
+        return
+    if latch.last_processed_revision > attempt.revision:
+        raise ValueError("latch revision cannot exceed source evidence")
+    if latch.last_processed_revision != attempt.revision:
+        return
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        if latch.phase is LatchPhase.RECOVERING:
+            raise ValueError("failed source cannot leave a recovery latch current")
+        return
+    _validate_current_latch_value(latch, _rule_success(source, attempt, value_type).value,
+                                  None)
+
+
+def _validate_current_latch_value(
+    latch: RuleLatch, value: object, window: Optional[CpuWindow]
+) -> None:
+    """Check only conclusions that the current successful value excludes."""
+    if latch.phase is LatchPhase.CLEAR:
+        return
+    if latch.rule_id is RuleId.MEMORY_CRITICAL:
+        if latch.phase is LatchPhase.ACTIVE and value.level is not MemoryPressureLevel.CRITICAL:
+            raise ValueError("critical memory latch contradicts current evidence")
+        if latch.phase is LatchPhase.RECOVERING and value.level is MemoryPressureLevel.CRITICAL:
+            raise ValueError("critical memory recovery contradicts current evidence")
+    elif latch.rule_id is RuleId.MEMORY_WATCH:
+        if latch.phase is LatchPhase.ACTIVE and value.level is not MemoryPressureLevel.WARN:
+            raise ValueError("memory watch latch contradicts current evidence")
+        if latch.phase is LatchPhase.RECOVERING and value.level is not MemoryPressureLevel.NORMAL:
+            raise ValueError("memory recovery contradicts current evidence")
+    elif latch.rule_id is RuleId.THERMAL_WATCH:
+        active = value.thermal_warning_level > 0 or value.performance_warning_level > 0
+        if latch.phase is LatchPhase.ACTIVE and not active:
+            raise ValueError("thermal watch latch contradicts current evidence")
+        if latch.phase is LatchPhase.RECOVERING and active:
+            raise ValueError("thermal recovery contradicts current evidence")
+    elif latch.rule_id is RuleId.STORAGE_WATCH:
+        if latch.phase is LatchPhase.ACTIVE and _storage_recovered(value):
+            raise ValueError("storage watch latch contradicts current evidence")
+        if latch.phase is LatchPhase.RECOVERING and not _storage_recovered(value):
+            raise ValueError("storage recovery contradicts current evidence")
+    elif latch.rule_id is RuleId.CPU_WATCH and window is not None:
+        summary = cpu_window_summary(window, 15.0)
+        if latch.phase is LatchPhase.ACTIVE and summary is not None and summary.mean_percent < 90.0:
+            raise ValueError("CPU watch latch contradicts current window")
+        if latch.phase is LatchPhase.RECOVERING and value.percent >= 90.0:
+            raise ValueError("CPU recovery contradicts current high usage")
+
+
+def _validate_process_state_consistency(
+    history: ProcessHistory, source: SourceState[Tuple[ProcessFact, ...]],
+    now_mono_s: float,
+) -> None:
+    attempt = _process_attempt(source, now_mono_s)
+    if attempt is None:
+        if history.last_attempt_revision:
+            raise ValueError("process history cannot precede an absent attempt")
+        return
+    if history.last_attempt_revision > attempt.revision:
+        raise ValueError("process history revision cannot exceed source evidence")
+    if history.last_attempt_revision == attempt.revision:
+        if attempt.outcome is not AttemptOutcome.SUCCESS:
+            if history.current_revision:
+                raise ValueError("failed process attempt cannot retain current history")
+        else:
+            sample = _validated_process_success(source, attempt)
+            if history.current_revision != attempt.revision or history.current != sample.value:
+                raise ValueError("process history must match consumed source evidence")
 
 
 def _health_assessment(

@@ -1756,7 +1756,7 @@ class RuleLatchTests(unittest.TestCase):
         self.assertIs(reduce_memory_latch(latch, source, 1.0), latch)
 
 
-def make_ready_policy_case():
+def make_ready_policy_case() -> Tuple[HealthFacts, float]:
     """A deterministic all-fresh, 15-second healthy policy case."""
     return HealthPolicyTests().ready_facts(), 20.0
 
@@ -1889,6 +1889,63 @@ class HealthPolicyTests(unittest.TestCase):
                 self.assertIn(assessment.evidence_state, tuple(EvidenceState))
                 self.assertEqual(assessment.evidence_state, evidence_state)
 
+    def test_evidence_overlap_table_is_complete_and_disjoint(self):
+        """Enumerate outcome × prior sample × freshness × decisive warning."""
+        facts = self.ready_facts()
+        outcomes = tuple(AttemptOutcome)
+        for outcome in outcomes:
+            for had_prior in (False, True):
+                for fresh in (False, True):
+                    for decisive_warning in (False, True):
+                        with self.subTest(outcome=outcome, had_prior=had_prior,
+                                          fresh=fresh, decisive_warning=decisive_warning):
+                            completed = 20.0 if fresh else 0.0
+                            memory = new_source(SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+                            if had_prior and outcome is not AttemptOutcome.SUCCESS:
+                                memory = self.successful(
+                                    SourceId.MEMORY_PRESSURE,
+                                    MemoryPressure(MemoryPressureLevel.WARN
+                                                   if decisive_warning else MemoryPressureLevel.NORMAL),
+                                    0.0,
+                                    memory,
+                                )
+                            if outcome is AttemptOutcome.SUCCESS:
+                                memory = self.successful(
+                                    SourceId.MEMORY_PRESSURE,
+                                    MemoryPressure(MemoryPressureLevel.WARN
+                                                   if decisive_warning else MemoryPressureLevel.NORMAL),
+                                    completed,
+                                    memory,
+                                )
+                            else:
+                                failure_completed = 20.0 if fresh else 1.0
+                                active, revision = start_attempt(
+                                    memory, failure_completed - 0.1)
+                                memory = complete_failure(
+                                    active, revision, outcome,
+                                    next(iter(LEGAL_FAILURES[outcome])), failure_completed,
+                                    UTC_NOW,
+                                )
+                            _, assessment = reduce_health(initial_policy_state(), HealthFacts(
+                                facts.cpu, memory, facts.thermal, facts.disk,
+                                facts.processes), 20.0)
+                            if outcome is AttemptOutcome.SUCCESS and fresh and decisive_warning:
+                                expected_severity = HealthSeverity.WATCH
+                                expected_state = EvidenceState.LIVE
+                            elif outcome is AttemptOutcome.SUCCESS and fresh:
+                                expected_severity = HealthSeverity.NORMAL
+                                expected_state = EvidenceState.LIVE
+                            else:
+                                expected_severity = HealthSeverity.UNKNOWN
+                                if (outcome in (AttemptOutcome.NOT_APPLICABLE,
+                                                AttemptOutcome.UNSUPPORTED)
+                                        or (not had_prior and outcome is not AttemptOutcome.SUCCESS)):
+                                    expected_state = EvidenceState.INCOMPLETE
+                                else:
+                                    expected_state = EvidenceState.DELAYED
+                            self.assertEqual((assessment.severity, assessment.evidence_state),
+                                             (expected_severity, expected_state))
+
     def test_health_facts_source_ids_and_assessment_values_are_nominal_and_structural(self):
         facts = self.ready_facts()
         with self.assertRaises(ValueError):
@@ -1987,6 +2044,134 @@ class HealthPolicyTests(unittest.TestCase):
         self.assertIs(same, policy)
         self.assertEqual(second, first)
         self.assertEqual(reset_policy_state(), initial_policy_state())
+
+    def test_cpu_failure_or_gap_cannot_turn_fresh_high_cpu_into_eased_recovery(self):
+        facts = self.ready_facts(cpu_percent=95.0)
+        policy, assessment = reduce_health(initial_policy_state(), facts, 20.0)
+        self.assertEqual(assessment.reason,
+                         "CPU capacity has averaged at least 90% for 15 seconds.")
+        failed_cpu = self.failed(facts.cpu, 21.0)
+        policy, failed = reduce_health(policy, HealthFacts(
+            failed_cpu, facts.memory, facts.thermal, facts.disk, facts.processes), 21.0)
+        self.assertEqual(failed.severity, HealthSeverity.UNKNOWN)
+        retry_high = self.successful(SourceId.CPU_USAGE,
+                                     CpuUsage(95.0, 21.0, 22.0), 22.0, failed_cpu)
+        policy, result = reduce_health(policy, HealthFacts(
+            retry_high, facts.memory, facts.thermal, facts.disk, facts.processes), 22.0)
+        self.assertEqual((result.severity, result.reason, result.evidence_state), (
+            HealthSeverity.WATCH,
+            "CPU capacity has averaged at least 90% for 15 seconds.",
+            EvidenceState.DEGRADED,
+        ))
+        self.assertEqual(result.evidence[0],
+                         EvidenceRef(SourceId.CPU_USAGE, retry_high.last_valid.revision,
+                                     EvidenceRole.CURRENT))
+        self.assertEqual(result.cpu_coverage_s, 1.0)
+
+        gap_policy, _ = reduce_health(initial_policy_state(), facts, 20.0)
+        gapped_high = self.successful(SourceId.CPU_USAGE,
+                                      CpuUsage(95.0, 23.0, 24.0), 24.0, facts.cpu)
+        refreshed_memory = self.successful(SourceId.MEMORY_PRESSURE,
+                                           MemoryPressure(MemoryPressureLevel.NORMAL),
+                                           24.0, facts.memory)
+        refreshed_thermal = self.successful(SourceId.THERMAL_OS, OsThermalState(0, 0),
+                                            24.0, facts.thermal)
+        refreshed_disk = self.successful(SourceId.DISK_CAPACITY, facts.disk.last_valid.value,
+                                         24.0, facts.disk)
+        _, gap_result = reduce_health(gap_policy, HealthFacts(
+            gapped_high, refreshed_memory, refreshed_thermal, refreshed_disk,
+            facts.processes), 24.0)
+        self.assertEqual(gap_result.reason,
+                         "CPU capacity has averaged at least 90% for 15 seconds.")
+
+    def test_short_low_cpu_after_failure_never_claims_eased_before_exact_recovery_window(self):
+        facts = self.ready_facts(cpu_percent=95.0)
+        policy, _ = reduce_health(initial_policy_state(), facts, 20.0)
+        failed_cpu = self.failed(facts.cpu, 21.0)
+        policy, _ = reduce_health(policy, HealthFacts(
+            failed_cpu, facts.memory, facts.thermal, facts.disk, facts.processes), 21.0)
+        low = failed_cpu
+        for end in range(22, 32):
+            low = self.successful(SourceId.CPU_USAGE,
+                                  CpuUsage(10.0, end - 1.0, float(end)), float(end), low)
+            memory = self.successful(SourceId.MEMORY_PRESSURE,
+                                     MemoryPressure(MemoryPressureLevel.NORMAL), float(end), facts.memory)
+            thermal = self.successful(SourceId.THERMAL_OS, OsThermalState(0, 0),
+                                      float(end), facts.thermal)
+            disk = self.successful(SourceId.DISK_CAPACITY, facts.disk.last_valid.value,
+                                   float(end), facts.disk)
+            policy, assessment = reduce_health(policy, HealthFacts(
+                low, memory, thermal, disk, facts.processes), float(end))
+            if end < 31:
+                self.assertEqual(assessment.reason,
+                                 "CPU use has eased; recovery confirmation is in progress.")
+            else:
+                self.assertEqual((assessment.severity, assessment.reason), (
+                    HealthSeverity.UNKNOWN,
+                    "CPU trend requires live monitoring.",
+                ))
+
+    def test_policy_rejects_corrupt_initial_active_and_non_utc_health_sources(self):
+        facts = self.ready_facts()
+        active, _ = start_attempt(new_source(SourceId.MEMORY_PRESSURE, 1.0, 2.5), 20.0)
+        accepted = HealthFacts(facts.cpu, active, facts.thermal, facts.disk, facts.processes)
+        self.assertEqual(reduce_health(initial_policy_state(), accepted, 20.0)[1].severity,
+                         HealthSeverity.UNKNOWN)
+        corrupt_active = replace(active, revision=2, active_revision=2)
+        with self.assertRaises(ValueError):
+            reduce_health(initial_policy_state(), HealthFacts(
+                facts.cpu, corrupt_active, facts.thermal, facts.disk, facts.processes), 20.0)
+        fixed_offset = UTC_NOW.astimezone(timezone(timedelta(hours=1)))
+        for field in ("cpu", "memory", "thermal", "disk", "processes"):
+            source = getattr(facts, field)
+            corrupt = replace(source,
+                              last_attempt=replace(source.last_attempt,
+                                                   completed_at_utc=fixed_offset),
+                              last_valid=replace(source.last_valid,
+                                                 completed_at_utc=fixed_offset))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                reduce_health(initial_policy_state(), replace(facts, **{field: corrupt}), 20.0)
+
+    def test_policy_rejects_corrupt_source_combinations_for_every_core_domain(self):
+        facts = self.ready_facts()
+        for field in ("cpu", "memory", "thermal", "disk"):
+            source = getattr(facts, field)
+            corrupt = replace(source, revision=source.revision + 1)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                reduce_health(initial_policy_state(), replace(facts, **{field: corrupt}), 20.0)
+
+    def test_duplicate_policy_state_must_match_same_revision_source_evidence(self):
+        healthy = self.ready_facts()
+        high_cpu = self.ready_facts(cpu_percent=95.0)
+        cpu_policy, _ = reduce_health(initial_policy_state(), high_cpu, 20.0)
+        with self.assertRaises(ValueError):
+            reduce_health(cpu_policy, healthy, 20.0)
+
+        watch_memory = self.ready_facts(memory=2)
+        memory_policy, _ = reduce_health(initial_policy_state(), watch_memory, 20.0)
+        with self.assertRaises(ValueError):
+            reduce_health(memory_policy, healthy, 20.0)
+
+        watch_thermal = self.ready_facts(thermal=1)
+        thermal_policy, _ = reduce_health(initial_policy_state(), watch_thermal, 20.0)
+        with self.assertRaises(ValueError):
+            reduce_health(thermal_policy, healthy, 20.0)
+
+        watch_storage = self.ready_facts(storage_low=True)
+        storage_policy, _ = reduce_health(initial_policy_state(), watch_storage, 20.0)
+        with self.assertRaises(ValueError):
+            reduce_health(storage_policy, healthy, 20.0)
+
+    def test_duplicate_policy_process_history_must_match_current_process_source(self):
+        facts = self.ready_facts()
+        forged_history = ProcessHistory(
+            current=(ProcessFact(77, "forged", 50.0, 2),),
+            current_revision=1,
+            last_attempt_revision=1,
+        )
+        forged_state = replace(initial_policy_state(), process_history=forged_history)
+        with self.assertRaises(ValueError):
+            reduce_health(forged_state, facts, 20.0)
 
 
 if __name__ == "__main__":
