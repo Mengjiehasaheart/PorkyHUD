@@ -10,6 +10,7 @@ from typing import Generic, Optional, Tuple, TypeVar
 
 
 T = TypeVar("T")
+_CPU_TIME_ABS_TOLERANCE_S = 1e-9
 
 
 class SourceId(str, Enum):
@@ -210,15 +211,26 @@ class CpuWindow:
             if previous is not None:
                 previous_usage = previous.value
                 usage = sample.value
-                if sample.revision <= previous.revision:
-                    raise ValueError("CPU window sample revisions must increase")
+                if sample.revision != previous.revision + 1:
+                    raise ValueError("CPU window sample revisions must be consecutive")
                 if usage.window_started_mono_s < previous_usage.window_completed_mono_s:
                     raise ValueError("CPU window samples cannot overlap")
+                if (
+                    usage.window_started_mono_s
+                    - previous_usage.window_completed_mono_s
+                    > 2.5
+                ):
+                    raise ValueError("CPU window sample gap cannot exceed 2.5 seconds")
                 if usage.window_completed_mono_s <= previous_usage.window_completed_mono_s:
                     raise ValueError("CPU window sample times must increase")
             previous = sample
-        if self.samples and self.last_attempt_revision < self.samples[-1].revision:
-            raise ValueError("last_attempt_revision cannot precede retained samples")
+        if (
+            self.samples
+            and self.last_attempt_revision != self.samples[-1].revision
+        ):
+            raise ValueError(
+                "last_attempt_revision must match the newest retained sample"
+            )
 
 
 @dataclass(frozen=True)
@@ -235,6 +247,16 @@ class CpuWindowSummary:
         _require_finite_mono(self.completed_mono_s, "completed_mono_s")
         if self.completed_mono_s <= self.started_mono_s:
             raise ValueError("summary window must have positive duration")
+        wall_span_s = self.completed_mono_s - self.started_mono_s
+        if wall_span_s < self.duration_s and not math.isclose(
+            wall_span_s,
+            self.duration_s,
+            rel_tol=0.0,
+            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
+        ):
+            raise ValueError(
+                "summary wall span cannot be shorter than represented duration"
+            )
 
 
 _LEGAL_FAILURES = {
@@ -467,9 +489,23 @@ def cpu_window_summary(
     if not window.samples:
         return None
 
+    sample_durations = tuple(
+        sample.value.window_completed_mono_s
+        - sample.value.window_started_mono_s
+        for sample in window.samples
+    )
+    available_duration_s = math.fsum(sample_durations)
+    if available_duration_s < duration_s and not math.isclose(
+        available_duration_s,
+        duration_s,
+        rel_tol=0.0,
+        abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
+    ):
+        return None
+
     completed_mono_s = window.samples[-1].value.window_completed_mono_s
-    remaining_duration_s = duration_s
-    weighted_percent_seconds = 0.0
+    used_segments = []
+    used_durations = []
     started_mono_s = None
 
     for sample in reversed(window.samples):
@@ -477,21 +513,42 @@ def cpu_window_summary(
         sample_duration_s = (
             usage.window_completed_mono_s - usage.window_started_mono_s
         )
-        if sample_duration_s >= remaining_duration_s:
-            started_mono_s = (
-                usage.window_completed_mono_s - remaining_duration_s
-            )
-            weighted_percent_seconds += usage.percent * remaining_duration_s
-            remaining_duration_s = 0.0
+        represented_duration_s = math.fsum(used_durations)
+        remaining_duration_s = duration_s - represented_duration_s
+        if remaining_duration_s <= 0.0:
             break
-        weighted_percent_seconds += usage.percent * sample_duration_s
-        remaining_duration_s -= sample_duration_s
+        if sample_duration_s < remaining_duration_s and not math.isclose(
+            sample_duration_s,
+            remaining_duration_s,
+            rel_tol=0.0,
+            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
+        ):
+            used_duration_s = sample_duration_s
+        else:
+            used_duration_s = min(sample_duration_s, remaining_duration_s)
+        used_segments.append((usage.percent, used_duration_s))
+        used_durations.append(used_duration_s)
+        started_mono_s = usage.window_completed_mono_s - used_duration_s
 
-    if remaining_duration_s > 0.0 or started_mono_s is None:
+    represented_duration_s = math.fsum(used_durations)
+    if (
+        represented_duration_s < duration_s
+        and not math.isclose(
+            represented_duration_s,
+            duration_s,
+            rel_tol=0.0,
+            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
+        )
+    ) or started_mono_s is None:
         return None
+    reference_percent = used_segments[0][0]
+    mean_percent = reference_percent + math.fsum(
+        (percent - reference_percent) * represented_s
+        for percent, represented_s in used_segments
+    ) / represented_duration_s
     return CpuWindowSummary(
         duration_s,
-        weighted_percent_seconds / duration_s,
+        mean_percent,
         started_mono_s,
         completed_mono_s,
     )
@@ -501,15 +558,21 @@ def _retain_cpu_samples(
     samples: Tuple[Sample[CpuUsage], ...]
 ) -> Tuple[Sample[CpuUsage], ...]:
     """Keep 15 represented seconds plus the intact clipped-boundary sample."""
-    represented_duration_s = 0.0
+    represented_durations = []
     first_retained_index = len(samples)
     for index in range(len(samples) - 1, -1, -1):
         usage = samples[index].value
-        represented_duration_s += (
+        represented_durations.append(
             usage.window_completed_mono_s - usage.window_started_mono_s
         )
         first_retained_index = index
-        if represented_duration_s >= 15.0:
+        represented_duration_s = math.fsum(represented_durations)
+        if represented_duration_s > 15.0 or math.isclose(
+            represented_duration_s,
+            15.0,
+            rel_tol=0.0,
+            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
+        ):
             break
     return samples[first_retained_index:]
 

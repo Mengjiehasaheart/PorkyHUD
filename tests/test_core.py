@@ -16,6 +16,7 @@ from porkyhud_core import (
     MemoryPressureLevel,
     OsThermalState,
     ProcessFact,
+    Sample,
     SourceId,
     SourceViewStatus,
     complete_failure,
@@ -299,6 +300,15 @@ class SourceStateTests(unittest.TestCase):
 
 
 class CpuWindowTests(unittest.TestCase):
+    def cpu_sample(self, revision, started, completed, percent=50.0):
+        return Sample(
+            CpuUsage(percent, started, completed),
+            revision,
+            started,
+            completed,
+            UTC_NOW,
+        )
+
     def complete_cpu(self, source, started, completed, percent):
         active, revision = start_attempt(source, started)
         return complete_success(
@@ -382,6 +392,34 @@ class CpuWindowTests(unittest.TestCase):
         summary = CpuWindowSummary(10.0, 50.0, 0.0, 12.5)
         self.assertEqual(summary.completed_mono_s - summary.started_mono_s, 12.5)
 
+    def test_summary_wall_span_cannot_be_shorter_than_represented_duration(self):
+        self.assertEqual(CpuWindowSummary(10.0, 50.0, 0.0, 10.0).duration_s,
+                         10.0)
+        self.assertEqual(CpuWindowSummary(10.0, 50.0, 0.0, 12.5).duration_s,
+                         10.0)
+        with self.assertRaises(ValueError):
+            CpuWindowSummary(10.0, 50.0, 0.0, 5.0)
+
+    def test_summary_rejects_boolean_and_nonfinite_fields(self):
+        cases = (
+            (True, 50.0, 0.0, 10.0),
+            (nan, 50.0, 0.0, 10.0),
+            (inf, 50.0, 0.0, 10.0),
+            (10.0, True, 0.0, 10.0),
+            (10.0, nan, 0.0, 10.0),
+            (10.0, inf, 0.0, 10.0),
+            (10.0, 50.0, True, 10.0),
+            (10.0, 50.0, nan, 10.0),
+            (10.0, 50.0, -inf, 10.0),
+            (10.0, 50.0, 0.0, True),
+            (10.0, 50.0, 0.0, nan),
+            (10.0, 50.0, 0.0, inf),
+        )
+        for values in cases:
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    CpuWindowSummary(*values)
+
     def test_gap_strictly_greater_than_2_5_seconds_resets_to_current_sample(self):
         source = self.complete_cpu(
             new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
@@ -436,10 +474,33 @@ class CpuWindowTests(unittest.TestCase):
         source = self.complete_cpu(
             new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
         )
-        window = CpuWindow(reduce_cpu_window(CpuWindow(), source).samples, 5)
+        window = CpuWindow((self.cpu_sample(5, 0.0, 5.0, 80.0),), 5)
         reset = reduce_cpu_window(window, source)
         self.assertEqual(reset.samples, (source.last_valid,))
         self.assertEqual(reset.last_attempt_revision, 1)
+
+    def test_direct_cpu_window_accepts_consecutive_samples_and_exact_gap(self):
+        first = self.cpu_sample(1, 0.0, 1.0)
+        adjacent = self.cpu_sample(2, 1.0, 2.0)
+        exact_gap = self.cpu_sample(2, 3.5, 4.5)
+
+        self.assertEqual(CpuWindow((first, adjacent), 2).samples[-1], adjacent)
+        self.assertEqual(CpuWindow((first, exact_gap), 2).samples[-1], exact_gap)
+
+    def test_direct_cpu_window_rejects_forged_history(self):
+        first = self.cpu_sample(1, 0.0, 1.0)
+        cases = (
+            ((first, self.cpu_sample(3, 1.0, 2.0)), 3),
+            ((first, self.cpu_sample(2, 3.5001, 4.5001)), 2),
+            ((first, self.cpu_sample(2, 1.0, 2.0)), 3),
+        )
+        for samples, last_attempt_revision in cases:
+            with self.subTest(samples=samples,
+                              last_attempt_revision=last_attempt_revision):
+                with self.assertRaises(ValueError):
+                    CpuWindow(samples, last_attempt_revision)
+
+        self.assertEqual(CpuWindow((), 7).last_attempt_revision, 7)
 
     def test_skipped_failed_revision_cannot_be_bridged_by_later_success(self):
         source = self.complete_cpu(
@@ -505,6 +566,9 @@ class CpuWindowTests(unittest.TestCase):
         )
         window = reduce_cpu_window(CpuWindow(), source)
         self.assertIsNone(cpu_window_summary(window, 15.0))
+        tiny_summary = cpu_window_summary(window, 1e-10)
+        self.assertIsNotNone(tiny_summary)
+        self.assertEqual(tiny_summary.duration_s, 1e-10)
         for duration in (0.0, -1.0, True, nan, inf):
             with self.subTest(duration=duration):
                 with self.assertRaises(ValueError):
@@ -556,6 +620,24 @@ class CpuWindowTests(unittest.TestCase):
             with self.subTest(percent=percent):
                 with self.assertRaises(ValueError):
                     ProcessFact(1, "compiler", percent, 3)
+
+    def test_segmented_exact_threshold_means_remain_on_the_safe_side(self):
+        for percent in (90.0, 70.0):
+            with self.subTest(percent=percent):
+                source = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+                window = CpuWindow()
+                for index in range(150):
+                    source = self.complete_cpu(
+                        source, index / 10.0, (index + 1) / 10.0, percent
+                    )
+                    window = reduce_cpu_window(window, source)
+                summary = cpu_window_summary(window, 15.0)
+                self.assertIsNotNone(summary)
+                self.assertAlmostEqual(summary.mean_percent, percent)
+                if percent == 90.0:
+                    self.assertGreaterEqual(summary.mean_percent, 90.0)
+                else:
+                    self.assertLessEqual(summary.mean_percent, 70.0)
 
 
 if __name__ == "__main__":
