@@ -38,6 +38,7 @@ Keep this table exhaustive. Add, move, or remove a row in the same commit as the
 | `AGENTS.md` | Agent routing, architecture, invariants, and maintenance contract | Any boundary, file ownership, runtime flow, validation, or documentation-policy change |
 | `README.md` | User-facing installation, controls, sensor access, privacy, and metric semantics | User-visible behavior, requirements, CLI workflows, or support changes |
 | `docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md` | Phase 1 design and acceptance proposal for the decision-cockpit foundation; not current behavior until implementation lands | Scope, architecture, UX, compatibility, performance, or acceptance changes to this milestone |
+| `docs/superpowers/plans/2026-08-11-porkyhud-trusted-decision-cockpit.md` | Test-first Phase 1 implementation sequence and fixed cross-task interfaces; not current behavior until implementation lands | Task boundaries, interface names, validation sequence, or approved Phase 1 execution changes |
 | `porkyhud.py` | Entire application: models, macOS adapters, collectors, policy, rendering, snapshots, and CLI | Focused tests plus every affected user or agent contract |
 | `PorkyHUD.command` | Double-click and shell launcher, terminal setup/restoration, source-versus-installed dispatch | Launcher, palette, executable discovery, or launch guidance changes |
 | `pyproject.toml` | Setuptools build and package metadata | Version, Python support, packaging, entry point, dependency, or project URL changes |

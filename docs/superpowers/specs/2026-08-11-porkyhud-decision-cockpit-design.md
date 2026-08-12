@@ -1,6 +1,6 @@
 # PorkyHUD Trusted Decision Cockpit — Phase 1 Design
 
-Status: approved product direction; awaiting written-spec review before implementation planning.
+Status: approved for Phase 1 implementation on 2026-08-11.
 
 Date: 2026-08-11
 
