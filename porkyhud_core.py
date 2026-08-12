@@ -1031,11 +1031,19 @@ def _rule_attempt(
           or source.active_started_mono_s < attempt.completed_mono_s):
         raise ValueError("active source cannot skip or precede an attempt")
     if source.last_valid is not None:
-        _validate_rule_sample(source.last_valid, value_type)
-        if source.last_valid.revision > attempt.revision:
+        sample = source.last_valid
+        _validate_rule_sample(sample, value_type)
+        if sample.revision > attempt.revision:
             raise ValueError("retained sample cannot follow the latest attempt")
-        if now_mono_s < source.last_valid.completed_mono_s:
+        if now_mono_s < sample.completed_mono_s:
             raise ValueError("now_mono_s cannot precede the retained sample")
+        if attempt.outcome is not AttemptOutcome.SUCCESS:
+            if sample.revision == attempt.revision:
+                raise ValueError("failed attempt cannot own a valid sample")
+            if sample.completed_mono_s > attempt.started_mono_s:
+                raise ValueError("retained sample cannot complete after a later attempt starts")
+            if sample.completed_at_utc > attempt.completed_at_utc:
+                raise ValueError("retained sample wall time cannot follow a later attempt")
     if attempt.outcome is AttemptOutcome.SUCCESS:
         _rule_success(source, attempt, value_type)
     return attempt
@@ -1116,6 +1124,9 @@ def _clear_latch(rule_id: RuleId, revision: int) -> RuleLatch:
 
 
 def _reset_recovery(latch: RuleLatch, revision: int) -> RuleLatch:
+    if (latch.phase is not LatchPhase.RECOVERING
+            and latch.last_processed_revision == revision):
+        return latch
     if latch.phase is LatchPhase.CLEAR:
         return _clear_latch(latch.rule_id, revision)
     return RuleLatch(latch.rule_id, latch.severity, LatchPhase.ACTIVE,

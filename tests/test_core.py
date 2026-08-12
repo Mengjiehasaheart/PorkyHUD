@@ -945,6 +945,44 @@ class RuleLatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reduce_memory_latch(recovering, source, 0.5)
 
+    def test_post_transition_stale_duplicates_preserve_latch_identity(self):
+        warning_source = self.memory_source(2, 0.0)
+        active = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), warning_source, 0.0
+        )
+        normal_source = self.memory_source(1, 1.0, warning_source)
+        recovering = reduce_memory_latch(active, normal_source, 1.0)
+
+        stale_active = reduce_memory_latch(recovering, normal_source, 3.500001)
+        self.assertIsNot(stale_active, recovering)
+        self.assertEqual(stale_active.phase, LatchPhase.ACTIVE)
+        self.assertIs(
+            reduce_memory_latch(stale_active, normal_source, 3.500001),
+            stale_active,
+        )
+
+        clear_source = self.memory_source(1, 1.0)
+        clear = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), clear_source, 1.0
+        )
+        self.assertIs(
+            reduce_memory_latch(clear, clear_source, 3.500001),
+            clear,
+        )
+
+        duplicate_active_source = self.memory_source(2, 1.0)
+        duplicate_active = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH),
+            duplicate_active_source,
+            1.0,
+        )
+        self.assertIs(
+            reduce_memory_latch(
+                duplicate_active, duplicate_active_source, 3.500001
+            ),
+            duplicate_active,
+        )
+
     def test_duplicate_revisions_reject_now_before_source_and_latch_times(self):
         source = self.memory_source(2, 3.0)
         latch = reduce_memory_latch(
@@ -1033,6 +1071,92 @@ class RuleLatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reduce_memory_latch(empty_latch(RuleId.MEMORY_WATCH),
                                 replace(source, revision=2), 1.0)
+
+    def test_failed_attempt_rejects_impossible_retained_sample_chronology(self):
+        source = self.memory_source(1, 3.0)
+        base_attempt = source.last_attempt
+
+        impossible_mono = replace(
+            source,
+            revision=2,
+            last_attempt=replace(
+                base_attempt,
+                revision=2,
+                started_mono_s=2.0,
+                completed_mono_s=2.1,
+                outcome=AttemptOutcome.TIMEOUT,
+                failure=FailureCode.COMMAND_TIMEOUT,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(
+                empty_latch(RuleId.MEMORY_WATCH), impossible_mono, 3.0
+            )
+
+        impossible_wall = replace(
+            source,
+            revision=2,
+            last_attempt=replace(
+                base_attempt,
+                revision=2,
+                started_mono_s=3.0,
+                completed_mono_s=3.1,
+                completed_at_utc=UTC_NOW - timedelta(seconds=1),
+                outcome=AttemptOutcome.TIMEOUT,
+                failure=FailureCode.COMMAND_TIMEOUT,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(
+                empty_latch(RuleId.MEMORY_WATCH), impossible_wall, 3.1
+            )
+
+        failed_own_sample = replace(
+            source,
+            last_attempt=replace(
+                base_attempt,
+                outcome=AttemptOutcome.TIMEOUT,
+                failure=FailureCode.COMMAND_TIMEOUT,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(
+                empty_latch(RuleId.MEMORY_WATCH), failed_own_sample, 3.0
+            )
+
+        boundary = replace(
+            source,
+            revision=2,
+            last_attempt=replace(
+                base_attempt,
+                revision=2,
+                started_mono_s=3.0,
+                completed_mono_s=3.1,
+                completed_at_utc=UTC_NOW + timedelta(seconds=1),
+                outcome=AttemptOutcome.TIMEOUT,
+                failure=FailureCode.COMMAND_TIMEOUT,
+            ),
+        )
+        boundary_latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), boundary, 3.1
+        )
+        self.assertEqual(boundary_latch.last_processed_revision, 2)
+
+        later_failure = replace(
+            boundary,
+            revision=4,
+            last_attempt=replace(
+                boundary.last_attempt,
+                revision=4,
+                started_mono_s=4.0,
+                completed_mono_s=4.1,
+                completed_at_utc=UTC_NOW + timedelta(seconds=2),
+            ),
+        )
+        later_latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), later_failure, 4.1
+        )
+        self.assertEqual(later_latch.last_processed_revision, 4)
 
     def test_rule_latch_rejects_incoherent_recovery_metadata(self):
         trigger = TriggerEvidence(
