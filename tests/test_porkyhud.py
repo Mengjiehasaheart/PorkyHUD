@@ -3883,6 +3883,547 @@ class SourcePollerTests(unittest.TestCase):
 
 
 class LayoutAndRenderingTests(unittest.TestCase):
+    def run_hud_fixture(
+        self, keys: list[int], *, height: int = 24, width: int = 80,
+        sensor: porkyhud.SensorInfo | None = None,
+        monotonic_values: list[float] | None = None,
+        frames: list[porkyhud.HealthFrame] | None = None,
+        poller_snapshots: list[tuple[object, float, str]] | None = None,
+        on_refresh=None,
+    ) -> tuple[FakeScreen, mock.Mock, mock.Mock, mock.Mock]:
+        frame = make_health_frame_for_test()
+        coordinator = mock.Mock()
+        coordinator.source_generation.return_value = 0
+        if frames is None:
+            coordinator.tick.return_value = frame
+        else:
+            coordinator.tick.side_effect = frames
+        coordinator.per_core.return_value = (10.0, 20.0)
+        coordinator.process_rows.return_value = (
+            porkyhud.ProcessRow(42, 70.0, 4.0, None, "R", "00:10",
+                                "/Applications/Xcode.app/Contents/MacOS/Xcode"),
+            porkyhud.ProcessRow(7, 20.0, 8.0, 0.0, "S", "01:00", "/usr/bin/worker"),
+        )
+        poller = mock.Mock()
+        poller.tick.return_value = None
+        if poller_snapshots is None:
+            poller.snapshot.return_value = (None, 0.0, "")
+        else:
+            poller.snapshot.side_effect = poller_snapshots
+        unlock = mock.Mock(return_value=True)
+        screen = FakeScreen(height, width, keys=keys)
+        if on_refresh is not None:
+            screen.on_refresh = lambda: on_refresh(screen)
+        default_sensor = sensor or settled_sensor()
+        clock = (
+            mock.patch.object(porkyhud.time, "monotonic",
+                              side_effect=monotonic_values)
+            if monotonic_values is not None
+            else mock.patch.object(porkyhud.time, "monotonic", return_value=21.0)
+        )
+        with mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator), \
+                mock.patch.object(porkyhud, "AsyncPoller", return_value=poller), \
+                mock.patch.object(porkyhud, "_start_static_discovery", return_value=poller), \
+                mock.patch.object(porkyhud, "default_sensor_info", return_value=default_sensor), \
+                mock.patch.object(porkyhud, "unlock_privileged_sensors", unlock), \
+                mock.patch.object(porkyhud, "init_colors"), \
+                mock.patch.object(porkyhud, "apply_dark_screen"), \
+                mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0), \
+                clock, \
+                mock.patch.object(porkyhud.time, "sleep"):
+            porkyhud.hud(screen)
+        return screen, coordinator, poller, unlock
+
+    def test_help_escape_survives_resize_below_minimum(self) -> None:
+        def resize(screen: FakeScreen) -> None:
+            if screen.refresh_count == 2:
+                screen.height, screen.width = 21, 75
+            elif screen.refresh_count == 3:
+                screen.height, screen.width = 24, 80
+
+        screen, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [ord("h"), 27, -1, ord("q")], on_refresh=resize,
+        )
+        self.assertNotIn("SHORTCUTS", screen.text())
+        self.assertIn("shortcut panel closed", screen.row(23))
+
+    def test_hud_direct_keys_change_mode_label_and_body_at_minimum_view(self) -> None:
+        expected = {
+            "1": ("1 OVERVIEW", "EVIDENCE DETAIL", "Overview"),
+            "2": ("2 COMPUTE", "TOP CPU", "Compute"),
+            "3": ("3 THERMALS", "FANS + TEMP SENSORS", "Thermals"),
+            "4": ("4 I/O", "disk live", "I/O"),
+            "5": ("5 PROCESSES", "PROCESS GRID sort=CPU", "Processes"),
+        }
+        for key, (mode_label, body_signature, display_name) in expected.items():
+            with self.subTest(key=key):
+                screen, _coordinator, _poller, _unlock = self.run_hud_fixture(
+                    [ord(key), ord("q")], height=22, width=76,
+                )
+                self.assertIn(mode_label, screen.row(0))
+                self.assertIn(body_signature, screen.text())
+                self.assertEqual(screen.row(21).strip(),
+                                 "%s selected | q quit" % display_name)
+
+    def test_hud_control_truth_table_guards_motion_refresh_and_unlock(self) -> None:
+        rejected, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [ord("6"), ord("q")], height=24, width=80,
+        )
+        self.assertIn("1 OVERVIEW", rejected.row(0))
+        self.assertIn("Cinema requires 118x34 | staying in Overview | q quit",
+                      rejected.row(23))
+
+        motion, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [ord("a"), ord("a"), ord("a"), ord("q")],
+        )
+        self.assertIn("motion off | q quit", motion.row(23))
+
+        locked_sensor = replace(settled_sensor(), privileged_locked=True,
+                                raw_hint="smc direct")
+        _screen, _coordinator, _poller, locked_unlock = self.run_hud_fixture(
+            [ord("u"), ord("q")], sensor=locked_sensor,
+        )
+        locked_unlock.assert_called_once()
+        _screen, _coordinator, _poller, unlocked_unlock = self.run_hud_fixture(
+            [ord("u"), ord("q")], sensor=settled_sensor(),
+        )
+        unlocked_unlock.assert_not_called()
+
+        _screen, refreshed, poller, _unlock = self.run_hud_fixture(
+            [-1, ord("r"), ord("q")],
+        )
+        self.assertEqual([call.args[1] for call in refreshed.tick.call_args_list],
+                         [True, True])
+        self.assertTrue(all(call.args[1] for call in poller.tick.call_args_list[:6]))
+        self.assertTrue(all(not call.args[1] for call in poller.tick.call_args_list[6:12]))
+
+        _small, small_coordinator, _poller, small_unlock = self.run_hud_fixture(
+            [ord("u"), ord("r"), ord("q")], height=21, width=75,
+        )
+        small_unlock.assert_not_called()
+        self.assertEqual(sum(call.args[1] is True
+                             for call in small_coordinator.tick.call_args_list), 1)
+
+    def test_motion_off_redraws_only_for_state_input_resize_or_age_boundary(self) -> None:
+        unchanged, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [-1, -1, -1, ord("q")],
+            monotonic_values=[20.0, 21.20, 21.23, 22.01, 22.02],
+        )
+        self.assertEqual(unchanged.refresh_count, 3)
+        self.assertEqual(unchanged.erase_count, 3)
+
+        changed, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [-1, -1, ord("q")],
+            monotonic_values=[20.0, 21.20, 21.23, 21.24],
+            frames=[make_health_frame_for_test(),
+                    make_health_frame_for_test("memory_watch")],
+        )
+        self.assertEqual(changed.refresh_count, 3)
+        self.assertIn("WATCH", changed.row(0))
+
+    def test_motion_off_uses_display_age_boundaries_not_continuous_sample_age(self) -> None:
+        sensor = settled_sensor()
+        activity = porkyhud.DiskActivity(1024.0, 2.0, 0.0, "iostat")
+
+        def snapshots(age: float) -> list[tuple[object, float, str]]:
+            return [
+                (None, age, ""), (None, age, ""), (None, age, ""),
+                (None, age, ""), (None, age, ""),
+                (sensor, age, ""), (activity, age, ""),
+            ]
+
+        screen, _coordinator, _poller, _unlock = self.run_hud_fixture(
+            [-1, -1, -1, ord("q")],
+            monotonic_values=[20.0, 21.20, 21.23, 21.41, 21.42],
+            poller_snapshots=(snapshots(0.80) + snapshots(0.83)
+                              + snapshots(1.01)),
+        )
+        self.assertEqual(screen.refresh_count, 3)
+        self.assertEqual(screen.erase_count, 3)
+
+    def test_frame_render_key_separates_semantics_from_displayed_age_buckets(self) -> None:
+        base = make_health_frame_for_test()
+        within_second = replace(
+            base,
+            assessment=replace(base.assessment, evidence_age_s=1.80),
+        )
+        base = replace(
+            base,
+            assessment=replace(base.assessment, evidence_age_s=1.20),
+        )
+        crossed_second = replace(
+            base,
+            assessment=replace(base.assessment, evidence_age_s=2.01),
+        )
+        sensor = replace(settled_sensor(), sensor_sample_age_s=0.80)
+        activity = porkyhud.DiskActivity(sample_age=0.80)
+
+        self.assertEqual(
+            porkyhud._frame_render_key(base),
+            porkyhud._frame_render_key(within_second),
+        )
+        self.assertEqual(
+            porkyhud._render_age_key(base, sensor, activity, 20.0),
+            porkyhud._render_age_key(within_second, sensor, activity, 20.0),
+        )
+        self.assertNotEqual(
+            porkyhud._render_age_key(base, sensor, activity, 20.0),
+            porkyhud._render_age_key(crossed_second, sensor, activity, 20.0),
+        )
+
+    def test_responsive_mode_contract_is_direct_bounded_and_non_mutating(self) -> None:
+        operational = ("balanced", "compute", "thermals", "io", "processes")
+        all_modes = operational + ("cinema",)
+        self.assertEqual(porkyhud.LAYOUTS, list(all_modes))
+        self.assertEqual(
+            porkyhud.DIRECT_MODE_KEYS,
+            {"1": "balanced", "2": "compute", "3": "thermals",
+             "4": "io", "5": "processes", "6": "cinema"},
+        )
+        self.assertEqual(porkyhud.HudConfig().animation_mode, 0)
+
+        for height, width, expected in (
+            (22, 76, operational), (24, 80, operational),
+            (33, 117, operational), (34, 118, all_modes), (42, 132, all_modes),
+        ):
+            with self.subTest(height=height, width=width):
+                self.assertEqual(porkyhud.supported_modes(height, width), expected)
+
+        labels = {
+            "balanced": "Overview", "compute": "Compute",
+            "thermals": "Thermals", "io": "I/O",
+            "processes": "Processes", "cinema": "Cinema",
+        }
+        config = porkyhud.HudConfig()
+        for mode in operational:
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    porkyhud.select_mode(config, mode, 22, 76),
+                    "%s selected" % labels[mode],
+                )
+                self.assertEqual(config.layout_name, mode)
+        before = config.layout_index
+        self.assertEqual(
+            porkyhud.select_mode(config, "cinema", 33, 117),
+            "Cinema requires 118×34 · staying in Processes",
+        )
+        self.assertEqual(config.layout_index, before)
+        for unknown in ("compact", "unknown", None):
+            with self.subTest(unknown=unknown), self.assertRaises(ValueError):
+                porkyhud.select_mode(config, unknown, 34, 118)
+            self.assertEqual(config.layout_index, before)
+
+        for dimensions in ((True, 80), (22, False), (22.0, 80),
+                           (22, 80.0), (-1, 80), (22, -1)):
+            with self.subTest(dimensions=dimensions), self.assertRaises(ValueError):
+                porkyhud.supported_modes(*dimensions)
+
+    def test_mode_cycles_resize_normalization_and_motion_are_independent(self) -> None:
+        narrow = porkyhud.HudConfig()
+        visited = []
+        for _ in range(7):
+            visited.append(narrow.layout_name)
+            porkyhud.cycle_mode(narrow, 24, 80)
+        self.assertEqual(set(visited),
+                         {"balanced", "compute", "thermals", "io", "processes"})
+        self.assertNotIn("compact", visited)
+        self.assertNotIn("cinema", visited)
+
+        wide = porkyhud.HudConfig(animation_mode=2)
+        visited = []
+        for _ in range(6):
+            visited.append(wide.layout_name)
+            porkyhud.cycle_mode(wide, 34, 118)
+        self.assertEqual(visited,
+                         ["balanced", "compute", "thermals", "io", "processes", "cinema"])
+        self.assertEqual(wide.animation_mode, 2)
+        self.assertEqual(wide.layout_name, "balanced")
+        self.assertEqual(porkyhud.select_mode(wide, "cinema", 34, 118),
+                         "Cinema selected")
+        self.assertEqual(wide.animation_mode, 2)
+        self.assertEqual(
+            porkyhud.normalize_mode_for_viewport(wide, 33, 117),
+            "Cinema requires 118×34 · returned to Overview",
+        )
+        self.assertEqual(wide.layout_name, "balanced")
+        self.assertEqual(porkyhud.normalize_mode_for_viewport(wide, 33, 117), "")
+        self.assertEqual(porkyhud.normalize_mode_for_viewport(wide, 42, 132), "")
+        self.assertEqual(wide.layout_name, "balanced")
+
+    def test_direct_mode_bodies_have_distinct_signatures_and_stay_in_body(self) -> None:
+        frame = make_health_frame_for_test()
+        history = porkyhud.MetricHistory()
+        for value in (12.0, 24.0, 36.0):
+            history.add(value, value / 2, value * 1024, value)
+        rows = [
+            porkyhud.ProcessRow(42, 72.0, 4.0, None, "R", "00:10",
+                                "/Applications/Xcode.app/Contents/MacOS/Xcode --token secret"),
+            porkyhud.ProcessRow(7, 12.0, 8.0, 0.0, "S", "01:00", "/usr/bin/worker"),
+        ]
+        static = {"chip": "Test Chip", "logical_cpu": 2, "physical_cpu": 2}
+        memory = {"total": 100.0, "used": 60.0, "available": 40.0,
+                  "compressed": 4.0, "swap_total": 10.0, "swap_used": 2.0}
+        battery = make_battery()
+        sensor = settled_sensor()
+        disk = porkyhud.DiskInfo("Data", "/System/Volumes/Data", 100, 50, 50)
+        activity = porkyhud.DiskActivity(1024.0, 2.0, 0.0, "iostat")
+        signatures = {
+            "balanced": ("EVIDENCE DETAIL", "TOP PROCESSES"),
+            "compute": ("CPU WORKER CORES", "15s", "MEMORY", "TOP CPU"),
+            "thermals": ("THERMAL", "FANS + TEMP SENSORS"),
+            "io": ("I/O", "disk live", "net d"),
+            "processes": ("PROCESS GRID sort=CPU",),
+        }
+        for mode, expected in signatures.items():
+            screen = FakeScreen(22, 76)
+            with self.subTest(mode=mode), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                scroll = porkyhud.draw_mode_body(
+                    screen, mode, 3, 18, 76, frame, [25.0, 50.0], static,
+                    memory, battery, sensor, disk, activity, 2048.0, 1024.0,
+                    history, rows, 0, "CPU", 0,
+                )
+            rendered = "\n".join(screen.row(row) for row in range(3, 21))
+            for signature in expected:
+                self.assertIn(signature, rendered)
+            self.assertNotIn("secret", rendered)
+            self.assertTrue(all(3 <= write[0] <= 20 for write in screen.writes))
+            self.assertTrue(all(1 <= write[1] <= 74 for write in screen.writes))
+            self.assertEqual(scroll, 0)
+
+        compute = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_mode_body(
+                compute, "compute", 3, 18, 76, frame, [25.0, 50.0], static,
+                memory, battery, sensor, disk, activity, 0.0, 0.0, history,
+                rows, 0, "CPU", 0,
+            )
+        self.assertEqual(
+            tuple(compute.cells[y][x] for y, x in
+                  ((3, 1), (3, 36), (3, 38), (3, 74),
+                   (12, 1), (13, 1), (20, 1), (20, 74))),
+            ("+", "+", "+", "+", "+", "+", "+", "+"),
+        )
+        self.assertTrue(all(compute.cells[row][37] == " " for row in range(3, 21)))
+
+        unavailable_io = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_mode_body(
+                unavailable_io, "io", 3, 18, 76, frame, (), static, memory,
+                battery, sensor, disk,
+                porkyhud.DiskActivity(source="unavailable"),
+                0.0, 0.0, history, (), 0, "CPU", 0,
+            )
+        self.assertIn("disk activity unavailable", unavailable_io.text())
+        self.assertNotIn("disk live 0B/s", unavailable_io.text())
+
+    def test_overview_process_rows_render_identity_without_arguments(self) -> None:
+        screen = FakeScreen(22, 76)
+        rows = (
+            porkyhud.ProcessRow(
+                7, 12.0, 8.0, None, "S", "01:00",
+                "/usr/bin/python private_customer_file --customer Acme",
+            ),
+        )
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_overview_body(
+                screen, 3, 18, 76, make_health_frame_for_test(),
+                porkyhud.MetricHistory(), rows, "CPU",
+            )
+        rendered = screen.text()
+        self.assertIn("python", rendered)
+        self.assertNotIn("private_customer_file", rendered)
+        self.assertNotIn("--customer", rendered)
+        self.assertNotIn("Acme", rendered)
+
+    def test_specialist_bodies_project_ascii_and_contain_wide_labels(self) -> None:
+        frame = make_health_frame_for_test()
+        history = porkyhud.MetricHistory()
+        battery = make_battery()
+        sensor = replace(
+            settled_sensor(), raw_hint="传感器🐷" * 20,
+            fans=[porkyhud.FanReading("风扇🐷" * 20, 2000, maximum_rpm=4000)],
+            fan_count=1,
+            temp_sensors=[porkyhud.TempReading("T0", "温度🐷" * 20, 55.0)],
+        )
+        disk = porkyhud.DiskInfo("数据📁" * 30, "/", 100, 50, 50)
+        activity = porkyhud.DiskActivity(0.0, 0.0, 0.0, "测量源🐷")
+        rows = [
+            porkyhud.ProcessRow(1, 10.0, 2.0, None, "S", "00:01",
+                                "/usr/bin/工具🐷 --input 客户文件"),
+        ]
+        for mode in porkyhud.LAYOUTS:
+            height, width = ((34, 118) if mode == "cinema" else (22, 76))
+            screen = FakeScreen(height, width)
+            with self.subTest(mode=mode), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_mode_body(
+                    screen, mode, 3, height - 4, width, frame, [99.0],
+                    {"chip": "芯片🐷" * 30, "gpus": [{"name": "图形🐷" * 30}]},
+                    {"total": 100.0, "used": 99.0}, battery, sensor, disk,
+                    activity, 0.0, 0.0, history, rows, 0, "CPU", 0,
+                )
+            body = "\n".join(screen.row(row) for row in range(3, height - 1))
+            self.assertTrue(all(ord(character) < 128 for character in body))
+
+        for mode, gap_columns in (("compute", (37,)), ("thermals", (37,)),
+                                  ("cinema", (39, 76))):
+            height, width = ((34, 118) if mode == "cinema" else (22, 76))
+            screen = FakeScreen(height, width)
+            with self.subTest(containment=mode), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=True), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_mode_body(
+                    screen, mode, 3, height - 4, width, frame, [99.0],
+                    {"chip": "界" * 100}, {"total": 100.0, "used": 99.0},
+                    battery, sensor, disk, activity, 0.0, 0.0, history, rows,
+                    0, "CPU", 0,
+                )
+            for column in gap_columns:
+                self.assertTrue(all(screen.cells[row][column] == " "
+                                    for row in range(10 if mode == "cinema" else 3,
+                                                     height - 1)))
+
+    def test_gpu_column_tracks_only_the_clamped_visible_process_slice(self) -> None:
+        rows = [
+            porkyhud.ProcessRow(index, 1.0, 1.0, None, "S", "00:01", "/bin/task")
+            for index in range(1, 5)
+        ]
+        rows[-1] = replace(rows[-1], gpu=12.5)
+        hidden = FakeScreen(10, 70)
+        visible = FakeScreen(10, 70)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_process_panel(hidden, 1, 1, 8, 64, rows, 0, "GPU")
+            porkyhud.draw_process_panel(visible, 1, 1, 8, 64, rows, 1, "GPU")
+        self.assertNotIn("GPU", hidden.row(2))
+        self.assertIn("GPU%", visible.row(2))
+        self.assertIn("12.5", visible.text())
+
+    def test_overview_lock_is_proof_only_and_actionable(self) -> None:
+        frame = make_health_frame_for_test()
+        history = porkyhud.MetricHistory()
+        locked = FakeScreen(22, 76)
+        unlocked = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=True), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_overview_body(
+                locked, 3, 18, 76, frame, history, (), "CPU",
+                sensor=replace(settled_sensor(), privileged_locked=True),
+            )
+            porkyhud.draw_overview_body(
+                unlocked, 3, 18, 76, frame, history, (), "CPU",
+                sensor=settled_sensor(),
+            )
+        self.assertIn("LOCKED · u: temporary unlock", locked.text())
+        self.assertNotIn("LOCKED", unlocked.text())
+
+    def test_typed_thermal_precedes_optional_detail_and_io_requires_evidence(self) -> None:
+        sensor = replace(
+            settled_sensor(), thermal_warning="legacy warning",
+            performance_warning="legacy performance",
+        )
+        thermal = FakeScreen(16, 60)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_thermal_panel(
+                thermal, 1, 1, 12, 50, make_battery(), sensor, 0,
+                os_thermal=core.OsThermalState(1, 2),
+            )
+        self.assertIn("OS thermal: WARN 1", thermal.row(2))
+        self.assertIn("OS performance: WARN 2", thermal.row(3))
+        self.assertGreater(thermal.text().find("legacy warning"),
+                           thermal.text().find("OS thermal"))
+
+        for source, down, up, expected, forbidden in (
+            ("checking", None, None, "CHECKING", "LIVE"),
+            ("unavailable", -1.0, -1.0, "UNAVAILABLE", "LIVE"),
+            ("iostat", 0.0, 0.0, "LIVE", "UNAVAILABLE"),
+        ):
+            screen = FakeScreen(14, 80)
+            with self.subTest(source=source), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_io_panel(
+                    screen, 1, 1, 10, 74,
+                    porkyhud.DiskInfo("Data", "/", 100, 50, 50),
+                    porkyhud.DiskActivity(source=source), down, up,
+                    porkyhud.MetricHistory(), 0,
+                )
+            rendered = screen.text()
+            self.assertIn(expected, rendered)
+            self.assertNotIn(forbidden, rendered)
+
+    def test_draw_helpers_consume_only_preordered_visible_process_rows(self) -> None:
+        row = porkyhud.ProcessRow(1, 1.0, 1.0, None, "S", "00:01", "/bin/task")
+
+        class VisibleRows:
+            def __len__(self):
+                return 10_000
+
+            def __iter__(self):
+                raise AssertionError("rendering must not iterate retained rows")
+
+            def __getitem__(self, key):
+                if not isinstance(key, slice) or key.stop - key.start > 13:
+                    raise AssertionError("rendering may request only a visible slice")
+                return [row] * (key.stop - key.start)
+
+        screen = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0), \
+                mock.patch.object(porkyhud, "sort_process_rows",
+                                  side_effect=AssertionError("sorting belongs to HUD")):
+            porkyhud.draw_mode_body(
+                screen, "processes", 3, 18, 76, make_health_frame_for_test(),
+                (), {}, {}, make_battery(), settled_sensor(),
+                porkyhud.DiskInfo("Data", "/", 100, 50, 50),
+                porkyhud.DiskActivity(), 0.0, 0.0, porkyhud.MetricHistory(),
+                VisibleRows(), 0, "CPU", 0,
+            )
+
+        with mock.patch.object(porkyhud, "sort_process_rows",
+                              wraps=porkyhud.sort_process_rows) as sorter:
+            self.run_hud_fixture(
+                [ord("m"), ord("2"), -1, ord("q")], height=22, width=76,
+            )
+        self.assertEqual(sorter.call_count, 2)
+
+    def test_unavailable_locked_and_stale_details_never_use_nominal_role(self) -> None:
+        def attr_for(screen: FakeScreen, fragment: str) -> int:
+            return next(write[4] for write in screen.writes if fragment in write[2])
+
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", side_effect=lambda pair: pair), \
+                mock.patch.object(porkyhud.curses, "A_BOLD", 0):
+            cpu = FakeScreen(14, 60)
+            porkyhud.draw_cpu_panel(cpu, 1, 1, 10, 50, [], {},
+                                    porkyhud.MetricHistory(), 0)
+            sensors = FakeScreen(20, 70)
+            porkyhud.draw_sensors_panel(
+                sensors, 1, 1, 16, 60, make_battery(),
+                replace(settled_sensor(), sensor_sample_age_s=30.0), 0,
+            )
+            gpu = FakeScreen(12, 60)
+            porkyhud.draw_gpu_panel(gpu, 1, 1, 8, 50, {}, settled_sensor(), 0)
+            locked_gpu = FakeScreen(12, 60)
+            porkyhud.draw_gpu_panel(
+                locked_gpu, 1, 1, 8, 50, {"gpus": [{"name": "GPU"}]},
+                replace(settled_sensor(), privileged_locked=True), 0,
+            )
+        self.assertEqual(attr_for(cpu, "unavailable"), porkyhud.PAIR_SECONDARY)
+        self.assertEqual(attr_for(sensors, "stale"), porkyhud.PAIR_PRIMARY)
+        self.assertEqual(attr_for(sensors, "none exposed"), porkyhud.PAIR_SECONDARY)
+        self.assertEqual(attr_for(gpu, "GPU scan unavailable"),
+                         porkyhud.PAIR_SECONDARY)
+        self.assertEqual(attr_for(locked_gpu, "press u"), porkyhud.PAIR_PRIMARY)
+
     def test_decision_projection_primitives_are_exact_and_validate_inputs(self) -> None:
         self.assertEqual(
             porkyhud.semantic_text(
@@ -4323,6 +4864,15 @@ class LayoutAndRenderingTests(unittest.TestCase):
             ),
             tuple(range(1, 9)),
         )
+        self.assertEqual(
+            (
+                porkyhud.PAIR_PRIMARY, porkyhud.PAIR_INFO,
+                porkyhud.PAIR_NOMINAL, porkyhud.PAIR_WATCH,
+                porkyhud.PAIR_CRITICAL, porkyhud.PAIR_STRUCTURE,
+                porkyhud.PAIR_SECONDARY, porkyhud.PAIR_BRAND,
+            ),
+            tuple(range(1, 9)),
+        )
         expected_theme_roles = {
             "Neon Grid": (231, 51, 46, 220, 196, 39, 45, 201),
             "Catppuccin": (189, 110, 119, 229, 203, 111, 153, 183),
@@ -4338,6 +4888,8 @@ class LayoutAndRenderingTests(unittest.TestCase):
             },
             expected_theme_roles,
         )
+        self.assertTrue(all(set(theme["colors"]) == set(range(1, 9))
+                            for theme in porkyhud.THEMES))
         with mock.patch.object(porkyhud, "color_pair", side_effect=lambda pair: pair << 20):
             for level, pair in (("normal", porkyhud.NOMINAL), ("watch", porkyhud.WATCH),
                                 ("critical", porkyhud.CRITICAL), ("checking", porkyhud.PRIMARY)):
@@ -4364,6 +4916,44 @@ class LayoutAndRenderingTests(unittest.TestCase):
             self.assertEqual(
                 screen.writes[0][4], (pair << 20) | porkyhud.curses.A_BOLD,
             )
+
+    def test_alert_pairs_are_reserved_for_typed_decision_and_source_evidence(self) -> None:
+        alert_names = {"PAIR_WATCH", "PAIR_CRITICAL"}
+        allowed = {"_ribbon_role", "read_attr"}
+        offenders = {
+            name: sorted(alert_names.intersection(value.__code__.co_names))
+            for name, value in vars(porkyhud).items()
+            if callable(value) and hasattr(value, "__code__") and name not in allowed
+            and alert_names.intersection(value.__code__.co_names)
+        }
+        self.assertEqual(offenders, {})
+        self.assertNotIn("read_attr", porkyhud.draw_small_screen.__code__.co_names)
+
+        screen = FakeScreen(42, 132)
+        history = porkyhud.MetricHistory()
+        hot_battery = make_battery(
+            percent=5, external_connected=False, temp_c=99.0,
+        )
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", side_effect=lambda pair: pair), \
+                mock.patch.object(porkyhud.curses, "A_BOLD", 0):
+            porkyhud.draw_header(
+                screen, 132, 0, {"chip": "M", "model": "Mac"},
+                porkyhud.HudConfig(),
+            )
+            porkyhud.draw_cpu_panel(
+                screen, 8, 1, 12, 60, [99.0], {}, history, 0,
+            )
+            porkyhud.draw_battery_panel(
+                screen, 21, 1, 10, 60, hot_battery, 0,
+            )
+        self.assertTrue(screen.writes)
+        self.assertTrue({porkyhud.PAIR_INFO, porkyhud.PAIR_STRUCTURE}
+                        .intersection(write[4] for write in screen.writes))
+        self.assertFalse(
+            {porkyhud.PAIR_WATCH, porkyhud.PAIR_CRITICAL}
+            .intersection(write[4] for write in screen.writes),
+        )
 
     def test_ribbon_segments_use_semantic_attributes_without_changing_text(self) -> None:
         screen = FakeScreen(22, 80)
@@ -4413,7 +5003,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertEqual(screen.erase_count, 0)
         self.assertEqual(screen.refresh_count, 0)
 
-    def test_hud_places_real_decision_header_and_ribbon_before_legacy_body(self) -> None:
+    def test_hud_places_decision_header_ribbon_and_overview_before_footer(self) -> None:
         frame = make_health_frame_for_test()
         coordinator = mock.Mock()
         coordinator.source_generation.return_value = 0
@@ -4444,8 +5034,12 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertIn("THERM CLEAR", screen.row(2))
         self.assertIn("DISK 50% FREE", screen.row(2))
         self.assertNotIn("Fresh core evidence", screen.row(22))
-        self.assertIn("+", screen.row(22))
-        self.assertIn("h help", screen.row(23))
+        self.assertIn("EVIDENCE DETAIL", screen.row(3))
+        self.assertIn("TOP PROCESSES", screen.row(5))
+        self.assertEqual(
+            screen.row(23).strip(),
+            "1-5 mode | h help | m sort | r refresh | q quit",
+        )
 
     def test_pure_frame_projection_10k_mean_is_under_five_milliseconds(self) -> None:
         frame = make_health_frame_for_test()
@@ -4507,8 +5101,16 @@ class LayoutAndRenderingTests(unittest.TestCase):
             [porkyhud.render_interval(mode) for mode in range(3)],
             [1.00, 0.40, 0.08],
         )
-        self.assertLessEqual(len(porkyhud.shortcut_status(76)), 74)
-        self.assertIn("u sensor", porkyhud.shortcut_status(76))
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=True):
+            self.assertEqual(
+                porkyhud.shortcut_status(76),
+                "1–5 mode · h help · m sort · r refresh · q quit",
+            )
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
+            self.assertEqual(
+                porkyhud.shortcut_status(76),
+                "1-5 mode | h help | m sort | r refresh | q quit",
+            )
         for total in range(6, 24):
             system_height, power_height = porkyhud.compact_top_heights(total)
             self.assertEqual(system_height + power_height, total)
@@ -4561,6 +5163,15 @@ class LayoutAndRenderingTests(unittest.TestCase):
             )
         rendered = "\n".join(settled.row(row) for row in range(40))
         self.assertIn("sensors: SMC online / power locked", rendered)
+        self.assertIn("u             unlock advanced macOS sensors", rendered)
+
+        unlocked = FakeScreen(40, 120)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_help_overlay(unlocked, config, settled_sensor())
+        unlocked_text = unlocked.text()
+        self.assertNotIn("u             unlock advanced macOS sensors", unlocked_text)
+        self.assertIn("6  Cinema", unlocked_text)
 
     def test_gpu_panel_uses_truthful_static_topology_and_prioritizes_availability(self) -> None:
         screen = FakeScreen(8, 60)
@@ -5023,12 +5634,32 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.assertTrue(all(row.gpu is None for row in porkyhud.merge_gpu_process_rows(rows, failed, 11.2)))
         self.assertEqual([row.pid for row in porkyhud.sort_process_rows(rows, "GPU")], [3, 2, 1])
 
-    def test_renderer_and_text_snapshot_show_unknown_gpu_as_dashes(self) -> None:
-        screen = FakeScreen(10, 70)
-        rows = [porkyhud.ProcessRow(1, 2.0, 3.0, None, "S", "00:01", "/bin/task")]
+    def test_renderer_suppresses_unavailable_gpu_but_preserves_measured_zero(self) -> None:
+        unknown = FakeScreen(10, 70)
+        unknown_rows = [
+            porkyhud.ProcessRow(1, 2.0, 3.0, None, "S", "00:01", "/bin/task"),
+        ]
         with mock.patch.object(porkyhud, "color_pair", return_value=0):
-            porkyhud.draw_process_panel(screen, 1, 1, 8, 64, rows, 0, "GPU")
-        self.assertIn("--", "\n".join(screen.row(index) for index in range(1, 9)))
+            porkyhud.draw_process_panel(unknown, 1, 1, 8, 64, unknown_rows, 0, "GPU")
+        unknown_text = "\n".join(unknown.row(index) for index in range(1, 9))
+        self.assertNotIn("GPU", unknown.row(2))
+        self.assertNotIn("--", unknown.row(4))
+
+        mixed = FakeScreen(12, 80)
+        mixed_rows = [
+            porkyhud.ProcessRow(1, 2.0, 3.0, None, "S", "00:01", "/bin/unknown"),
+            porkyhud.ProcessRow(2, 2.0, 3.0, 0.0, "S", "00:01", "/bin/zero"),
+            porkyhud.ProcessRow(3, 2.0, 3.0, 12.5, "S", "00:01", "/bin/measured"),
+        ]
+        with mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_process_panel(mixed, 1, 1, 10, 74, mixed_rows, 0, "GPU")
+        mixed_text = "\n".join(mixed.row(index) for index in range(1, 11))
+        self.assertIn("GPU%", mixed_text)
+        self.assertNotIn("GPU%%", mixed_text)
+        self.assertIn("--", mixed_text)
+        self.assertIn("0.0", mixed_text)
+        self.assertIn("12.5", mixed_text)
+
         snapshot = {"system": {}, "cpu": {"average_percent": 0.0, "cores": []},
                     "memory": {"used_bytes": 0, "total_bytes": 0, "used_percent": 0.0},
                     "sensors": {}, "disk": {"activity": {"bytes_per_sec": 0, "iops": 0}},

@@ -101,7 +101,12 @@ RETRY_LAUNCH_RESERVE = 12
 VERSION = "0.1.2"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
-LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "compact", "cinema"]
+LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "cinema"]
+OPERATIONAL_MODES = ("balanced", "compute", "thermals", "io", "processes")
+DIRECT_MODE_KEYS = {
+    "1": "balanced", "2": "compute", "3": "thermals",
+    "4": "io", "5": "processes", "6": "cinema",
+}
 DARK_BG_RGB = "#05070d"
 DARK_FG_RGB = "#e6f7ff"
 DARK_CURSOR_RGB = "#5df2ff"
@@ -140,14 +145,24 @@ COMMAND_TERMINATE_GRACE_SECONDS = 0.2
 COMMAND_CLEANUP_SECONDS = 1.0
 COMMAND_CLEANUP_RETRY_SECONDS = 0.01
 T = TypeVar("T")
-PRIMARY = 1
-INFO = 2
-NOMINAL = 3
-WATCH = 4
-CRITICAL = 5
-STRUCTURE = 6
-SECONDARY = 7
-BRAND = 8
+PAIR_PRIMARY = 1
+PAIR_INFO = 2
+PAIR_NOMINAL = 3
+PAIR_WATCH = 4
+PAIR_CRITICAL = 5
+PAIR_STRUCTURE = 6
+PAIR_SECONDARY = 7
+PAIR_BRAND = 8
+# Compatibility aliases for the existing public module surface. New rendering
+# code uses the semantic PAIR_* names exclusively.
+PRIMARY = PAIR_PRIMARY
+INFO = PAIR_INFO
+NOMINAL = PAIR_NOMINAL
+WATCH = PAIR_WATCH
+CRITICAL = PAIR_CRITICAL
+STRUCTURE = PAIR_STRUCTURE
+SECONDARY = PAIR_SECONDARY
+BRAND = PAIR_BRAND
 THEMES: list[dict[str, Any]] = [
     {
         "name": "Neon Grid",
@@ -160,8 +175,6 @@ THEMES: list[dict[str, Any]] = [
             6: 39,
             7: 45,
             8: 201,
-            9: 171,
-            10: 214,
         },
     },
     {
@@ -175,8 +188,6 @@ THEMES: list[dict[str, Any]] = [
             6: 111,
             7: 153,
             8: 183,
-            9: 147,
-            10: 215,
         },
     },
     {
@@ -190,8 +201,6 @@ THEMES: list[dict[str, Any]] = [
             6: 33,
             7: 87,
             8: 165,
-            9: 165,
-            10: 220,
         },
     },
     {
@@ -205,8 +214,6 @@ THEMES: list[dict[str, Any]] = [
             6: 245,
             7: 250,
             8: 183,
-            9: 183,
-            10: 216,
         },
     },
 ]
@@ -215,7 +222,7 @@ THEMES: list[dict[str, Any]] = [
 @dataclass
 class HudConfig:
     theme_index: int = 0
-    animation_mode: int = 1
+    animation_mode: int = 0
     layout_index: int = 0
     show_help: bool = False
     message: str = ""
@@ -228,6 +235,72 @@ class HudConfig:
     @property
     def layout_name(self) -> str:
         return LAYOUTS[self.layout_index % len(LAYOUTS)]
+
+
+def _validate_viewport(height: int, width: int) -> tuple[int, int]:
+    if (type(height) is not int or type(width) is not int
+            or height < 0 or width < 0):
+        raise ValueError("viewport dimensions must be nonnegative integers")
+    return height, width
+
+
+def supported_modes(height: int, width: int) -> Tuple[str, ...]:
+    """Return modes selectable in one viewport, preserving direct-key order."""
+
+    height, width = _validate_viewport(height, width)
+    return tuple(LAYOUTS) if height >= 34 and width >= 118 else OPERATIONAL_MODES
+
+
+def _mode_copy_name(mode: str) -> str:
+    try:
+        return {
+            "balanced": "Overview", "compute": "Compute",
+            "thermals": "Thermals", "io": "I/O",
+            "processes": "Processes", "cinema": "Cinema",
+        }[mode]
+    except (KeyError, TypeError):
+        raise ValueError("unknown display mode")
+
+
+def select_mode(config: HudConfig, mode: str, height: int, width: int) -> str:
+    """Select a supported mode without mutating state on rejection."""
+
+    height, width = _validate_viewport(height, width)
+    if not isinstance(config, HudConfig):
+        raise ValueError("config must be a HudConfig")
+    if mode not in LAYOUTS:
+        raise ValueError("unknown display mode")
+    if mode == "cinema" and mode not in supported_modes(height, width):
+        return "Cinema requires 118×34 · staying in %s" % _mode_copy_name(
+            config.layout_name,
+        )
+    config.layout_index = LAYOUTS.index(mode)
+    return "%s selected" % _mode_copy_name(mode)
+
+
+def cycle_mode(config: HudConfig, height: int, width: int) -> str:
+    """Select the next mode supported by the current viewport."""
+
+    modes = supported_modes(height, width)
+    if not isinstance(config, HudConfig):
+        raise ValueError("config must be a HudConfig")
+    current = config.layout_name
+    next_index = 0 if current not in modes else (modes.index(current) + 1) % len(modes)
+    return select_mode(config, modes[next_index], height, width)
+
+
+def normalize_mode_for_viewport(
+    config: HudConfig, height: int, width: int,
+) -> str:
+    """Return unsupported Cinema to Overview exactly once after a resize."""
+
+    height, width = _validate_viewport(height, width)
+    if not isinstance(config, HudConfig):
+        raise ValueError("config must be a HudConfig")
+    if config.layout_name == "cinema" and "cinema" not in supported_modes(height, width):
+        config.layout_index = LAYOUTS.index("balanced")
+        return "Cinema requires 118×34 · returned to Overview"
+    return ""
 
 
 @dataclass
@@ -2310,7 +2383,7 @@ def apply_dark_screen(screen: curses.window) -> None:
     if os.environ.get("NO_COLOR") is not None:
         return
     try:
-        screen.bkgd(" ", color_pair(1))
+        screen.bkgd(" ", color_pair(PAIR_PRIMARY))
     except (curses.error, ValueError):
         pass
 
@@ -4952,11 +5025,9 @@ def process_rows(sort_mode: str) -> list[ProcessRow]:
 
 
 def color_for_percent(percent: float) -> int:
-    if percent >= 85:
-        return color_pair(4) | curses.A_BOLD
     if percent >= 60:
-        return color_pair(3) | curses.A_BOLD
-    return color_pair(2)
+        return color_pair(PAIR_INFO) | curses.A_BOLD
+    return color_pair(PAIR_INFO)
 
 
 def safe_add(screen: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -4970,6 +5041,18 @@ def safe_add(screen: curses.window, y: int, x: int, text: str, attr: int = 0) ->
         pass
 
 
+def _rect_add(
+    screen: curses.window, y: int, x: int, text: str, width: int,
+    attr: int = 0,
+) -> None:
+    """Project and cell-truncate one write to its owning rectangle."""
+
+    if width <= 0:
+        return
+    projected = semantic_text(str(text), unicode_ok())
+    safe_add(screen, y, x, truncate_display_cells(projected, width), attr)
+
+
 def draw_box(screen: curses.window, y: int, x: int, h: int, w: int, title: str, attr: int) -> None:
     if h < 3 or w < 8:
         return
@@ -4979,13 +5062,13 @@ def draw_box(screen: curses.window, y: int, x: int, h: int, w: int, title: str, 
         tl, tr, bl, br, hz, vt = "+", "+", "+", "+", "-", "|"
     top = tl + hz * (w - 2) + tr
     bottom = bl + hz * (w - 2) + br
-    safe_add(screen, y, x, top, attr)
+    _rect_add(screen, y, x, top, w, attr)
     for row in range(1, h - 1):
-        safe_add(screen, y + row, x, vt, attr)
-        safe_add(screen, y + row, x + w - 1, vt, attr)
-    safe_add(screen, y + h - 1, x, bottom, attr)
+        _rect_add(screen, y + row, x, vt, 1, attr)
+        _rect_add(screen, y + row, x + w - 1, vt, 1, attr)
+    _rect_add(screen, y + h - 1, x, bottom, w, attr)
     label = f" {title} "
-    safe_add(screen, y, x + 2, label[: max(0, w - 4)], attr | curses.A_BOLD)
+    _rect_add(screen, y, x + 2, label, w - 4, attr | curses.A_BOLD)
 
 
 def fill_rect(screen: curses.window, y: int, x: int, h: int, w: int, attr: int = 0) -> None:
@@ -5107,12 +5190,10 @@ def flow_text(phase: int, charging: bool, external: bool) -> str:
 
 def temp_attr(value: float | None) -> int:
     if value is None:
-        return color_pair(3)
-    if value >= 85:
-        return color_pair(4) | curses.A_BOLD
+        return color_pair(PAIR_SECONDARY)
     if value >= 65:
-        return color_pair(3) | curses.A_BOLD
-    return color_pair(2)
+        return color_pair(PAIR_INFO) | curses.A_BOLD
+    return color_pair(PAIR_INFO)
 
 
 def fan_percent(fan: FanReading) -> float:
@@ -5125,11 +5206,9 @@ def fan_percent(fan: FanReading) -> float:
 
 def fan_attr(fan: FanReading) -> int:
     pct = fan_percent(fan)
-    if pct >= 85:
-        return color_pair(4) | curses.A_BOLD
     if pct >= 55:
-        return color_pair(3) | curses.A_BOLD
-    return color_pair(2)
+        return color_pair(PAIR_INFO) | curses.A_BOLD
+    return color_pair(PAIR_INFO)
 
 
 def temperature_group_rows(readings: list[TempReading]) -> list[tuple[str, float, float, int]]:
@@ -5515,24 +5594,24 @@ def _ribbon_role(
             SourceViewStatus.NOT_EXPOSED,
             SourceViewStatus.UNSUPPORTED,
         ):
-            return SECONDARY
-        return PRIMARY
+            return PAIR_SECONDARY
+        return PAIR_PRIMARY
     if source_id is SourceId.MEMORY_PRESSURE and frame.memory_pressure is not None:
         if frame.memory_pressure.level is MemoryPressureLevel.CRITICAL:
-            return CRITICAL
+            return PAIR_CRITICAL
         if frame.memory_pressure.level is MemoryPressureLevel.WARN:
-            return WATCH
+            return PAIR_WATCH
     if (source_id is SourceId.THERMAL_OS and frame.thermal is not None
             and (frame.thermal.thermal_warning_level
                  or frame.thermal.performance_warning_level)):
-        return WATCH
+        return PAIR_WATCH
     if (source_id is SourceId.CPU_USAGE
             and RuleId.CPU_WATCH in frame.assessment.active_rules):
-        return WATCH
+        return PAIR_WATCH
     if (source_id is SourceId.DISK_CAPACITY
             and RuleId.STORAGE_WATCH in frame.assessment.active_rules):
-        return WATCH
-    return NOMINAL
+        return PAIR_WATCH
+    return PAIR_NOMINAL
 
 
 def _evidence_ribbon_projection(
@@ -5602,13 +5681,13 @@ def read_attr(level: str) -> int:
     """Map a semantic conclusion to the same color role in every theme."""
 
     if level in ("normal", "good", "nominal"):
-        pair = NOMINAL
+        pair = PAIR_NOMINAL
     elif level == "watch":
-        pair = WATCH
+        pair = PAIR_WATCH
     elif level in ("critical", "hot"):
-        pair = CRITICAL
+        pair = PAIR_CRITICAL
     elif level in ("unknown", "checking", "incomplete", "delayed"):
-        pair = PRIMARY
+        pair = PAIR_PRIMARY
     else:
         raise ValueError("unknown semantic level")
     return color_pair(pair) | curses.A_BOLD
@@ -5809,32 +5888,32 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
         ]
         mascot_lines = pig_mascot_lines(phase)
         for idx, line in enumerate(title_lines):
-            attr = color_pair(2) | curses.A_BOLD if idx in (0, 2) else color_pair(1)
+            attr = color_pair(PAIR_INFO) | curses.A_BOLD if idx in (0, 2) else color_pair(PAIR_PRIMARY)
             safe_add(screen, idx, 2, line, attr)
         pig_x = min(max(58, len(title_lines[0]) + 8), max(2, width - 54))
         for idx, line in enumerate(mascot_lines):
-            attr = color_pair(3) | curses.A_BOLD if idx in (2, 3) else color_pair(7)
+            attr = color_pair(PAIR_BRAND) | curses.A_BOLD if idx in (2, 3) else color_pair(PAIR_SECONDARY)
             safe_add(screen, idx, pig_x, line, attr)
         rig = f"{static.get('chip', 'Mac')} / {static.get('model', '')}".strip()
-        safe_add(screen, 3, max(58, width - len(rig) - 3), rig[: max(0, width - 62)], color_pair(1))
+        safe_add(screen, 3, max(58, width - len(rig) - 3), rig[: max(0, width - 62)], color_pair(PAIR_PRIMARY))
         meta = f"{COPYRIGHT_TEXT}  |  {config.theme_name} / {config.layout_name}"
-        safe_add(screen, 5, max(58, width - len(meta) - 3), meta, color_pair(7) | curses.A_BOLD)
+        safe_add(screen, 5, max(58, width - len(meta) - 3), meta, color_pair(PAIR_SECONDARY) | curses.A_BOLD)
         divider = list("-" * (width - 2))
         head = (phase * 3) % max(1, width - 2)
         for offset, char in enumerate("<*>"):
             idx = head + offset
             if 0 <= idx < len(divider):
                 divider[idx] = char
-        safe_add(screen, 6, 1, "".join(divider), color_pair(5))
+        safe_add(screen, 6, 1, "".join(divider), color_pair(PAIR_STRUCTURE))
         return 7
 
     title = " P O R K Y H U D "
-    safe_add(screen, 0, 1, title, color_pair(2) | curses.A_BOLD)
+    safe_add(screen, 0, 1, title, color_pair(PAIR_INFO) | curses.A_BOLD)
     meta = f"{COPYRIGHT_TEXT} | {config.theme_name} / {config.layout_name}"
-    safe_add(screen, 1, max(1, width - len(meta) - 2), meta[: max(0, width - 3)], color_pair(7))
+    safe_add(screen, 1, max(1, width - len(meta) - 2), meta[: max(0, width - 3)], color_pair(PAIR_SECONDARY))
     divider = list("-" * (width - 2))
     divider[(phase * 2) % max(1, width - 2)] = "*"
-    safe_add(screen, 2, 1, "".join(divider), color_pair(5))
+    safe_add(screen, 2, 1, "".join(divider), color_pair(PAIR_STRUCTURE))
     return 3
 
 
@@ -5849,7 +5928,7 @@ def draw_cpu_panel(
     history: MetricHistory,
     phase: int,
 ) -> None:
-    draw_box(screen, y, x, h, w, "CPU WORKER CORES", color_pair(5))
+    draw_box(screen, y, x, h, w, "CPU WORKER CORES", color_pair(PAIR_STRUCTURE))
     if h < 5:
         return
     display_core, labels = display_core_usage(per_core, static)
@@ -5857,15 +5936,22 @@ def draw_cpu_panel(
     logical = static.get("logical_cpu") or str(len(display_core) or "?")
     physical = static.get("physical_cpu") or "?"
     core_line = static.get("cpu_cores") or f"{physical} physical / {logical} logical"
-    safe_add(screen, y + 1, x + 2, f"{static.get('chip', 'CPU')}"[: w - 4], color_pair(1) | curses.A_BOLD)
-    safe_add(screen, y + 2, x + 2, f"cores: {core_line}"[: w - 4], color_pair(1))
-    safe_add(screen, y + 3, x + 2, pulse_bar(total, max(8, w - 18), phase, "total "), color_for_percent(total))
-    safe_add(screen, y + 4, x + 2, f"60s  {sparkline(history.cpu, max(8, w - 10), 100.0)}"[: w - 4], color_pair(6))
+    _rect_add(screen, y + 1, x + 2, f"{static.get('chip', 'CPU')}", w - 4,
+              color_pair(PAIR_PRIMARY) | curses.A_BOLD)
+    _rect_add(screen, y + 2, x + 2, f"cores: {core_line}", w - 4,
+              color_pair(PAIR_PRIMARY))
+    _rect_add(screen, y + 3, x + 2,
+              pulse_bar(total, max(8, w - 18), phase, "total "), w - 4,
+              color_for_percent(total))
+    _rect_add(screen, y + 4, x + 2,
+              f"60s  {sparkline(history.cpu, max(8, w - 10), 100.0)}",
+              w - 4, color_pair(PAIR_STRUCTURE))
 
     lanes_start = y + 6
     lanes_available = max(0, h - 8)
     if not display_core or lanes_available <= 0:
-        safe_add(screen, y + 6, x + 2, "per-core stream unavailable", color_pair(3))
+        _rect_add(screen, y + 6, x + 2, "per-core stream unavailable", w - 4,
+                  color_pair(PAIR_SECONDARY))
         return
 
     groups = cpu_groups(static, len(display_core))
@@ -5879,7 +5965,8 @@ def draw_cpu_panel(
             hidden += group["count"]
             continue
         label = f"{group['code']} cluster {group['count']}c"
-        safe_add(screen, row_y, x + 2, label[: w - 4], color_pair(7) | curses.A_BOLD)
+        _rect_add(screen, row_y, x + 2, label, w - 4,
+                  color_pair(PAIR_SECONDARY) | curses.A_BOLD)
         row_y += 1
         for offset in range(group["count"]):
             core_index = group["start"] + offset
@@ -5892,10 +5979,17 @@ def draw_cpu_panel(
             cx = x + 2 + column * col_width
             pct = display_core[core_index]
             core_label = labels[core_index] if core_index < len(labels) else f"{group['code']}{offset:02d}"
-            safe_add(screen, cy, cx, cpu_lane_text(core_label, core_index, pct, max(1, col_width - 1), phase), color_for_percent(pct))
+            _rect_add(
+                screen, cy, cx,
+                cpu_lane_text(
+                    core_label, core_index, pct, max(1, col_width - 1), phase,
+                ),
+                max(1, col_width - 1), color_for_percent(pct),
+            )
         row_y += (group["count"] + columns - 1) // columns
     if hidden:
-        safe_add(screen, y + h - 2, x + 2, f"+{hidden} workers hidden", color_pair(1))
+        _rect_add(screen, y + h - 2, x + 2, f"+{hidden} workers hidden",
+                  w - 4, color_pair(PAIR_PRIMARY))
 
 
 def draw_system_panel(
@@ -5909,7 +6003,7 @@ def draw_system_panel(
     uptime_seconds: int,
     load_average: tuple[float, float, float],
 ) -> None:
-    draw_box(screen, y, x, h, w, "SYSTEM", color_pair(5))
+    draw_box(screen, y, x, h, w, "SYSTEM", color_pair(PAIR_STRUCTURE))
     lines = [
         f"node: {static.get('host', 'localhost')}",
         f"rig:  {static.get('model', 'Mac')} {static.get('model_id', '')}".strip(),
@@ -5920,10 +6014,10 @@ def draw_system_panel(
         battery_summary(battery),
     ]
     for index, line in enumerate(lines[: h - 2], start=1):
-        attr = color_pair(1)
+        attr = color_pair(PAIR_PRIMARY)
         if index == 1:
             attr |= curses.A_BOLD
-        safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+        _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
 def draw_memory_panel(
@@ -5936,7 +6030,7 @@ def draw_memory_panel(
     history: MetricHistory,
     phase: int = 0,
 ) -> None:
-    draw_box(screen, y, x, h, w, "MEMORY", color_pair(5))
+    draw_box(screen, y, x, h, w, "MEMORY", color_pair(PAIR_STRUCTURE))
     total = mem.get("total", 0.0) or 1.0
     used = mem.get("used", 0.0)
     available = mem.get("available", 0.0)
@@ -5948,16 +6042,16 @@ def draw_memory_panel(
     swap_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
     lines = [
         (pulse_bar(used_pct, max(8, w - 18), phase, "ram  "), color_for_percent(used_pct)),
-        (f"60s  {sparkline(history.ram, max(8, w - 10), 100.0)}", color_pair(6)),
-        (f"used {human_bytes(used)} / {human_bytes(total)}  avail {human_bytes(available)}", color_pair(1)),
-        (f"app {human_bytes(app)}  wired {human_bytes(mem.get('wired', 0.0))}", color_pair(1)),
-        (f"cache {human_bytes(cached)}  comp {human_bytes(mem.get('compressed', 0.0))}", color_pair(1)),
+        (f"60s  {sparkline(history.ram, max(8, w - 10), 100.0)}", color_pair(PAIR_STRUCTURE)),
+        (f"used {human_bytes(used)} / {human_bytes(total)}  avail {human_bytes(available)}", color_pair(PAIR_PRIMARY)),
+        (f"app {human_bytes(app)}  wired {human_bytes(mem.get('wired', 0.0))}", color_pair(PAIR_PRIMARY)),
+        (f"cache {human_bytes(cached)}  comp {human_bytes(mem.get('compressed', 0.0))}", color_pair(PAIR_PRIMARY)),
         (pulse_bar(swap_pct, max(8, w - 18), phase + 4, "swap "), color_for_percent(swap_pct)),
     ]
     if h > 8:
-        lines.append((f"swap {human_bytes(swap_used)} / {human_bytes(swap_total)}", color_pair(1)))
+        lines.append((f"swap {human_bytes(swap_used)} / {human_bytes(swap_total)}", color_pair(PAIR_PRIMARY)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
-        safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+        _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
 def draw_battery_panel(
@@ -5969,22 +6063,20 @@ def draw_battery_panel(
     battery: BatteryInfo,
     phase: int,
 ) -> None:
-    draw_box(screen, y, x, h, w, "POWER CELL", color_pair(5))
+    draw_box(screen, y, x, h, w, "POWER CELL", color_pair(PAIR_STRUCTURE))
     if not battery.present:
         desktop_lines = [
-            ("desktop power", color_pair(2) | curses.A_BOLD),
-            (f"source: {battery.source}", color_pair(1)),
-            ("internal battery: not present", color_pair(1)),
+            ("desktop power", color_pair(PAIR_INFO) | curses.A_BOLD),
+            (f"source: {battery.source}", color_pair(PAIR_PRIMARY)),
+            ("internal battery: not present", color_pair(PAIR_PRIMARY)),
         ]
         for index, (line, line_attr) in enumerate(desktop_lines[: h - 2], start=1):
-            safe_add(screen, y + index, x + 2, line[: w - 4], line_attr)
+            _rect_add(screen, y + index, x + 2, line, w - 4, line_attr)
         return
     pct = float(battery.percent if battery.percent is not None else 0)
-    attr = color_pair(2) | curses.A_BOLD
+    attr = color_pair(PAIR_INFO) | curses.A_BOLD
     if battery.percent is not None and battery.percent <= 30:
-        attr = color_pair(3) | curses.A_BOLD
-    if battery.percent is not None and battery.percent <= 20 and not battery.external_connected:
-        attr = color_pair(4) | curses.A_BOLD
+        attr = color_pair(PAIR_INFO) | curses.A_BOLD
 
     state = "charging" if battery.is_charging else battery.state
     if battery.external_connected and not battery.is_charging:
@@ -5999,12 +6091,12 @@ def draw_battery_panel(
 
     lines: list[tuple[str, int]] = [
         (pulse_bar(pct, max(8, w - 18), phase, "cell "), attr),
-        (f"state {flow_text(phase, battery.is_charging, battery.external_connected)} {state}", color_pair(6) | curses.A_BOLD),
-        (f"source: {battery.source}", color_pair(1)),
-        (f"charger: {charger_label}".strip(), color_pair(1)),
+        (f"state {flow_text(phase, battery.is_charging, battery.external_connected)} {state}", color_pair(PAIR_STRUCTURE) | curses.A_BOLD),
+        (f"source: {battery.source}", color_pair(PAIR_PRIMARY)),
+        (f"charger: {charger_label}".strip(), color_pair(PAIR_PRIMARY)),
         (
             f"cycles: {format_optional_int(battery.cycle_count)} / {format_optional_int(battery.design_cycles)}",
-            color_pair(1),
+            color_pair(PAIR_PRIMARY),
         ),
         (
             f"health: {format_optional_int(battery.health_percent, '%')}  temp: {format_temp(battery.temp_c)}",
@@ -6012,9 +6104,9 @@ def draw_battery_panel(
         ),
     ]
     if battery.voltage_v is not None and battery.amperage_a is not None:
-        lines.append((f"pack: {battery.voltage_v:4.2f}V  {battery.amperage_a:5.2f}A", color_pair(1)))
+        lines.append((f"pack: {battery.voltage_v:4.2f}V  {battery.amperage_a:5.2f}A", color_pair(PAIR_PRIMARY)))
     for index, (line, line_attr) in enumerate(lines[: h - 2], start=1):
-        safe_add(screen, y + index, x + 2, line[: w - 4], line_attr)
+        _rect_add(screen, y + index, x + 2, line, w - 4, line_attr)
 
 
 def draw_thermal_panel(
@@ -6026,16 +6118,35 @@ def draw_thermal_panel(
     battery: BatteryInfo,
     sensor: SensorInfo,
     phase: int,
+    os_thermal: Optional[OsThermalState] = None,
 ) -> None:
-    draw_box(screen, y, x, h, w, "THERMAL", color_pair(5))
+    draw_box(screen, y, x, h, w, "THERMAL", color_pair(PAIR_STRUCTURE))
+
+    def os_status_line(label: str, value: Optional[int]) -> tuple[str, int]:
+        if value is None:
+            return (f"OS {label}: UNAVAILABLE", color_pair(PAIR_SECONDARY))
+        if value == 0:
+            return (f"OS {label}: CLEAR", read_attr("nominal"))
+        return (f"OS {label}: WARN {value}", read_attr("watch"))
+
     def status_line(label: str, value: str) -> tuple[str, int]:
         if value in ("checking", "pending"):
-            return (f"{label}: checking...", color_pair(1))
+            return (f"optional {label}: checking...", color_pair(PAIR_PRIMARY))
         if value == "nominal":
-            return (f"{label}: {value}", color_pair(2) | curses.A_BOLD)
-        return (f"{label}: {value}", color_pair(3) | curses.A_BOLD)
+            return (f"optional {label}: {value}",
+                    color_pair(PAIR_INFO) | curses.A_BOLD)
+        return (f"optional {label}: {value}",
+                color_pair(PAIR_PRIMARY) | curses.A_BOLD)
 
     lines: list[tuple[str, int]] = [
+        os_status_line(
+            "thermal",
+            None if os_thermal is None else os_thermal.thermal_warning_level,
+        ),
+        os_status_line(
+            "performance",
+            None if os_thermal is None else os_thermal.performance_warning_level,
+        ),
         status_line("pressure", sensor.thermal_warning),
         status_line("performance", sensor.performance_warning),
     ]
@@ -6047,7 +6158,7 @@ def draw_thermal_panel(
             ]
         )
     else:
-        lines.append(("battery: not installed", color_pair(1)))
+        lines.append(("battery: not installed", color_pair(PAIR_PRIMARY)))
     exposed_count = 0
     if sensor.cpu_temp_c is not None:
         lines.append((f"processor temp: {format_temp(sensor.cpu_temp_c)}", temp_attr(sensor.cpu_temp_c)))
@@ -6057,35 +6168,38 @@ def draw_thermal_panel(
         exposed_count += 1
     if sensor.fan_rpm is not None:
         fan_prefix = f"{sensor.fan_count} fans" if sensor.fan_count > 1 else "fan"
-        lines.append((f"{fan_prefix}: {fan_text(sensor)}", color_pair(2)))
+        lines.append((f"{fan_prefix}: {fan_text(sensor)}", color_pair(PAIR_INFO)))
         exposed_count += 1
     if sensor.privileged_locked:
         if sensor.thermal_warning in ("checking", "pending"):
-            lines.append(("advanced: checking sensor access", color_pair(1)))
+            lines.append(("advanced: checking sensor access", color_pair(PAIR_PRIMARY)))
         else:
             locked_text = "power sampler: press u" if exposed_count else "advanced: press u to unlock"
-            lines.append((locked_text, color_pair(3) | curses.A_BOLD))
+            lines.append((locked_text, color_pair(PAIR_PRIMARY) | curses.A_BOLD))
     else:
         if sensor.cpu_power_w is not None:
-            lines.append((f"cpu power: {format_watts(sensor.cpu_power_w)}", color_pair(1)))
+            lines.append((f"cpu power: {format_watts(sensor.cpu_power_w)}", color_pair(PAIR_PRIMARY)))
             exposed_count += 1
         if sensor.gpu_power_w is not None:
-            lines.append((f"gpu power: {format_watts(sensor.gpu_power_w)}", color_pair(1)))
+            lines.append((f"gpu power: {format_watts(sensor.gpu_power_w)}", color_pair(PAIR_PRIMARY)))
             exposed_count += 1
         if sensor.ane_power_w is not None:
-            lines.append((f"ane power: {format_watts(sensor.ane_power_w)}", color_pair(9)))
+            lines.append((f"ane power: {format_watts(sensor.ane_power_w)}",
+                          color_pair(PAIR_INFO)))
             exposed_count += 1
         if sensor.dram_power_w is not None:
             bw = ""
             if sensor.dram_read_gbs is not None or sensor.dram_write_gbs is not None:
                 bw = f"  bw {(sensor.dram_read_gbs or 0) + (sensor.dram_write_gbs or 0):.1f}GB/s"
-            lines.append((f"dram power: {format_watts(sensor.dram_power_w)}{bw}", color_pair(10)))
+            lines.append((f"dram power: {format_watts(sensor.dram_power_w)}{bw}",
+                          color_pair(PAIR_INFO)))
             exposed_count += 1
         if sensor.package_power_w is not None:
-            lines.append((f"package: {format_watts(sensor.package_power_w)}", color_pair(6) | curses.A_BOLD))
+            lines.append((f"package: {format_watts(sensor.package_power_w)}", color_pair(PAIR_STRUCTURE) | curses.A_BOLD))
             exposed_count += 1
         if exposed_count == 0:
-            lines.append(("advanced: no extra sensors exposed", color_pair(3)))
+            lines.append(("advanced: no extra sensors exposed",
+                          color_pair(PAIR_SECONDARY)))
     cluster_bits = []
     for code, active, freq in (
         ("E", sensor.e_cluster_active, sensor.e_cluster_freq_mhz),
@@ -6097,11 +6211,11 @@ def draw_thermal_panel(
             freq_text = "--" if freq is None else f"{freq}MHz"
             cluster_bits.append(f"{code} {active_text}/{freq_text}")
     if cluster_bits:
-        lines.append(("clusters: " + "  ".join(cluster_bits), color_pair(2)))
+        lines.append(("clusters: " + "  ".join(cluster_bits), color_pair(PAIR_INFO)))
     if h > 10:
-        lines.append((f"sensor bus: {comet(max(8, w - 18), phase, 0.85)}", color_pair(2)))
+        lines.append((f"sensor bus: {comet(max(8, w - 18), phase, 0.85)}", color_pair(PAIR_INFO)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
-        safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+        _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
 def draw_sensors_panel(
@@ -6114,7 +6228,7 @@ def draw_sensors_panel(
     sensor: SensorInfo,
     phase: int,
 ) -> None:
-    draw_box(screen, y, x, h, w, "FANS + TEMP SENSORS", color_pair(5))
+    draw_box(screen, y, x, h, w, "FANS + TEMP SENSORS", color_pair(PAIR_STRUCTURE))
     if h < 5:
         return
 
@@ -6122,15 +6236,17 @@ def draw_sensors_panel(
     source = sensor.raw_hint.replace("smc", "SMC")
     if sensor.privileged_locked and sensor.raw_hint.startswith("smc"):
         source = "SMC online / power locked"
-    source_attr = color_pair(6) | curses.A_BOLD
+    source_attr = color_pair(PAIR_STRUCTURE) | curses.A_BOLD
     if sensor.sensor_sample_age_s > SENSOR_REFRESH_SECONDS * 2:
         source = f"{source} · stale {sensor.sensor_sample_age_s:.0f}s"
-        source_attr = color_pair(3) | curses.A_BOLD
-    safe_add(screen, line_y, x + 2, source[: w - 4], source_attr)
+        source_attr = color_pair(PAIR_PRIMARY) | curses.A_BOLD
+    _rect_add(screen, line_y, x + 2, source, w - 4, source_attr)
     line_y += 1
 
     if sensor.fans:
-        safe_add(screen, line_y, x + 2, f"fan array: {sensor.fan_count} active", color_pair(2) | curses.A_BOLD)
+        _rect_add(screen, line_y, x + 2,
+                  f"fan array: {sensor.fan_count} active", w - 4,
+                  color_pair(PAIR_INFO) | curses.A_BOLD)
         line_y += 1
         fan_rows = min(len(sensor.fans), max(1, (h - 6) // 3 + 1))
         for index, fan in enumerate(sensor.fans[:fan_rows]):
@@ -6141,20 +6257,23 @@ def draw_sensors_panel(
             mode = f" {fan.mode}" if fan.mode else ""
             max_text = f"/{fan.maximum_rpm}" if fan.maximum_rpm else ""
             line = f"{fan.name:<7.7} {pulse_bar(pct, bar_width, phase + index, '')} {fan.rpm}{max_text}rpm{mode}"
-            safe_add(screen, line_y, x + 2, line[: w - 4], fan_attr(fan))
+            _rect_add(screen, line_y, x + 2, line, w - 4, fan_attr(fan))
             line_y += 1
             if line_y < y + h - 1 and (fan.minimum_rpm or fan.target_rpm or fan.maximum_rpm):
                 bounds = f"min {format_optional_int(fan.minimum_rpm)}  target {format_optional_int(fan.target_rpm)}  max {format_optional_int(fan.maximum_rpm)}"
-                safe_add(screen, line_y, x + 4, bounds[: w - 6], color_pair(7))
+                _rect_add(screen, line_y, x + 4, bounds, w - 6,
+                          color_pair(PAIR_SECONDARY))
                 line_y += 1
     else:
         if sensor.thermal_warning in ("checking", "pending"):
             text = "fans: checking sensor bus..."
-            attr = color_pair(1)
+            attr = color_pair(PAIR_PRIMARY)
         else:
             text = "fans: press u or SMC unavailable" if sensor.privileged_locked else "fans: none exposed"
-            attr = color_pair(3)
-        safe_add(screen, line_y, x + 2, text[: w - 4], attr)
+            attr = color_pair(
+                PAIR_PRIMARY if sensor.privileged_locked else PAIR_SECONDARY
+            )
+        _rect_add(screen, line_y, x + 2, text, w - 4, attr)
         line_y += 1
 
     quick_temps = [
@@ -6166,18 +6285,23 @@ def draw_sensors_panel(
         if line_y >= y + h - 1 or value is None:
             continue
         width_for_bar = max(6, w - 20)
-        safe_add(screen, line_y, x + 2, pulse_bar(clamp(value), width_for_bar, phase, f"{label:<3} ")[: w - 4], temp_attr(value))
+        _rect_add(
+            screen, line_y, x + 2,
+            pulse_bar(clamp(value), width_for_bar, phase, f"{label:<3} "),
+            w - 4, temp_attr(value),
+        )
         line_y += 1
 
     rows = temperature_group_rows(sensor.temp_sensors)
     if rows and line_y < y + h - 1:
-        safe_add(screen, line_y, x + 2, "hottest groups", color_pair(6) | curses.A_BOLD)
+        _rect_add(screen, line_y, x + 2, "hottest groups", w - 4,
+                  color_pair(PAIR_STRUCTURE) | curses.A_BOLD)
         line_y += 1
     for label, average, hottest, count in rows:
         if line_y >= y + h - 1:
             break
         line = f"{label:<13.13} avg {average:4.1f}C  max {hottest:4.1f}C  n={count}"
-        safe_add(screen, line_y, x + 2, line[: w - 4], temp_attr(hottest))
+        _rect_add(screen, line_y, x + 2, line, w - 4, temp_attr(hottest))
         line_y += 1
 
     if line_y < y + h - 1:
@@ -6185,7 +6309,8 @@ def draw_sensors_panel(
             line = f"sensor sweep {comet(max(8, w - 16), phase + 5, 0.75)}"
         else:
             line = "temperature sensors: no detail exposed"
-        safe_add(screen, line_y, x + 2, line[: w - 4], color_pair(2))
+        _rect_add(screen, line_y, x + 2, line, w - 4,
+                  color_pair(PAIR_INFO))
 
 
 def draw_gpu_panel(
@@ -6198,11 +6323,14 @@ def draw_gpu_panel(
     sensor: SensorInfo,
     phase: int,
 ) -> None:
-    draw_box(screen, y, x, h, w, "GPU", color_pair(5))
+    draw_box(screen, y, x, h, w, "GPU", color_pair(PAIR_STRUCTURE))
     gpus = static.get("gpus") or []
     if not gpus:
-        safe_add(screen, y + 1, x + 2, "GPU scan unavailable", color_pair(3))
-        safe_add(screen, y + 2, x + 2, "try: system_profiler SPDisplaysDataType", color_pair(1))
+        _rect_add(screen, y + 1, x + 2, "GPU scan unavailable", w - 4,
+                  color_pair(PAIR_SECONDARY))
+        _rect_add(screen, y + 2, x + 2,
+                  "try: system_profiler SPDisplaysDataType", w - 4,
+                  color_pair(PAIR_PRIMARY))
         return
 
     line_y = y + 1
@@ -6212,7 +6340,8 @@ def draw_gpu_panel(
         name = gpu.get("name", "GPU")
         cores = gpu.get("cores", "") or str(static.get("gpu_core_count") or "")
         core_text = f" [{cores} GPU cores]" if cores else ""
-        safe_add(screen, line_y, x + 2, f"{name}{core_text}"[: w - 4], color_pair(2) | curses.A_BOLD)
+        _rect_add(screen, line_y, x + 2, f"{name}{core_text}", w - 4,
+                  color_pair(PAIR_INFO) | curses.A_BOLD)
         line_y += 1
         if line_y < y + h - 1:
             if sensor.gpu_active_percent is not None:
@@ -6229,15 +6358,16 @@ def draw_gpu_panel(
                     if w < 40
                     else "activity: press u for live telemetry"
                 )
-                activity_attr = color_pair(3)
+                activity_attr = color_pair(PAIR_PRIMARY)
             else:
                 activity_text = (
                     "GPU activity unavailable"
                     if w < 40
                     else "activity: not exposed by this Mac"
                 )
-                activity_attr = color_pair(7)
-            safe_add(screen, line_y, x + 2, activity_text[: w - 4], activity_attr)
+                activity_attr = color_pair(PAIR_SECONDARY)
+            _rect_add(screen, line_y, x + 2, activity_text, w - 4,
+                      activity_attr)
             line_y += 1
         if line_y < y + h - 1 and (sensor.gpu_temp_c is not None or sensor.gpu_power_w is not None or sensor.gpu_freq_mhz is not None):
             stats = []
@@ -6249,25 +6379,30 @@ def draw_gpu_panel(
                 stats.append(f"sram: {format_watts(sensor.gpu_sram_power_w)}")
             if sensor.gpu_freq_mhz is not None:
                 stats.append(f"freq: {sensor.gpu_freq_mhz}MHz")
-            safe_add(screen, line_y, x + 2, "  ".join(stats)[: w - 4], temp_attr(sensor.gpu_temp_c))
+            _rect_add(screen, line_y, x + 2, "  ".join(stats), w - 4,
+                      temp_attr(sensor.gpu_temp_c))
             line_y += 1
         peak = gpu.get("max_freq_mhz") or str(static.get("max_gpu_freq_mhz") or "")
         fp32 = static.get("gpu_fp32_tflops")
         if line_y < y + h - 1 and (peak or fp32):
             peak_text = f"peak {peak}MHz" if peak else "peak freq unknown"
             fp32_text = f"  {fp32:.1f} TFLOPS est" if isinstance(fp32, float) else ""
-            safe_add(screen, line_y, x + 2, f"{peak_text}{fp32_text}"[: w - 4], color_pair(8))
+            _rect_add(screen, line_y, x + 2, f"{peak_text}{fp32_text}",
+                      w - 4, color_pair(PAIR_BRAND))
             line_y += 1
         metal = gpu.get("metal", "")
         if metal and line_y < y + h - 1:
-            safe_add(screen, line_y, x + 2, f"metal: {metal}"[: w - 4], color_pair(1))
+            _rect_add(screen, line_y, x + 2, f"metal: {metal}", w - 4,
+                      color_pair(PAIR_PRIMARY))
             line_y += 1
         displays = gpu.get("displays", "")
         if displays and line_y < y + h - 1:
-            safe_add(screen, line_y, x + 2, f"driving: {displays}"[: w - 4], color_pair(1))
+            _rect_add(screen, line_y, x + 2, f"driving: {displays}", w - 4,
+                      color_pair(PAIR_PRIMARY))
             line_y += 1
         if gpu_index < len(gpus) - 1 and line_y < y + h - 1:
-            safe_add(screen, line_y, x + 2, "-" * min(w - 4, 28), color_pair(5))
+            _rect_add(screen, line_y, x + 2, "-" * min(w - 4, 28),
+                      w - 4, color_pair(PAIR_STRUCTURE))
             line_y += 1
 
 
@@ -6279,32 +6414,74 @@ def draw_io_panel(
     w: int,
     disk: DiskInfo,
     activity: DiskActivity,
-    net_down: float,
-    net_up: float,
+    net_down: Optional[float],
+    net_up: Optional[float],
     history: MetricHistory,
     phase: int = 0,
 ) -> None:
-    draw_box(screen, y, x, h, w, "I/O", color_pair(5))
+    draw_box(screen, y, x, h, w, "I/O", color_pair(PAIR_STRUCTURE))
     disk_pct = disk_percent(disk)
-    net_peak = max(history.net) if history.net else net_down + net_up
-    net_peak_text = f"pk {human_bytes(net_peak)}/s"
-    net_spark_width = max(6, w - len("net 60s  ") - len(net_peak_text) - 6)
     activity_age = ""
     if activity.sample_age > DISK_ACTIVITY_REFRESH_SECONDS * 2:
         activity_age = f" · {activity.sample_age:.0f}s old"
+    if activity.source in ("checking", "pending"):
+        activity_line = "disk activity CHECKING"
+        activity_attr = color_pair(PAIR_PRIMARY) | curses.A_BOLD
+    elif activity.source == "unavailable":
+        activity_line = "disk activity unavailable · UNAVAILABLE"
+        activity_attr = color_pair(PAIR_SECONDARY) | curses.A_BOLD
+    else:
+        activity_line = (
+            f"disk live [{activity.source}] {human_bytes(activity.bytes_per_sec)}/s  "
+            f"{activity.iops:.0f} iops{activity_age} · LIVE"
+        )
+        activity_attr = color_pair(PAIR_INFO) | curses.A_BOLD
+
+    network_ready = (
+        net_down is not None and net_up is not None
+        and net_down >= 0.0 and net_up >= 0.0
+    )
+    network_unavailable = (
+        net_down is not None and net_up is not None
+        and (net_down < 0.0 or net_up < 0.0)
+    )
+    if network_ready:
+        network_total = net_down + net_up
+        net_peak = max(history.net) if history.net else network_total
+        net_peak_text = f"pk {human_bytes(net_peak)}/s"
+        net_spark_width = max(
+            6, w - len("net 60s  ") - len(net_peak_text) - 6,
+        )
+        network_line = (
+            f"net d {human_bytes(net_down)}/s  "
+            f"u {human_bytes(net_up)}/s · LIVE"
+        )
+        network_attr = color_pair(PAIR_INFO) | curses.A_BOLD
+        network_history = (
+            f"net 60s  {sparkline(history.net, net_spark_width, None)} "
+            f"{net_peak_text}"
+        )
+    elif network_unavailable:
+        network_line = "net UNAVAILABLE"
+        network_attr = color_pair(PAIR_SECONDARY) | curses.A_BOLD
+        network_history = "net history unavailable"
+    else:
+        network_line = "net CHECKING · awaiting rate baseline"
+        network_attr = color_pair(PAIR_PRIMARY) | curses.A_BOLD
+        network_history = "net history awaiting baseline"
     lines = [
         (pulse_bar(disk_pct, max(8, w - 18), phase, "disk "), color_for_percent(disk_pct)),
-        (f"{disk.label} {human_bytes(disk.used)} / {human_bytes(disk.total)}  free {human_bytes(disk.free)}", color_pair(1)),
-        (f"disk live {human_bytes(activity.bytes_per_sec)}/s  {activity.iops:.0f} iops{activity_age}", color_pair(10) | curses.A_BOLD),
-        (f"net d {human_bytes(net_down)}/s  u {human_bytes(net_up)}/s", color_pair(2) | curses.A_BOLD),
-        (f"net 60s  {sparkline(history.net, net_spark_width, None)} {net_peak_text}", color_pair(6)),
-        (f"disk 60s {sparkline(history.disk, max(8, w - 18), 100.0)}", color_pair(2)),
+        (f"{disk.label} {human_bytes(disk.used)} / {human_bytes(disk.total)}  free {human_bytes(disk.free)}", color_pair(PAIR_PRIMARY)),
+        (activity_line, activity_attr),
+        (network_line, network_attr),
+        (network_history, color_pair(PAIR_STRUCTURE)),
+        (f"disk 60s {sparkline(history.disk, max(8, w - 18), 100.0)}", color_pair(PAIR_INFO)),
     ]
-    if h > 8:
-        lines.append((f"rx {comet(max(8, w - 9), phase, min(1.0, net_down / 1_000_000 + 0.35))}", color_pair(6)))
-        lines.append((f"tx {comet(max(8, w - 9), phase + 7, min(1.0, net_up / 1_000_000 + 0.35))}", color_pair(2)))
+    if h > 8 and network_ready:
+        lines.append((f"rx {comet(max(8, w - 9), phase, min(1.0, net_down / 1_000_000 + 0.35))}", color_pair(PAIR_STRUCTURE)))
+        lines.append((f"tx {comet(max(8, w - 9), phase + 7, min(1.0, net_up / 1_000_000 + 0.35))}", color_pair(PAIR_INFO)))
     for index, (line, attr) in enumerate(lines[: h - 2], start=1):
-        safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+        _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
 def draw_process_panel(
@@ -6313,48 +6490,57 @@ def draw_process_panel(
     x: int,
     h: int,
     w: int,
-    rows: list[ProcessRow],
+    rows: Sequence[ProcessRow],
     scroll: int,
     sort_mode: str,
+    title: Optional[str] = None,
 ) -> None:
-    draw_box(screen, y, x, h, w, f"PROCESS GRID sort={sort_mode}", color_pair(5))
+    panel_title = title or "PROCESS GRID sort=%s" % sort_mode
+    draw_box(screen, y, x, h, w, panel_title, color_pair(PAIR_STRUCTURE))
     if h < 5:
         return
-    compact = w < 58
-    header = " PID     CPU%  MEM%  GPU ST   COMMAND" if compact else " PID      CPU%  MEM%  GPU% ST     ELAPSED    COMMAND"
-    safe_add(screen, y + 1, x + 1, header[: w - 2], color_pair(6) | curses.A_BOLD)
-    safe_add(screen, y + 2, x + 1, "-" * (w - 2), color_pair(5))
-
     body_height = process_body_height(h)
     scroll = max(0, min(scroll, max(0, len(rows) - body_height)))
+    visible_rows = rows[scroll : scroll + body_height]
+    show_gpu = any(row.gpu is not None for row in visible_rows)
+    compact = w < 58
+    if compact:
+        header = " CPU%% MEM%% %sIDENTITY" % ("GPU% " if show_gpu else "")
+    else:
+        header = " PID   CPU%% MEM%% %sST ELAPSED   IDENTITY" % (
+            "GPU% " if show_gpu else "",
+        )
+    _rect_add(screen, y + 1, x + 1, header, w - 2,
+              color_pair(PAIR_STRUCTURE) | curses.A_BOLD)
+    _rect_add(screen, y + 2, x + 1, "-" * (w - 2), w - 2,
+              color_pair(PAIR_STRUCTURE))
+
     if not rows and body_height > 0:
-        safe_add(screen, y + 3, x + 2, "collecting processes..."[: w - 4], color_pair(1))
-    for index, row in enumerate(rows[scroll : scroll + body_height]):
+        _rect_add(screen, y + 3, x + 2, "collecting processes...", w - 4,
+                  color_pair(PAIR_PRIMARY))
+    for index, row in enumerate(visible_rows):
         line_y = y + 3 + index
         if compact:
-            command_width = max(10, w - 34)
-            line = (
-                f"{row.pid:>6} {row.cpu:6.1f} {row.mem:5.1f} {(f'{row.gpu:4.0f}' if row.gpu is not None else '--'):>4} "
-                f"{row.stat:<4.4} {visible_command(row.command, command_width)}"
+            fixed_width = 13 + (5 if show_gpu else 0)
+            command_width = max(8, w - fixed_width - 2)
+            gpu = ""
+            if show_gpu:
+                gpu = "%5s" % ("--" if row.gpu is None else "%.1f" % row.gpu)
+            line = "%5.1f %4.1f%s %s" % (
+                row.cpu, row.mem, gpu, visible_command(row.command, command_width),
             )
         else:
-            command_width = max(8, w - 49)
-            line = (
-                f"{row.pid:>6}  {row.cpu:6.1f} {row.mem:5.1f} {(f'{row.gpu:5.1f}' if row.gpu is not None else '--'):>5} "
-                f"{row.stat:<5.5} {row.etime:>9.9}  {visible_command(row.command, command_width)}"
+            fixed_width = 31 + (6 if show_gpu else 0)
+            command_width = max(8, w - fixed_width)
+            gpu = ""
+            if show_gpu:
+                gpu = "%6s" % ("--" if row.gpu is None else "%.1f" % row.gpu)
+            line = "%6d %5.1f %4.1f%s %-2.2s %8.8s  %s" % (
+                row.pid, row.cpu, row.mem, gpu, row.stat, row.etime,
+                visible_command(row.command, command_width),
             )
-        if sort_mode == "MEM":
-            metric, critical, warning = row.mem, 10.0, 3.0
-        elif sort_mode == "GPU":
-            metric, critical, warning = row.gpu or 0.0, 80.0, 35.0
-        else:
-            metric, critical, warning = row.cpu, 80.0, 35.0
-        attr = color_pair(1)
-        if metric >= critical:
-            attr = color_pair(4) | curses.A_BOLD
-        elif metric >= warning:
-            attr = color_pair(3) | curses.A_BOLD
-        safe_add(screen, line_y, x + 1, line[: w - 2], attr)
+        attr = color_pair(PAIR_PRIMARY)
+        _rect_add(screen, line_y, x + 1, line, w - 2, attr)
 
     first = min(len(rows), scroll + 1) if rows else 0
     last = min(len(rows), scroll + body_height)
@@ -6365,7 +6551,197 @@ def draw_process_panel(
         footer = f"{len(rows)} · {first}-{last} · {keys} · m {sort_mode}"
     else:
         footer = f"{len(rows)} processes · {first}-{last} · {keys} scroll · m sort"
-    safe_add(screen, y + h - 2, x + 2, footer[: w - 4], color_pair(6) | curses.A_BOLD)
+    _rect_add(screen, y + h - 2, x + 2, footer, w - 4,
+              color_pair(PAIR_STRUCTURE) | curses.A_BOLD)
+
+
+def _body_add(
+    screen: curses.window, y: int, x: int, text: str, width: int,
+    attr: int = 0,
+) -> None:
+    _rect_add(screen, y, x, text, max(0, width), attr)
+
+
+def _clamped_process_scroll(rows: Sequence[ProcessRow], panel_h: int, scroll: int) -> int:
+    return max(0, min(scroll, max(0, len(rows) - process_body_height(panel_h))))
+
+
+def draw_overview_body(
+    screen: curses.window, body_y: int, body_h: int, width: int,
+    frame: HealthFrame, history: MetricHistory, rows: Sequence[ProcessRow],
+    sort_mode: str, sensor: Optional[SensorInfo] = None,
+) -> int:
+    """Draw the fixed Overview hierarchy without collection or frame effects."""
+
+    body_w = width - 2
+    elapsed = 0.0
+    details = []
+    for source_id, label in _CORE_SOURCE_LABELS.items():
+        view = frame.source_views[source_id]
+        value = (_live_ribbon_value(frame, source_id)
+                 if view.status is SourceViewStatus.LIVE
+                 else source_view_text(view, elapsed))
+        details.append("%s %s" % (label, value))
+    _body_add(
+        screen, body_y, 1, "EVIDENCE DETAIL · " + " · ".join(details), body_w,
+        color_pair(PAIR_INFO) | curses.A_BOLD,
+    )
+    _body_add(
+        screen, body_y + 1, 1,
+        "PROVENANCE · macOS core evidence · current frame",
+        body_w, color_pair(PAIR_SECONDARY),
+    )
+    _body_add(
+        screen, body_y + 2, 1, "TOP PROCESSES · sort %s" % sort_mode,
+        body_w, color_pair(PAIR_STRUCTURE) | curses.A_BOLD,
+    )
+    visible_rows = max(0, min(5, body_h - 5))
+    for index, row in enumerate(rows[:visible_rows]):
+        metric = (row.mem if sort_mode == "MEM" else
+                  (row.gpu if sort_mode == "GPU" else row.cpu))
+        metric_text = "--" if metric is None else "%.1f" % metric
+        identity_width = max(8, body_w - 16)
+        identity = truncate_display_cells(
+            process_identity(row.command), identity_width,
+        )
+        identity_field = identity + " " * max(
+            0, identity_width - display_cell_width(identity),
+        )
+        _body_add(
+            screen, body_y + 3 + index, 1,
+            "%2d  %s %s %s" % (
+                index + 1, identity_field, sort_mode, metric_text,
+            ),
+            body_w, color_pair(PAIR_PRIMARY),
+        )
+    exceptional = []
+    for source_id, label in _CORE_SOURCE_LABELS.items():
+        view = frame.source_views[source_id]
+        if view.status is not SourceViewStatus.LIVE:
+            exceptional.append("%s %s" % (label, source_view_text(view)))
+    if frame.decisive_triggered_mono_s is not None:
+        exceptional.append("recovery confirmation in progress")
+    if sensor is not None and sensor.privileged_locked:
+        exceptional.append("LOCKED · u: temporary unlock")
+    next_y = body_y + 3 + visible_rows
+    if exceptional and next_y < body_y + body_h:
+        _body_add(
+            screen, next_y, 1, "EXCEPTION · " + " · ".join(exceptional),
+            body_w, color_pair(PAIR_PRIMARY) | curses.A_BOLD,
+        )
+        next_y += 1
+    screen_h, _screen_w = screen.getmaxyx()
+    if screen_h >= 24 and width >= 80 and next_y < body_y + body_h:
+        _body_add(
+            screen, next_y, 1,
+            "CPU 60s · %s" % sparkline(history.cpu, max(8, body_w - 10), 100.0),
+            body_w, color_pair(PAIR_STRUCTURE),
+        )
+    return 0
+
+
+def draw_mode_body(
+    screen: curses.window, mode: str, body_y: int, body_h: int, width: int,
+    frame: HealthFrame, per_core: Sequence[float], static: Mapping[str, Any],
+    mem: Mapping[str, float], battery: BatteryInfo, sensor: SensorInfo,
+    disk: DiskInfo, activity: DiskActivity, net_down: float, net_up: float,
+    history: MetricHistory, rows: Sequence[ProcessRow], scroll: int,
+    sort_mode: str, phase: int,
+) -> int:
+    """Dispatch one deterministic body inside the global header/footer geometry."""
+
+    if mode not in LAYOUTS:
+        raise ValueError("unknown display mode")
+    screen_h, screen_w = screen.getmaxyx()
+    if (type(body_y) is not int or type(body_h) is not int or type(width) is not int
+            or body_y < 0 or body_h < 0 or width < 2
+            or body_y + body_h > screen_h or width > screen_w):
+        raise ValueError("body geometry must fit the viewport")
+    body_w = width - 2
+    if body_w < 8:
+        return 0
+    per_core_values = list(per_core)
+    static_values = dict(static)
+    memory_values = dict(mem)
+    row_values = rows
+    operational_phase = 0
+    if mode == "balanced":
+        return draw_overview_body(
+            screen, body_y, body_h, width, frame, history, row_values, sort_mode,
+            sensor,
+        )
+    if mode == "cinema":
+        if width < 118 or screen_h < 34 or body_h < 7:
+            raise ValueError("Cinema requires 118×34")
+        brand_lines = (
+            "PORKYHUD CINEMA · SIGNAL FIRST",
+            "  /\\  _.._  /\\",
+            " |  oo  oo  |",
+            " |   .-oo-.  |",
+            "  '._ ---- _.'",
+            "TRUSTED DECISION COCKPIT",
+            "-" * max(1, body_w),
+        )
+        for index, line in enumerate(brand_lines):
+            _body_add(screen, body_y + index, 1, line, body_w,
+                      color_pair(PAIR_BRAND) | curses.A_BOLD)
+        operational_y = body_y + 7
+        operational_h = body_h - 7
+        left_w, center_w, right_w = wide_column_widths(width, "cinema")
+        left_x = 1
+        center_x = left_x + left_w + 1
+        right_x = center_x + center_w + 1
+        left_top = max(3, operational_h // 2)
+        center_top = max(3, operational_h * 3 // 5)
+        draw_thermal_panel(screen, operational_y, left_x, left_top, left_w,
+                           battery, sensor, phase, frame.thermal)
+        draw_io_panel(screen, operational_y + left_top, left_x,
+                      operational_h - left_top, left_w, disk, activity,
+                      net_down, net_up, history, phase)
+        draw_cpu_panel(screen, operational_y, center_x, center_top, center_w,
+                       per_core_values, static_values, history, phase)
+        draw_memory_panel(screen, operational_y + center_top, center_x,
+                          operational_h - center_top, center_w, memory_values,
+                          history, phase)
+        effective = _clamped_process_scroll(row_values, operational_h, scroll)
+        draw_process_panel(screen, operational_y, right_x, operational_h,
+                           right_w, row_values, effective, sort_mode)
+        return effective
+
+    gap = 1
+    left_w = (body_w - gap) // 2
+    right_w = body_w - gap - left_w
+    left_x = 1
+    right_x = left_x + left_w + gap
+    if mode == "compute":
+        cpu_h = min(max(3, 10), max(3, body_h - 3))
+        memory_h = body_h - cpu_h
+        draw_cpu_panel(screen, body_y, left_x, cpu_h, left_w, per_core_values,
+                       static_values, history, operational_phase)
+        _body_add(
+            screen, body_y + 4, left_x + 2,
+            "15s  %s" % sparkline(list(history.cpu)[-15:], max(8, left_w - 10), 100.0),
+            left_w - 4, color_pair(PAIR_STRUCTURE),
+        )
+        draw_memory_panel(screen, body_y + cpu_h, left_x, memory_h, left_w,
+                          memory_values, history, operational_phase)
+        draw_process_panel(screen, body_y, right_x, body_h, right_w, row_values,
+                           0, "CPU", "TOP CPU")
+        return 0
+    if mode == "thermals":
+        draw_thermal_panel(screen, body_y, left_x, body_h, left_w,
+                           battery, sensor, operational_phase, frame.thermal)
+        draw_sensors_panel(screen, body_y, right_x, body_h, right_w,
+                           battery, sensor, operational_phase)
+        return 0
+    if mode == "io":
+        draw_io_panel(screen, body_y, 1, body_h, body_w, disk, activity,
+                      net_down, net_up, history, operational_phase)
+        return 0
+    effective = _clamped_process_scroll(row_values, body_h, scroll)
+    draw_process_panel(screen, body_y, 1, body_h, body_w, row_values,
+                       effective, sort_mode)
+    return effective
 
 
 def set_message(config: HudConfig, text: str, ttl: float = 3.0) -> None:
@@ -6374,9 +6750,10 @@ def set_message(config: HudConfig, text: str, ttl: float = 3.0) -> None:
 
 
 def shortcut_status(width: int) -> str:
-    if width < 100:
-        return "h help  t theme  l view  a motion  u sensor  m sort  r refresh  q quit"
-    return "h help  t theme  l layout  a motion  u sensors  m sort CPU/MEM/GPU  r refresh  q quit"
+    _projection_width(width)
+    return semantic_text(
+        "1–5 mode · h help · m sort · r refresh · q quit", unicode_ok(),
+    )
 
 
 def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorInfo) -> None:
@@ -6385,8 +6762,8 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
     h = 16
     y = max(2, (height - h) // 2)
     x = max(2, (width - w) // 2)
-    fill_rect(screen, y, x, h, w, color_pair(1))
-    draw_box(screen, y, x, h, w, "SHORTCUTS", color_pair(6) | curses.A_BOLD)
+    fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
+    draw_box(screen, y, x, h, w, "SHORTCUTS", color_pair(PAIR_STRUCTURE) | curses.A_BOLD)
     if sensor.thermal_warning in ("checking", "pending"):
         unlock_state = "checking"
     elif not sensor.privileged_locked:
@@ -6398,24 +6775,34 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
     lines = [
         "q             quit",
         "Esc / h / ?   close this panel",
+        "1–5           select operational mode",
         "t             cycle theme",
-        "l             cycle terminal layout",
-        "a             animation: off / calm / vivid",
+        "l             cycle supported modes",
+        "a             motion: off / calm / vivid",
         "m             sort process grid by CPU, memory, or GPU",
         "r             refresh live telemetry",
-        "u             unlock advanced macOS sensors with sudo",
         "arrows/j/k    scroll processes",
-        "PgUp/PgDn     faster process scrolling",
+        "PgUp/PgDn/Home/End  jump through processes",
         "",
-        f"theme: {config.theme_name}    layout: {config.layout_name}",
-        f"sensors: {unlock_state}",
-        COPYRIGHT_TEXT,
     ]
+    if width >= 118 and height >= 34:
+        lines.append("6  Cinema     select wide Cinema mode")
+    if sensor.privileged_locked:
+        lines.append("u             unlock advanced macOS sensors with sudo")
+    lines.extend([
+        f"sensors: {unlock_state} · theme: {config.theme_name} · layout: {config.layout_name}",
+        COPYRIGHT_TEXT,
+    ])
+    unicode_enabled = unicode_ok()
     for index, line in enumerate(lines[: h - 2], start=1):
-        attr = color_pair(1)
+        attr = color_pair(PAIR_PRIMARY)
         if line.startswith(("theme:", "sensors:")) or line == COPYRIGHT_TEXT:
-            attr = color_pair(7) | curses.A_BOLD
-        safe_add(screen, y + index, x + 2, line[: w - 4], attr)
+            attr = color_pair(PAIR_SECONDARY) | curses.A_BOLD
+        safe_add(
+            screen, y + index, x + 2,
+            truncate_display_cells(semantic_text(line, unicode_enabled), w - 4),
+            attr,
+        )
 
 
 def init_colors(theme_index: int = 0) -> None:
@@ -6445,16 +6832,19 @@ def init_colors(theme_index: int = 0) -> None:
 
 def draw_small_screen(screen: curses.window, height: int, width: int) -> None:
     unicode_enabled = unicode_ok()
-    safe_add(screen, 1, 2, "PorkyHUD needs a larger terminal.", read_attr("watch"))
+    safe_add(
+        screen, 1, 2, "PorkyHUD needs a larger terminal.",
+        color_pair(PAIR_STRUCTURE) | curses.A_BOLD,
+    )
     safe_add(
         screen, 3, 2,
         semantic_text(
             "Current: %d×%d. Resize to at least 76×22." % (width, height),
             unicode_enabled,
         ),
-        color_pair(PRIMARY),
+        color_pair(PAIR_PRIMARY),
     )
-    safe_add(screen, 5, 2, "Press q to quit.", color_pair(PRIMARY))
+    safe_add(screen, 5, 2, "Press q to quit.", color_pair(PAIR_PRIMARY))
 
 
 def draw_decision_header(
@@ -6475,7 +6865,7 @@ def draw_decision_header(
     if any(display_cell_width(line) > width - 1 for line in projected):
         raise ValueError("projected decision header exceeds the viewport")
     safe_add(screen, 0, 0, projected[0], read_attr(level))
-    safe_add(screen, 1, 0, projected[1], color_pair(PRIMARY))
+    safe_add(screen, 1, 0, projected[1], color_pair(PAIR_PRIMARY))
     return 2
 
 
@@ -6526,9 +6916,61 @@ def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
     if any(display_cell_width(line) > width - 1 for line in projected):
         raise ValueError("initial shell does not fit the supported viewport")
     safe_add(screen, 0, 0, projected[0], read_attr("checking"))
-    safe_add(screen, 1, 0, projected[1], color_pair(PRIMARY))
-    safe_add(screen, 2, 0, projected[2], color_pair(INFO) | curses.A_BOLD)
+    safe_add(screen, 1, 0, projected[1], color_pair(PAIR_PRIMARY))
+    safe_add(screen, 2, 0, projected[2], color_pair(PAIR_INFO) | curses.A_BOLD)
     return 3
+
+
+def _frame_render_key(frame: HealthFrame) -> Tuple[Any, ...]:
+    """Return semantic frame state without continuously advancing ages."""
+
+    assessment = frame.assessment
+    assessment_key = (
+        assessment.severity, assessment.evidence_state, assessment.reason,
+        assessment.evidence, assessment.active_rules,
+        assessment.contributor_name, assessment.blockers,
+        assessment.cpu_coverage_s,
+    )
+    source_key = tuple(
+        (
+            source_id, view.status, view.refreshing, view.decision_ready,
+            view.last_valid_revision, view.failure,
+        )
+        for source_id, view in frame.source_views.items()
+    )
+    return (
+        assessment_key, source_key, frame.cpu_percent,
+        frame.memory_pressure, frame.thermal, frame.disk_capacity,
+        frame.contributor, frame.origin, frame.decisive_triggered_mono_s,
+    )
+
+
+def _render_age_key(
+    frame: HealthFrame, sensor: SensorInfo, activity: DiskActivity,
+    now_mono_s: float,
+) -> Tuple[Any, ...]:
+    """Return only integer age buckets whose visible copy can change."""
+
+    elapsed_s = max(0.0, now_mono_s - frame.captured_mono_s)
+
+    def displayed_age(
+        value: Optional[float], extra: float = 0.0,
+    ) -> Optional[int]:
+        if value is None:
+            return None
+        return int(math.floor(max(0.0, value + extra)))
+
+    return (
+        displayed_age(frame.assessment.evidence_age_s, elapsed_s),
+        tuple(displayed_age(view.age_s, elapsed_s)
+              for view in frame.source_views.values()),
+        displayed_age(
+            None if frame.decisive_triggered_mono_s is None
+            else now_mono_s - frame.decisive_triggered_mono_s,
+        ),
+        displayed_age(sensor.sensor_sample_age_s),
+        displayed_age(activity.sample_age),
+    )
 
 
 def hud(screen: curses.window) -> None:
@@ -6579,9 +7021,12 @@ def _hud_impl(
                           False, False, None, None, None, None, None, None, None,
                           None, None)
     disk = DiskInfo("checking", "/", 1, 0, 1)
-    net_down = 0.0
-    net_up = 0.0
+    net_down: Optional[float] = None
+    net_up: Optional[float] = None
+    raw_rows: tuple[ProcessRow, ...] = ()
     rows: list[ProcessRow] = []
+    cpu_rows: list[ProcessRow] = []
+    rows_sort_mode = ""
     sort_mode = "CPU"
     scroll = 0
     sensor = default_sensor_info()
@@ -6609,6 +7054,9 @@ def _hud_impl(
     force_disk_activity = True
     network_baseline: Optional[tuple[tuple[int, int], float]] = None
     last_render = 0.0
+    descriptive_revision = 0
+    last_render_state: Optional[tuple[Any, ...]] = None
+    last_render_age_key: Optional[tuple[Any, ...]] = None
 
     def quit_hud() -> None:
         # The outer hud() finally owns the single aggregate close.
@@ -6616,70 +7064,89 @@ def _hud_impl(
 
     while True:
         now = time.monotonic()
+        height, width = screen.getmaxyx()
         key = screen.getch()
-        if key in (ord("q"), ord("Q")):
+        ui_changed = False
+        if key in (ord("q"), ord("Q")) or (
+                key == 27 and not config.show_help):
             quit_hud()
             return
+        controls_enabled = height >= 22 and width >= 76
+        if not controls_enabled and key != 27:
+            key = -1
+        resized_message = normalize_mode_for_viewport(config, height, width)
+        if resized_message:
+            scroll = 0
+            set_message(config, resized_message)
+            ui_changed = True
         if config.show_help:
             if key in (27, ord("h"), ord("H"), ord("?")):
                 config.show_help = False
                 set_message(config, "shortcut panel closed")
-        elif key == 27:
-            quit_hud()
-            return
+                ui_changed = True
         elif key in (ord("h"), ord("H"), ord("?")):
             config.show_help = True
             set_message(config, "shortcut panel opened")
+            ui_changed = True
+        elif key in tuple(ord(value) for value in DIRECT_MODE_KEYS):
+            message = select_mode(
+                config, DIRECT_MODE_KEYS[chr(key)], height, width,
+            )
+            if message.endswith(" selected"):
+                scroll = 0
+            set_message(config, message)
+            ui_changed = True
         elif key in (ord("t"), ord("T")):
             config.theme_index = (config.theme_index + 1) % len(THEMES)
             init_colors(config.theme_index)
             apply_dark_screen(screen)
             set_message(config, f"theme switched to {config.theme_name}")
+            ui_changed = True
         elif key in (ord("l"), ord("L")):
-            config.layout_index = (config.layout_index + 1) % len(LAYOUTS)
+            set_message(config, cycle_mode(config, height, width))
             scroll = 0
-            current_height, current_width = screen.getmaxyx()
-            if current_width < 118 or current_height < 34:
-                set_message(config, f"{config.layout_name} saved · wide layouts need 118x34")
-            else:
-                set_message(config, f"layout switched to {config.layout_name}")
+            ui_changed = True
         elif key in (ord("a"), ord("A")):
             config.animation_mode = (config.animation_mode + 1) % 3
             labels = ["off", "calm", "vivid"]
-            set_message(config, f"animation {labels[config.animation_mode]}")
-        elif key in (ord("u"), ord("U")):
+            set_message(config, f"motion {labels[config.animation_mode]}")
+            ui_changed = True
+        elif key in (ord("u"), ord("U")) and sensor.privileged_locked:
             if unlock_privileged_sensors(screen):
                 force_sensor = True
                 set_message(config, "sensor access unlocked · refreshing")
             else:
                 set_message(config, "advanced sensor unlock skipped")
+            ui_changed = True
         elif key in (ord("m"), ord("M")):
             sort_modes = ["CPU", "MEM", "GPU"]
             sort_mode = sort_modes[(sort_modes.index(sort_mode) + 1) % len(sort_modes)]
-            rows = sort_process_rows(rows, sort_mode)
+            rows_sort_mode = ""
             scroll = 0
             set_message(config, f"process sort: {sort_mode}")
+            ui_changed = True
         elif key in (curses.KEY_DOWN, ord("j")):
             scroll += 1
+            ui_changed = True
         elif key in (curses.KEY_UP, ord("k")):
             scroll -= 1
+            ui_changed = True
         elif key == curses.KEY_NPAGE:
             scroll += 10
+            ui_changed = True
         elif key == curses.KEY_PPAGE:
             scroll -= 10
+            ui_changed = True
         elif key == curses.KEY_HOME:
             scroll = 0
+            ui_changed = True
         elif key == curses.KEY_END:
             scroll = 10**9
+            ui_changed = True
         elif key in (ord("r"), ord("R")):
             force_live = True
-            force_memory = True
-            force_swap = True
-            force_network = True
-            force_battery = True
-            force_sensor = True
-            force_disk_activity = True
             set_message(config, "refreshing live telemetry")
+            ui_changed = True
 
         coordinator.observe_time(now, utc_now())
         current_source_generation = coordinator.source_generation()
@@ -6695,53 +7162,95 @@ def _hud_impl(
             disk = DiskInfo(capacity.volume_name.lower(), capacity.mount_point,
                             capacity.total_bytes, capacity.total_bytes - capacity.free_bytes,
                             capacity.free_bytes)
-        rows = sort_process_rows(coordinator.process_rows(now), sort_mode)
+        sampled_rows = tuple(coordinator.process_rows(now))
+        if sampled_rows != raw_rows:
+            raw_rows = sampled_rows
+            cpu_rows = sort_process_rows(raw_rows, "CPU")
+            rows = (cpu_rows if sort_mode == "CPU"
+                    else sort_process_rows(raw_rows, sort_mode))
+            rows_sort_mode = sort_mode
+        elif sort_mode != rows_sort_mode:
+            rows = (cpu_rows if sort_mode == "CPU"
+                    else sort_process_rows(raw_rows, sort_mode))
+            rows_sort_mode = sort_mode
 
         if static_poller is None:
             static_poller = _start_static_discovery(collect_live_static, now)
         sampled_static, _static_age, _static_error = static_poller.snapshot(now)
-        if sampled_static:
+        if sampled_static and sampled_static != static:
             static = sampled_static
             uptime_at_start = int(static.get("boot_seconds", uptime_at_start) or 0)
+            descriptive_revision += 1
         memory_poller.tick(now, force_memory)
         sampled_memory, _memory_age, _memory_error = memory_poller.snapshot(now)
-        if sampled_memory:
+        if sampled_memory and sampled_memory != mem:
             mem = sampled_memory
+            descriptive_revision += 1
         swap_poller.tick(now, force_swap)
         sampled_swap, _swap_age, _swap_error = swap_poller.snapshot(now)
         if sampled_swap is not None:
-            mem = merge_memory_stats(mem, sampled_swap)
+            merged_memory = merge_memory_stats(mem, sampled_swap)
+            if merged_memory != mem:
+                mem = merged_memory
+                descriptive_revision += 1
         network_poller.tick(now, force_network)
         sampled_network, _network_age, _network_error = network_poller.snapshot(now)
-        if sampled_network is not None:
+        if (sampled_network is None and _network_error
+                and network_baseline is None
+                and (net_down, net_up) != (-1.0, -1.0)):
+            net_down = net_up = -1.0
+            descriptive_revision += 1
+        if (sampled_network is not None
+                and (network_baseline is None
+                     or sampled_network != network_baseline[0])):
+            first_network_sample = network_baseline is None
             network_baseline, sampled_rates = _network_rate_update(
                 network_baseline, sampled_network, now,
             )
-            if sampled_rates is not None:
+            if sampled_rates is not None and sampled_rates != (net_down, net_up):
                 net_down, net_up = sampled_rates
+                descriptive_revision += 1
+            elif first_network_sample and (net_down is not None or net_up is not None):
+                net_down = net_up = None
+                descriptive_revision += 1
         battery_poller.tick(now, force_battery)
         sampled_battery, _battery_age, _battery_error = battery_poller.snapshot(now)
-        if sampled_battery is not None:
+        if sampled_battery is not None and sampled_battery != battery:
             battery = sampled_battery
+            descriptive_revision += 1
 
         sensor_poller.tick(now, force_sensor)
         sampled_sensor, sensor_age, _sensor_error = sensor_poller.snapshot(now)
         if sampled_sensor is not None:
-            sensor = replace(sampled_sensor, sensor_sample_age_s=sensor_age)
+            candidate_sensor = replace(sampled_sensor, sensor_sample_age_s=sensor_age)
+            if (replace(candidate_sensor, sensor_sample_age_s=0.0)
+                    != replace(sensor, sensor_sample_age_s=0.0)):
+                descriptive_revision += 1
+            sensor = candidate_sensor
             coordinator.set_system_gpu_percent(sensor.gpu_active_percent)
 
         disk_activity_poller.tick(now, force_disk_activity)
         sampled_activity, activity_age, _activity_error = disk_activity_poller.snapshot(now)
         if sampled_activity is not None:
-            activity = replace(sampled_activity, sample_age=activity_age)
+            candidate_activity = replace(sampled_activity, sample_age=activity_age)
+            if (replace(candidate_activity, sample_age=0.0)
+                    != replace(activity, sample_age=0.0)):
+                descriptive_revision += 1
+            activity = candidate_activity
 
+        network_bps = (
+            net_down + net_up
+            if net_down is not None and net_up is not None
+            and net_down >= 0.0 and net_up >= 0.0
+            else 0.0
+        )
         last_history_cpu_revision = _record_history_frame(
             history,
             frame,
             last_history_cpu_revision,
             per_core,
             mem,
-            net_down + net_up,
+            network_bps,
             disk,
         )
         force_live = False
@@ -6752,11 +7261,32 @@ def _hud_impl(
         force_sensor = False
         force_disk_activity = False
 
-        height, width = screen.getmaxyx()
-        if key == -1 and now - last_render < render_interval(config.animation_mode):
+        active_message = (
+            config.message if config.message and now < config.message_until else ""
+        )
+        render_state = (
+            height, width, _frame_render_key(frame), descriptive_revision,
+            config.theme_index, config.animation_mode, config.layout_index,
+            config.show_help, active_message, sort_mode, scroll,
+        )
+        render_age_key = _render_age_key(frame, sensor, activity, now)
+        should_render = (
+            last_render_state is None or render_state != last_render_state
+            or ui_changed
+        )
+        if config.animation_mode == 0:
+            should_render = should_render or render_age_key != last_render_age_key
+        else:
+            should_render = (
+                should_render
+                or now - last_render >= render_interval(config.animation_mode)
+            )
+        if not should_render:
             time.sleep(0.03)
             continue
         last_render = now
+        last_render_state = render_state
+        last_render_age_key = render_age_key
         if height < 22 or width < 76:
             screen.erase()
             draw_small_screen(screen, height, width)
@@ -6773,102 +7303,23 @@ def _hud_impl(
         screen.erase()
         header_h = draw_decision_header(screen, frame, config, now)
         header_h = draw_evidence_ribbon(screen, header_h, frame, now)
-        footer_lines = 1
-        body_height = height - header_h - footer_lines
-        uptime_seconds = uptime_at_start + int(max(0.0, now - uptime_clock_start))
-        try:
-            load_average = os.getloadavg()
-        except OSError:
-            load_average = (0.0, 0.0, 0.0)
-
-        if width >= 118 and height >= 34:
-            layout = config.layout_name
-            left_x = 1
-            left_width, center_width, right_width = wide_column_widths(width, layout)
-            center_x = left_x + left_width + 1
-            right_x = center_x + center_width + 1
-            body_y = header_h
-
-            if layout == "thermals":
-                system_h, power_h, thermal_h, sensors_h = proportional_heights(body_height, [(6, 0), (6, 0), (7, 1), (9, 4)])
-                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery, uptime_seconds, load_average)
-                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
-                draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
-                draw_sensors_panel(screen, body_y + system_h + power_h + thermal_h, left_x, sensors_h, left_width, battery, sensor, phase)
-            elif layout == "io":
-                system_h, power_h, sensors_h, io_h = proportional_heights(body_height, [(6, 0), (6, 0), (7, 1), (8, 4)])
-                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery, uptime_seconds, load_average)
-                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
-                draw_sensors_panel(screen, body_y + system_h + power_h, left_x, sensors_h, left_width, battery, sensor, phase)
-                draw_io_panel(screen, body_y + system_h + power_h + sensors_h, left_x, io_h, left_width, disk, activity, net_down, net_up, history, phase)
-            else:
-                compact_left = layout == "compact"
-                system_h, power_h, thermal_h, io_h = proportional_heights(
-                    body_height,
-                    [(5 if compact_left else 7, 0), (5 if compact_left else 7, 0), (6 if compact_left else 8, 1), (7, 3)],
-                )
-                draw_system_panel(screen, body_y, left_x, system_h, left_width, static, battery, uptime_seconds, load_average)
-                draw_battery_panel(screen, body_y + system_h, left_x, power_h, left_width, battery, phase)
-                draw_thermal_panel(screen, body_y + system_h + power_h, left_x, thermal_h, left_width, battery, sensor, phase)
-                draw_io_panel(screen, body_y + system_h + power_h + thermal_h, left_x, io_h, left_width, disk, activity, net_down, net_up, history, phase)
-
-            if layout == "compute":
-                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(18, 5), (10, 2), (7, 1)])
-            elif layout == "cinema":
-                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(16, 4), (10, 3), (7, 1)])
-            elif layout == "compact":
-                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(11, 3), (6, 1), (6, 1)])
-            else:
-                cpu_h, gpu_h, mem_h = proportional_heights(body_height, [(14, 4), (8, 2), (7, 2)])
-            draw_cpu_panel(screen, body_y, center_x, cpu_h, center_width, per_core, static, history, phase)
-            draw_gpu_panel(screen, body_y + cpu_h, center_x, gpu_h, center_width, static, sensor, phase)
-            draw_memory_panel(screen, body_y + cpu_h + gpu_h, center_x, mem_h, center_width, mem, history, phase)
-
-            proc_h = body_height
-            process_scroll_max = max(0, len(rows) - process_body_height(proc_h))
-            scroll = max(0, min(scroll, process_scroll_max))
-            draw_process_panel(screen, body_y, right_x, proc_h, right_width, rows, scroll, sort_mode)
-        else:
-            process_region_height = max(8, body_height // 2)
-            top_height = body_height - process_region_height
-            left_width = max(34, min(56, width * 42 // 100))
-            if width - left_width - 3 < 38:
-                left_width = max(32, width - 41)
-            right_width = width - left_width - 3
-            left_x = 1
-            right_x = left_x + left_width + 1
-
-            sys_h, power_h = compact_top_heights(top_height)
-            cpu_h = top_height
-            lower_h = height - (header_h + top_height) - footer_lines
-
-            draw_system_panel(screen, header_h, left_x, sys_h, left_width, static, battery, uptime_seconds, load_average)
-            draw_battery_panel(screen, header_h + sys_h, left_x, power_h, left_width, battery, phase)
-            draw_cpu_panel(screen, header_h, right_x, cpu_h, right_width, per_core, static, history, phase)
-            if lower_h >= 16:
-                thermal_h, sensors_h, gpu_h = proportional_heights(lower_h, [(5, 1), (6, 2), (5, 1)])
-                draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
-                draw_sensors_panel(screen, header_h + top_height + thermal_h, left_x, sensors_h, left_width, battery, sensor, phase)
-                draw_gpu_panel(screen, header_h + top_height + thermal_h + sensors_h, left_x, gpu_h, left_width, static, sensor, phase)
-            else:
-                thermal_h, gpu_h = proportional_heights(lower_h, [(5, 1), (4, 1)])
-                draw_thermal_panel(screen, header_h + top_height, left_x, thermal_h, left_width, battery, sensor, phase)
-                draw_gpu_panel(screen, header_h + top_height + thermal_h, left_x, gpu_h, left_width, static, sensor, phase)
-
-            proc_y = header_h + top_height
-            proc_h = height - proc_y - footer_lines
-            process_scroll_max = max(0, len(rows) - process_body_height(proc_h))
-            scroll = max(0, min(scroll, process_scroll_max))
-            draw_process_panel(screen, proc_y, right_x, proc_h, right_width, rows, scroll, sort_mode)
+        body_rows = cpu_rows if config.layout_name == "compute" else rows
+        scroll = draw_mode_body(
+            screen, config.layout_name, header_h, height - 4, width, frame,
+            per_core, static, mem, battery, sensor, disk, activity, net_down,
+            net_up, history, body_rows, scroll, sort_mode, phase,
+        )
 
         if config.show_help:
             draw_help_overlay(screen, config, sensor)
 
         status = shortcut_status(width)
         if config.message and now < config.message_until:
-            suffix = status if width >= 100 else "h help  q quit"
-            status = f"{config.message} | {suffix}"
-        safe_add(screen, height - 1, 1, status[: width - 2], color_pair(6))
+            status = semantic_text(config.message + " · q quit", unicode_ok())
+        safe_add(
+            screen, height - 1, 1,
+            truncate_display_cells(status, width - 2), color_pair(PAIR_STRUCTURE),
+        )
         screen.refresh()
         time.sleep(0.03)
 
