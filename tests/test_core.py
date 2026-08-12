@@ -753,6 +753,43 @@ class RuleLatchTests(unittest.TestCase):
         self.assertEqual((latch.severity, latch.rule_id),
                          (HealthSeverity.WATCH, RuleId.MEMORY_WATCH))
 
+    def test_ten_normal_samples_clear_a_critical_memory_latch_on_the_tenth(self):
+        state = self.memory_source(4, -1.0)
+        latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), state, -1.0
+        )
+        for completed in range(10):
+            state = self.memory_source(1, float(completed), state)
+            latch = reduce_memory_latch(latch, state, float(completed))
+            if completed < 9:
+                self.assertIsNot(latch.phase, LatchPhase.CLEAR)
+        self.assertEqual(latch.phase, LatchPhase.CLEAR)
+
+    def test_critical_downgrade_carries_only_trailing_normal_samples(self):
+        state = self.memory_source(4, -1.0)
+        latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), state, -1.0
+        )
+        for completed, level in enumerate((1, 1, 2, 1, 1)):
+            state = self.memory_source(level, float(completed), state)
+            latch = reduce_memory_latch(latch, state, float(completed))
+        self.assertEqual(
+            (
+                latch.rule_id,
+                latch.severity,
+                latch.phase,
+                latch.recovery_count,
+                latch.recovery_started_mono_s,
+            ),
+            (
+                RuleId.MEMORY_WATCH,
+                HealthSeverity.WATCH,
+                LatchPhase.RECOVERING,
+                2,
+                3.0,
+            ),
+        )
+
     def test_thermal_requires_three_clear_samples_spanning_exactly_ten_seconds(self):
         state = self.thermal_source(1, 0, -1.0)
         latch = reduce_thermal_latch(empty_latch(RuleId.THERMAL_WATCH), state, -1.0)
@@ -775,6 +812,67 @@ class RuleLatchTests(unittest.TestCase):
         entry_window = reduce_cpu_window(entry_window, entry_source)
         latch = reduce_cpu_latch(latch, entry_source, entry_window, 25.0)
         self.assertEqual(latch.phase, LatchPhase.CLEAR)
+
+    def test_cpu_windows_never_round_short_duration_up_to_policy_thresholds(self):
+        short_entry = 14.9999999995
+        source, window = self.cpu_source_and_window(
+            ((0.0, short_entry, 90.0),)
+        )
+        latch = reduce_cpu_latch(
+            empty_latch(RuleId.CPU_WATCH), source, window, short_entry
+        )
+        self.assertEqual(latch.phase, LatchPhase.CLEAR)
+
+        source, window = self.cpu_source_and_window(((0.0, 15.0, 90.0),))
+        active = reduce_cpu_latch(
+            empty_latch(RuleId.CPU_WATCH), source, window, 15.0
+        )
+        short_recovery_end = 24.9999999995
+        source = self.next_success(
+            source,
+            CpuUsage(70.0, 15.0, short_recovery_end),
+            short_recovery_end,
+        )
+        window = reduce_cpu_window(window, source)
+        recovering = reduce_cpu_latch(
+            active, source, window, short_recovery_end
+        )
+        self.assertEqual(recovering.phase, LatchPhase.RECOVERING)
+
+        exact_source, exact_window = self.cpu_source_and_window(
+            ((0.0, 15.0, 90.0),)
+        )
+        exact_active = reduce_cpu_latch(
+            empty_latch(RuleId.CPU_WATCH),
+            exact_source,
+            exact_window,
+            15.0,
+        )
+        exact_source = self.next_success(
+            exact_source, CpuUsage(70.0, 15.0, 25.0), 25.0
+        )
+        exact_window = reduce_cpu_window(exact_window, exact_source)
+        self.assertEqual(
+            reduce_cpu_latch(
+                exact_active, exact_source, exact_window, 25.0
+            ).phase,
+            LatchPhase.CLEAR,
+        )
+
+    def test_cpu_retention_keeps_an_extra_sample_when_recent_time_is_short(self):
+        source, window = self.cpu_source_and_window(
+            (
+                (0.0, 1.0, 50.0),
+                (1.0, 6.0, 50.0),
+                (6.0, 11.0, 50.0),
+                (11.0, 15.9999999995, 50.0),
+            )
+        )
+        self.assertEqual(
+            tuple(sample.revision for sample in window.samples),
+            (1, 2, 3, 4),
+        )
+        self.assertEqual(window.last_attempt_revision, source.last_attempt.revision)
 
     def test_storage_recovery_requires_same_identity_two_samples_spanning_thirty_seconds(self):
         gib = 1024 ** 3
@@ -829,6 +927,85 @@ class RuleLatchTests(unittest.TestCase):
         self.assertEqual(recovering.trigger, latch.trigger)
         self.assertEqual(recovering.phase, LatchPhase.RECOVERING)
 
+    def test_duplicate_revisions_still_validate_time_and_reset_stale_recovery(self):
+        source = self.memory_source(2, 0.0)
+        active = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), source, 0.0
+        )
+        source = self.memory_source(1, 1.0, source)
+        recovering = reduce_memory_latch(active, source, 1.0)
+
+        self.assertIs(reduce_memory_latch(recovering, source, 3.5), recovering)
+        stale = reduce_memory_latch(recovering, source, 3.500001)
+        self.assertEqual(
+            (stale.phase, stale.recovery_count, stale.last_processed_revision),
+            (LatchPhase.ACTIVE, 0, recovering.last_processed_revision),
+        )
+
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(recovering, source, 0.5)
+
+    def test_duplicate_revisions_reject_now_before_source_and_latch_times(self):
+        source = self.memory_source(2, 3.0)
+        latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), source, 3.0
+        )
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(latch, source, 2.0)
+
+        active_source, _ = start_attempt(source, 5.0)
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(latch, active_source, 4.0)
+
+        future_trigger = replace(latch.trigger, triggered_mono_s=4.0)
+        future_latch = replace(latch, trigger=future_trigger)
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(future_latch, source, 3.5)
+
+        normal = self.memory_source(1, 4.0, source)
+        recovering = reduce_memory_latch(latch, normal, 4.0)
+        rewound = replace(
+            normal,
+            last_attempt=replace(
+                normal.last_attempt,
+                started_mono_s=3.4,
+                completed_mono_s=3.5,
+            ),
+            last_valid=replace(
+                normal.last_valid,
+                started_mono_s=3.4,
+                completed_mono_s=3.5,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            reduce_memory_latch(recovering, rewound, 3.75)
+
+    def test_skipped_attempt_revisions_restart_recovery_from_current_sample(self):
+        for skipped_failure in (False, True):
+            with self.subTest(skipped_failure=skipped_failure):
+                source = self.memory_source(2, 0.0)
+                latch = reduce_memory_latch(
+                    empty_latch(RuleId.MEMORY_WATCH), source, 0.0
+                )
+                source = self.memory_source(1, 1.0, source)
+                latch = reduce_memory_latch(latch, source, 1.0)
+                if skipped_failure:
+                    source = self.next_failure(source, 2.0)
+                else:
+                    source = self.memory_source(1, 2.0, source)
+                source = self.memory_source(1, 3.0, source)
+
+                restarted = reduce_memory_latch(latch, source, 3.0)
+                self.assertEqual(
+                    (
+                        restarted.phase,
+                        restarted.recovery_count,
+                        restarted.recovery_started_mono_s,
+                        restarted.last_processed_revision,
+                    ),
+                    (LatchPhase.RECOVERING, 1, 3.0, source.last_attempt.revision),
+                )
+
     def test_latch_construction_and_reducers_reject_corruption_and_wrong_families(self):
         with self.assertRaises(ValueError):
             empty_latch(RuleId.MEMORY_WATCH.value)
@@ -856,6 +1033,167 @@ class RuleLatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reduce_memory_latch(empty_latch(RuleId.MEMORY_WATCH),
                                 replace(source, revision=2), 1.0)
+
+    def test_rule_latch_rejects_incoherent_recovery_metadata(self):
+        trigger = TriggerEvidence(
+            SourceId.MEMORY_PRESSURE, 2, 1.0, "memory pressure level 2"
+        )
+        with self.assertRaises(ValueError):
+            RuleLatch(
+                RuleId.MEMORY_WATCH,
+                HealthSeverity.WATCH,
+                LatchPhase.ACTIVE,
+                trigger,
+                0,
+                None,
+                1,
+                None,
+            )
+
+        memory = self.memory_source(2, 0.0)
+        memory_latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), memory, 0.0
+        )
+        memory = self.memory_source(1, 1.0, memory)
+        memory_recovery = reduce_memory_latch(memory_latch, memory, 1.0)
+
+        thermal = self.thermal_source(1, 0, 0.0)
+        thermal_latch = reduce_thermal_latch(
+            empty_latch(RuleId.THERMAL_WATCH), thermal, 0.0
+        )
+        thermal = self.thermal_source(0, 0, 5.0, thermal)
+        thermal_recovery = reduce_thermal_latch(thermal_latch, thermal, 5.0)
+
+        gib = 1024 ** 3
+        disk = self.disk_source(100 * gib, 9 * gib, 0.0)
+        disk_latch = reduce_storage_latch(
+            empty_latch(RuleId.STORAGE_WATCH), disk, 0.0
+        )
+        disk = self.disk_source(100 * gib, 12 * gib, 30.0, disk)
+        disk_recovery = reduce_storage_latch(disk_latch, disk, 30.0)
+
+        critical = self.memory_source(4, 0.0)
+        critical_latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), critical, 0.0
+        )
+        critical = self.memory_source(1, 1.0, critical)
+        critical_recovery = reduce_memory_latch(
+            critical_latch, critical, 1.0
+        )
+        critical = self.memory_source(1, 2.0, critical)
+        critical_recovery_with_two_normals = reduce_memory_latch(
+            critical_recovery, critical, 2.0
+        )
+
+        for latch, count in (
+            (memory_recovery, 10),
+            (thermal_recovery, 3),
+            (disk_recovery, 2),
+            (critical_recovery, 5),
+        ):
+            with self.subTest(rule=latch.rule_id, count=count):
+                with self.assertRaises(ValueError):
+                    replace(latch, recovery_count=count)
+                with self.assertRaises(ValueError):
+                    replace(
+                        latch,
+                        recovery_count=0,
+                        recovery_started_mono_s=None,
+                        recovery_identity=None,
+                    )
+
+        with self.assertRaises(ValueError):
+            replace(
+                critical_recovery_with_two_normals,
+                recovery_count=1,
+            )
+
+        with self.assertRaises(ValueError):
+            replace(
+                memory_recovery,
+                trigger=replace(
+                    memory_recovery.trigger, triggered_mono_s=2.0
+                ),
+            )
+
+        cpu_source, cpu_window = self.cpu_source_and_window(
+            ((0.0, 15.0, 90.0),)
+        )
+        cpu_active = reduce_cpu_latch(
+            empty_latch(RuleId.CPU_WATCH),
+            cpu_source,
+            cpu_window,
+            15.0,
+        )
+        cpu_source = self.next_success(
+            cpu_source, CpuUsage(80.0, 15.0, 16.0), 16.0
+        )
+        cpu_window = reduce_cpu_window(cpu_window, cpu_source)
+        cpu_recovery = reduce_cpu_latch(
+            cpu_active, cpu_source, cpu_window, 16.0
+        )
+        self.assertEqual(
+            (
+                cpu_recovery.recovery_count,
+                cpu_recovery.recovery_started_mono_s,
+                cpu_recovery.recovery_identity,
+            ),
+            (0, None, None),
+        )
+        with self.assertRaises(ValueError):
+            replace(cpu_recovery, recovery_started_mono_s=16.0)
+
+    def test_recovery_markers_are_rule_typed_and_storage_identity_is_injective(self):
+        memory = self.memory_source(2, 0.0)
+        memory_latch = reduce_memory_latch(
+            empty_latch(RuleId.MEMORY_WATCH), memory, 0.0
+        )
+        memory = self.memory_source(1, 1.0, memory)
+        memory_recovery = reduce_memory_latch(memory_latch, memory, 1.0)
+
+        gib = 1024 ** 3
+        disk = self.disk_source(
+            100 * gib,
+            9 * gib,
+            0.0,
+            volume_id="disk\x1fgroup",
+            mount_point="/data",
+        )
+        disk_latch = reduce_storage_latch(
+            empty_latch(RuleId.STORAGE_WATCH), disk, 0.0
+        )
+        disk = self.disk_source(
+            100 * gib,
+            12 * gib,
+            30.0,
+            disk,
+            volume_id="disk\x1fgroup",
+            mount_point="/data",
+        )
+        disk_recovery = reduce_storage_latch(disk_latch, disk, 30.0)
+        with self.assertRaises(ValueError):
+            replace(
+                disk_recovery,
+                recovery_identity=memory_recovery.recovery_identity,
+            )
+
+        changed = self.disk_source(
+            100 * gib,
+            12 * gib,
+            60.0,
+            disk,
+            volume_id="disk",
+            mount_point="group\x1f/data",
+        )
+        restarted = reduce_storage_latch(disk_recovery, changed, 60.0)
+        self.assertEqual(
+            (
+                restarted.phase,
+                restarted.recovery_count,
+                restarted.recovery_started_mono_s,
+            ),
+            (LatchPhase.RECOVERING, 1, 60.0),
+        )
 
     def test_cpu_intermediate_or_incomplete_evidence_cannot_silently_clear(self):
         source, window = self.cpu_source_and_window(((0.0, 15.0, 90.0),))

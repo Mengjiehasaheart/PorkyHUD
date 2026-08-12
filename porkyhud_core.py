@@ -10,7 +10,6 @@ from typing import Generic, Optional, Tuple, TypeVar
 
 
 T = TypeVar("T")
-_CPU_TIME_ABS_TOLERANCE_S = 1e-9
 
 
 class SourceId(str, Enum):
@@ -248,12 +247,7 @@ class CpuWindowSummary:
         if self.completed_mono_s <= self.started_mono_s:
             raise ValueError("summary window must have positive duration")
         wall_span_s = self.completed_mono_s - self.started_mono_s
-        if wall_span_s < self.duration_s and not math.isclose(
-            wall_span_s,
-            self.duration_s,
-            rel_tol=0.0,
-            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
-        ):
+        if wall_span_s < self.duration_s:
             raise ValueError(
                 "summary wall span cannot be shorter than represented duration"
             )
@@ -495,12 +489,7 @@ def cpu_window_summary(
         for sample in window.samples
     )
     available_duration_s = math.fsum(sample_durations)
-    if available_duration_s < duration_s and not math.isclose(
-        available_duration_s,
-        duration_s,
-        rel_tol=0.0,
-        abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
-    ):
+    if available_duration_s < duration_s:
         return None
 
     completed_mono_s = window.samples[-1].value.window_completed_mono_s
@@ -517,12 +506,7 @@ def cpu_window_summary(
         remaining_duration_s = duration_s - represented_duration_s
         if remaining_duration_s <= 0.0:
             break
-        if sample_duration_s < remaining_duration_s and not math.isclose(
-            sample_duration_s,
-            remaining_duration_s,
-            rel_tol=0.0,
-            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
-        ):
+        if sample_duration_s < remaining_duration_s:
             used_duration_s = sample_duration_s
         else:
             used_duration_s = min(sample_duration_s, remaining_duration_s)
@@ -531,15 +515,7 @@ def cpu_window_summary(
         started_mono_s = usage.window_completed_mono_s - used_duration_s
 
     represented_duration_s = math.fsum(used_durations)
-    if (
-        represented_duration_s < duration_s
-        and not math.isclose(
-            represented_duration_s,
-            duration_s,
-            rel_tol=0.0,
-            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
-        )
-    ) or started_mono_s is None:
+    if represented_duration_s < duration_s or started_mono_s is None:
         return None
     reference_percent = used_segments[0][0]
     mean_percent = reference_percent + math.fsum(
@@ -567,12 +543,7 @@ def _retain_cpu_samples(
         )
         first_retained_index = index
         represented_duration_s = math.fsum(represented_durations)
-        if represented_duration_s > 15.0 or math.isclose(
-            represented_duration_s,
-            15.0,
-            rel_tol=0.0,
-            abs_tol=_CPU_TIME_ABS_TOLERANCE_S,
-        ):
+        if represented_duration_s >= 15.0:
             break
     return samples[first_retained_index:]
 
@@ -769,6 +740,8 @@ class RuleLatch:
             raise ValueError("active latch severity must be watch or critical")
         if self.trigger is None:
             raise ValueError("active latch requires trigger evidence")
+        if self.trigger.revision > self.last_processed_revision:
+            raise ValueError("trigger revision cannot exceed the processed revision")
         if not _rule_matches(self.rule_id, self.severity):
             raise ValueError("rule_id is incompatible with latch severity")
         if self.trigger.source_id is not _rule_source_for(self.rule_id):
@@ -778,13 +751,42 @@ class RuleLatch:
                     self.recovery_started_mono_s is not None,
                     self.recovery_identity is not None)):
                 raise ValueError("active latch cannot carry a recovery streak")
-        elif self.recovery_count > 0 and self.recovery_started_mono_s is None:
-            raise ValueError("recovery streak requires its start time")
-        if self.recovery_identity is not None:
-            last_recovery_mono_s = _recovery_last_time(self.recovery_identity)
-            if (self.recovery_started_mono_s is not None
-                    and last_recovery_mono_s < self.recovery_started_mono_s):
-                raise ValueError("recovery marker cannot precede recovery start")
+            return
+        if self.rule_id is RuleId.CPU_WATCH:
+            if any((self.recovery_count != 0,
+                    self.recovery_started_mono_s is not None,
+                    self.recovery_identity is not None)):
+                raise ValueError("CPU recovery carries no sample-streak metadata")
+            return
+        count_limit = _recovery_count_limit(self.rule_id)
+        if not 1 <= self.recovery_count <= count_limit:
+            raise ValueError("recovery_count is outside the rule's public bound")
+        if self.recovery_started_mono_s is None or self.recovery_identity is None:
+            raise ValueError("non-CPU recovery requires complete streak metadata")
+        if self.recovery_started_mono_s < self.trigger.triggered_mono_s:
+            raise ValueError("recovery cannot begin before its trigger")
+        (last_recovery_mono_s, _identity, trailing_normal_count,
+         trailing_normal_started_mono_s) = _decode_recovery_marker(
+             self.rule_id, self.recovery_identity
+         )
+        if last_recovery_mono_s < self.recovery_started_mono_s:
+            raise ValueError("recovery marker cannot precede recovery start")
+        if last_recovery_mono_s < self.trigger.triggered_mono_s:
+            raise ValueError("recovery marker cannot precede its trigger")
+        if self.rule_id is RuleId.MEMORY_CRITICAL:
+            if (self.recovery_count < 4
+                    and trailing_normal_count > self.recovery_count):
+                raise ValueError(
+                    "trailing normal count exceeds observed noncritical evidence"
+                )
+            if trailing_normal_count > 0:
+                if trailing_normal_started_mono_s is None:
+                    raise ValueError("trailing normal evidence requires a start time")
+                if (trailing_normal_started_mono_s
+                        < self.recovery_started_mono_s
+                        or trailing_normal_started_mono_s
+                        > last_recovery_mono_s):
+                    raise ValueError("trailing normal evidence has incoherent time")
 
 
 def empty_latch(rule_id: RuleId) -> RuleLatch:
@@ -800,11 +802,16 @@ def reduce_memory_latch(
     """Apply the macOS pressure rule without treating retained evidence as live."""
     latch = _validate_latch_for(latch, (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL))
     attempt = _rule_attempt(source, SourceId.MEMORY_PRESSURE, MemoryPressure, now_mono_s)
+    _validate_latch_now(latch, now_mono_s)
     if attempt is None:
         return latch
-    duplicate = _check_attempt_revision(latch, attempt)
+    duplicate, skipped = _check_attempt_revision(latch, attempt)
     if duplicate:
+        if not is_decision_ready(source, now_mono_s):
+            return _reset_recovery(latch, attempt.revision)
         return latch
+    if skipped:
+        latch = _discard_recovery(latch)
     if not is_decision_ready(source, now_mono_s):
         return _reset_recovery(latch, attempt.revision)
     sample = _rule_success(source, attempt, MemoryPressure)
@@ -835,11 +842,16 @@ def reduce_thermal_latch(
     """Apply the explicit OS thermal-warning rule."""
     latch = _validate_latch_for(latch, (RuleId.THERMAL_WATCH,))
     attempt = _rule_attempt(source, SourceId.THERMAL_OS, OsThermalState, now_mono_s)
+    _validate_latch_now(latch, now_mono_s)
     if attempt is None:
         return latch
-    duplicate = _check_attempt_revision(latch, attempt)
+    duplicate, skipped = _check_attempt_revision(latch, attempt)
     if duplicate:
+        if not is_decision_ready(source, now_mono_s):
+            return _reset_recovery(latch, attempt.revision)
         return latch
+    if skipped:
+        latch = _discard_recovery(latch)
     if not is_decision_ready(source, now_mono_s):
         return _reset_recovery(latch, attempt.revision)
     sample = _rule_success(source, attempt, OsThermalState)
@@ -863,11 +875,16 @@ def reduce_storage_latch(
     """Apply low-headroom entry and same-volume recovery confirmation."""
     latch = _validate_latch_for(latch, (RuleId.STORAGE_WATCH,))
     attempt = _rule_attempt(source, SourceId.DISK_CAPACITY, DiskCapacity, now_mono_s)
+    _validate_latch_now(latch, now_mono_s)
     if attempt is None:
         return latch
-    duplicate = _check_attempt_revision(latch, attempt)
+    duplicate, skipped = _check_attempt_revision(latch, attempt)
     if duplicate:
+        if not is_decision_ready(source, now_mono_s):
+            return _reset_recovery(latch, attempt.revision)
         return latch
+    if skipped:
+        latch = _discard_recovery(latch)
     if not is_decision_ready(source, now_mono_s):
         return _reset_recovery(latch, attempt.revision)
     sample = _rule_success(source, attempt, DiskCapacity)
@@ -897,15 +914,20 @@ def reduce_cpu_latch(
     """Latch only sustained, continuously represented CPU pressure."""
     latch = _validate_latch_for(latch, (RuleId.CPU_WATCH,))
     attempt = _rule_attempt(source, SourceId.CPU_USAGE, CpuUsage, now_mono_s)
+    _validate_latch_now(latch, now_mono_s)
     if not isinstance(window, CpuWindow):
         raise ValueError("window must be a CpuWindow")
     if attempt is None:
         return latch
-    duplicate = _check_attempt_revision(latch, attempt)
-    if duplicate:
-        return latch
     if window.last_attempt_revision != attempt.revision:
         raise ValueError("CPU window must include the latest source attempt")
+    duplicate, skipped = _check_attempt_revision(latch, attempt)
+    if duplicate:
+        if not is_decision_ready(source, now_mono_s):
+            return _reset_recovery(latch, attempt.revision)
+        return latch
+    if skipped:
+        latch = _discard_recovery(latch)
     if not is_decision_ready(source, now_mono_s):
         return _reset_recovery(latch, attempt.revision)
     sample = _rule_success(source, attempt, CpuUsage)
@@ -990,6 +1012,8 @@ def _rule_attempt(
             raise ValueError("active source requires an active start time")
         _require_finite_mono(source.active_started_mono_s,
                              "source.active_started_mono_s")
+        if now_mono_s < source.active_started_mono_s:
+            raise ValueError("now_mono_s cannot precede the active attempt")
     attempt = source.last_attempt
     if attempt is None:
         if source.last_valid is not None:
@@ -998,16 +1022,22 @@ def _rule_attempt(
             raise ValueError("inactive source cannot have an uncompleted revision")
         return None
     _validate_cpu_attempt(attempt)
+    if now_mono_s < attempt.completed_mono_s:
+        raise ValueError("now_mono_s cannot precede the completed attempt")
     if source.active_revision is None:
         if attempt.revision != source.revision:
             raise ValueError("completed attempt must match source revision")
     elif (attempt.revision != source.active_revision - 1
           or source.active_started_mono_s < attempt.completed_mono_s):
         raise ValueError("active source cannot skip or precede an attempt")
+    if source.last_valid is not None:
+        _validate_rule_sample(source.last_valid, value_type)
+        if source.last_valid.revision > attempt.revision:
+            raise ValueError("retained sample cannot follow the latest attempt")
+        if now_mono_s < source.last_valid.completed_mono_s:
+            raise ValueError("now_mono_s cannot precede the retained sample")
     if attempt.outcome is AttemptOutcome.SUCCESS:
         _rule_success(source, attempt, value_type)
-    elif source.last_valid is not None:
-        _validate_rule_sample(source.last_valid, value_type)
     return attempt
 
 
@@ -1042,14 +1072,30 @@ def _validate_rule_sample(sample: Sample[T], value_type: type) -> None:
         raise ValueError("sample completion timestamp must be timezone-aware")
 
 
-def _check_attempt_revision(latch: RuleLatch, attempt: CollectionAttempt) -> bool:
-    if attempt.revision == latch.last_processed_revision:
-        return True
-    if attempt.revision < latch.last_processed_revision:
-        raise ValueError("source attempt revision cannot go backwards")
+def _validate_latch_now(latch: RuleLatch, now_mono_s: float) -> None:
+    if latch.trigger is not None and now_mono_s < latch.trigger.triggered_mono_s:
+        raise ValueError("now_mono_s cannot precede the latch trigger")
+    if (latch.recovery_started_mono_s is not None
+            and now_mono_s < latch.recovery_started_mono_s):
+        raise ValueError("now_mono_s cannot precede recovery start")
+    if latch.recovery_identity is not None:
+        last_recovery_mono_s, _, _, _ = _decode_recovery_marker(
+            latch.rule_id, latch.recovery_identity
+        )
+        if now_mono_s < last_recovery_mono_s:
+            raise ValueError("now_mono_s cannot precede latest recovery evidence")
+
+
+def _check_attempt_revision(
+    latch: RuleLatch, attempt: CollectionAttempt
+) -> Tuple[bool, bool]:
     if latch.trigger is not None and attempt.completed_mono_s < latch.trigger.triggered_mono_s:
         raise ValueError("source completion cannot precede latch trigger")
-    return False
+    if attempt.revision == latch.last_processed_revision:
+        return True, False
+    if attempt.revision < latch.last_processed_revision:
+        raise ValueError("source attempt revision cannot go backwards")
+    return False, attempt.revision > latch.last_processed_revision + 1
 
 
 def _trigger(source_id: SourceId, sample: Sample[T], value_text: str) -> TriggerEvidence:
@@ -1076,33 +1122,105 @@ def _reset_recovery(latch: RuleLatch, revision: int) -> RuleLatch:
                      latch.trigger, 0, None, revision, None)
 
 
+def _discard_recovery(latch: RuleLatch) -> RuleLatch:
+    if latch.phase is not LatchPhase.RECOVERING:
+        return latch
+    return RuleLatch(latch.rule_id, latch.severity, LatchPhase.ACTIVE,
+                     latch.trigger, 0, None,
+                     latch.last_processed_revision, None)
+
+
 def _memory_noncritical(
     latch: RuleLatch, sample: Sample[MemoryPressure], revision: int,
     level: MemoryPressureLevel,
 ) -> RuleLatch:
-    progress = _advance_streak(latch, revision, sample.completed_mono_s,
-                               2.5, 5, 4.0, None)
-    if progress.severity is HealthSeverity.CRITICAL:
-        return progress
-    if level is MemoryPressureLevel.WARN:
-        return _active_latch(RuleId.MEMORY_WATCH, HealthSeverity.WATCH,
-                             revision, latch.trigger)
-    # The fifth non-critical normal observation becomes the first independent
-    # normal proof for the subsequent watch recovery.
-    return RuleLatch(RuleId.MEMORY_WATCH, HealthSeverity.WATCH,
-                     LatchPhase.RECOVERING, latch.trigger,
-                     1, sample.completed_mono_s, revision,
-                     _recovery_marker(None, sample.completed_mono_s))
+    completed_mono_s = sample.completed_mono_s
+    continuing = latch.phase is LatchPhase.RECOVERING
+    trailing_normal_count = 0
+    trailing_normal_started_mono_s = None
+    previous_mono_s = None
+    if continuing:
+        (previous_mono_s, _identity, trailing_normal_count,
+         trailing_normal_started_mono_s) = _decode_recovery_marker(
+             RuleId.MEMORY_CRITICAL, latch.recovery_identity
+         )
+        if completed_mono_s < previous_mono_s:
+            raise ValueError("recovery sample time cannot go backwards")
+        if completed_mono_s - previous_mono_s > 2.5:
+            continuing = False
+
+    if continuing:
+        noncritical_count = latch.recovery_count + 1
+        noncritical_started_mono_s = latch.recovery_started_mono_s
+    else:
+        noncritical_count = 1
+        noncritical_started_mono_s = completed_mono_s
+        trailing_normal_count = 0
+        trailing_normal_started_mono_s = None
+
+    if level is MemoryPressureLevel.NORMAL:
+        if continuing and trailing_normal_count > 0:
+            trailing_normal_count += 1
+        else:
+            trailing_normal_count = 1
+            trailing_normal_started_mono_s = completed_mono_s
+    else:
+        trailing_normal_count = 0
+        trailing_normal_started_mono_s = None
+
+    if (noncritical_count >= 5
+            and completed_mono_s - noncritical_started_mono_s >= 4.0):
+        if level is MemoryPressureLevel.WARN:
+            return _active_latch(
+                RuleId.MEMORY_WATCH, HealthSeverity.WATCH, revision,
+                latch.trigger,
+            )
+        if (trailing_normal_count >= 10
+                and completed_mono_s - trailing_normal_started_mono_s >= 9.0):
+            return _clear_latch(RuleId.MEMORY_WATCH, revision)
+        watch_count = min(trailing_normal_count, 9)
+        return RuleLatch(
+            RuleId.MEMORY_WATCH,
+            HealthSeverity.WATCH,
+            LatchPhase.RECOVERING,
+            latch.trigger,
+            watch_count,
+            trailing_normal_started_mono_s,
+            revision,
+            _recovery_marker(RuleId.MEMORY_WATCH, completed_mono_s),
+        )
+
+    critical_count = min(noncritical_count, 4)
+    return RuleLatch(
+        RuleId.MEMORY_CRITICAL,
+        HealthSeverity.CRITICAL,
+        LatchPhase.RECOVERING,
+        latch.trigger,
+        critical_count,
+        noncritical_started_mono_s,
+        revision,
+        _recovery_marker(
+            RuleId.MEMORY_CRITICAL,
+            completed_mono_s,
+            trailing_normal_count=min(trailing_normal_count, 9),
+            trailing_normal_started_mono_s=trailing_normal_started_mono_s,
+        ),
+    )
 
 
 def _advance_streak(
     latch: RuleLatch, revision: int, completed_mono_s: float, max_gap_s: float,
-    required_count: int, required_span_s: float, identity: Optional[str],
+    required_count: int, required_span_s: float,
+    identity: Optional[Tuple[str, str]],
 ) -> RuleLatch:
-    previous_time = _recovery_last_time(latch.recovery_identity)
-    same_identity = _recovery_base_identity(latch.recovery_identity) == identity
-    if (latch.phase is not LatchPhase.RECOVERING or not same_identity
-            or previous_time is None):
+    previous_time = None
+    previous_identity = None
+    if latch.phase is LatchPhase.RECOVERING:
+        previous_time, previous_identity, _, _ = _decode_recovery_marker(
+            latch.rule_id, latch.recovery_identity
+        )
+    same_identity = previous_identity == identity
+    if latch.phase is not LatchPhase.RECOVERING or not same_identity:
         count = 1
         started = completed_mono_s
     else:
@@ -1114,38 +1232,150 @@ def _advance_streak(
         else:
             count = latch.recovery_count + 1
             started = latch.recovery_started_mono_s
-    marker = _recovery_marker(identity, completed_mono_s)
+    marker = _recovery_marker(latch.rule_id, completed_mono_s, identity)
     if count >= required_count and completed_mono_s - started >= required_span_s:
         return _clear_latch(latch.rule_id, revision)
+    count = min(count, required_count - 1)
     return RuleLatch(latch.rule_id, latch.severity, LatchPhase.RECOVERING,
                      latch.trigger, count, started, revision, marker)
 
 
-def _recovery_marker(identity: Optional[str], last_mono_s: float) -> str:
-    base = "" if identity is None else identity
-    return "%s\x1f%.17g" % (base, last_mono_s)
-
-
-def _recovery_base_identity(marker: Optional[str]) -> Optional[str]:
-    if marker is None:
-        return None
-    if "\x1f" not in marker:
-        raise ValueError("recovery_identity is malformed")
-    base, _ = marker.rsplit("\x1f", 1)
-    return base or None
-
-
-def _recovery_last_time(marker: Optional[str]) -> Optional[float]:
-    if marker is None:
-        return None
-    if "\x1f" not in marker:
-        raise ValueError("recovery_identity is malformed")
-    _, encoded = marker.rsplit("\x1f", 1)
+def _recovery_count_limit(rule_id: RuleId) -> int:
+    limits = {
+        RuleId.MEMORY_CRITICAL: 4,
+        RuleId.MEMORY_WATCH: 9,
+        RuleId.THERMAL_WATCH: 2,
+        RuleId.STORAGE_WATCH: 1,
+    }
     try:
-        value = float(encoded)
+        return limits[rule_id]
+    except KeyError:
+        raise ValueError("rule has no sample-streak recovery metadata")
+
+
+def _recovery_marker(
+    rule_id: RuleId,
+    last_mono_s: float,
+    identity: Optional[Tuple[str, str]] = None,
+    trailing_normal_count: int = 0,
+    trailing_normal_started_mono_s: Optional[float] = None,
+) -> str:
+    _require_finite_mono(last_mono_s, "recovery marker timestamp")
+    prefix = "v1|%s|" % rule_id.value
+    encoded_last = float(last_mono_s).hex()
+    if rule_id is RuleId.STORAGE_WATCH:
+        if (not isinstance(identity, tuple) or len(identity) != 2
+                or not all(isinstance(part, str) and part for part in identity)):
+            raise ValueError("storage recovery requires a two-part identity")
+        if trailing_normal_count != 0 or trailing_normal_started_mono_s is not None:
+            raise ValueError("storage recovery cannot carry memory metadata")
+        volume_id, mount_point = identity
+        return "%s%d:%s%d:%s%s" % (
+            prefix,
+            len(volume_id),
+            volume_id,
+            len(mount_point),
+            mount_point,
+            encoded_last,
+        )
+    if identity is not None:
+        raise ValueError("only storage recovery accepts an identity")
+    if rule_id is RuleId.MEMORY_CRITICAL:
+        if type(trailing_normal_count) is not int or not 0 <= trailing_normal_count <= 9:
+            raise ValueError("trailing normal count is outside its bound")
+        if trailing_normal_count == 0:
+            if trailing_normal_started_mono_s is not None:
+                raise ValueError("empty trailing normal state cannot have a start")
+            encoded_start = "-"
+        else:
+            if trailing_normal_started_mono_s is None:
+                raise ValueError("trailing normal state requires a start")
+            _require_finite_mono(
+                trailing_normal_started_mono_s,
+                "trailing normal recovery start",
+            )
+            encoded_start = float(trailing_normal_started_mono_s).hex()
+        return "%s%s|%d|%s" % (
+            prefix, encoded_last, trailing_normal_count, encoded_start
+        )
+    if trailing_normal_count != 0 or trailing_normal_started_mono_s is not None:
+        raise ValueError("rule cannot carry trailing normal metadata")
+    if rule_id not in (RuleId.MEMORY_WATCH, RuleId.THERMAL_WATCH):
+        raise ValueError("rule has no encoded recovery marker")
+    return prefix + encoded_last
+
+
+def _decode_recovery_marker(
+    rule_id: RuleId, marker: Optional[str]
+) -> Tuple[float, Optional[Tuple[str, str]], int, Optional[float]]:
+    if not isinstance(marker, str):
+        raise ValueError("recovery_identity is malformed")
+    prefix = "v1|%s|" % rule_id.value
+    if not marker.startswith(prefix):
+        raise ValueError("recovery_identity has the wrong rule type")
+    payload = marker[len(prefix):]
+    if rule_id is RuleId.STORAGE_WATCH:
+        volume_id, offset = _read_length_prefixed(payload, 0)
+        mount_point, offset = _read_length_prefixed(payload, offset)
+        if not volume_id or not mount_point:
+            raise ValueError("storage recovery identity cannot be empty")
+        last_mono_s = _decode_mono_hex(payload[offset:])
+        return last_mono_s, (volume_id, mount_point), 0, None
+    if rule_id is RuleId.MEMORY_CRITICAL:
+        parts = payload.split("|")
+        if len(parts) != 3:
+            raise ValueError("critical memory recovery marker is malformed")
+        last_mono_s = _decode_mono_hex(parts[0])
+        if not parts[1].isdigit() or str(int(parts[1])) != parts[1]:
+            raise ValueError("critical memory trailing count is malformed")
+        trailing_normal_count = int(parts[1])
+        if not 0 <= trailing_normal_count <= 9:
+            raise ValueError("critical memory trailing count is outside its bound")
+        if trailing_normal_count == 0:
+            if parts[2] != "-":
+                raise ValueError("empty trailing normal state has a start")
+            trailing_normal_started_mono_s = None
+        else:
+            if parts[2] == "-":
+                raise ValueError("trailing normal state lacks a start")
+            trailing_normal_started_mono_s = _decode_mono_hex(parts[2])
+            if trailing_normal_started_mono_s > last_mono_s:
+                raise ValueError("trailing normal start follows latest evidence")
+        return (
+            last_mono_s,
+            None,
+            trailing_normal_count,
+            trailing_normal_started_mono_s,
+        )
+    if rule_id not in (RuleId.MEMORY_WATCH, RuleId.THERMAL_WATCH):
+        raise ValueError("rule has no encoded recovery marker")
+    return _decode_mono_hex(payload), None, 0, None
+
+
+def _read_length_prefixed(payload: str, offset: int) -> Tuple[str, int]:
+    colon = payload.find(":", offset)
+    if colon < 0:
+        raise ValueError("storage recovery identity is malformed")
+    encoded_length = payload[offset:colon]
+    if (not encoded_length.isdigit()
+            or str(int(encoded_length)) != encoded_length):
+        raise ValueError("storage recovery identity length is malformed")
+    length = int(encoded_length)
+    start = colon + 1
+    end = start + length
+    if end > len(payload):
+        raise ValueError("storage recovery identity is truncated")
+    return payload[start:end], end
+
+
+def _decode_mono_hex(encoded: str) -> float:
+    try:
+        value = float.fromhex(encoded)
     except ValueError:
         raise ValueError("recovery_identity has an invalid timestamp")
     _require_finite_mono(value, "recovery_identity timestamp")
+    if float(value).hex() != encoded:
+        raise ValueError("recovery_identity timestamp is not canonical")
     return value
 
 
@@ -1157,5 +1387,5 @@ def _storage_recovered(disk: DiskCapacity) -> bool:
     return disk.free_bytes * 100 >= disk.total_bytes * 12 or disk.free_bytes >= 25 * 1024 ** 3
 
 
-def _volume_identity(disk: DiskCapacity) -> str:
-    return "%s\x1f%s" % (disk.volume_id, disk.mount_point)
+def _volume_identity(disk: DiskCapacity) -> Tuple[str, str]:
+    return disk.volume_id, disk.mount_point
