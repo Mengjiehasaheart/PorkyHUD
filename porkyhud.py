@@ -50,6 +50,9 @@ from porkyhud_core import (
     ProcessFact,
     SourceId,
     SourceState,
+    complete_failure,
+    complete_success,
+    start_attempt,
     validate_source_state,
 )
 
@@ -417,6 +420,291 @@ class AsyncPoller:
                 next_thread = self._prepare_thread(self.last_finish)
         if next_thread is not None:
             next_thread.start()
+
+
+class SourcePoller(Generic[T]):
+    """Single-flight scheduler for collectors that return typed evidence."""
+
+    _RETRY_DELAYS = (1.0, 2.0, 4.0, 10.0)
+    _TERMINAL_OUTCOMES = (
+        AttemptOutcome.UNSUPPORTED,
+        AttemptOutcome.NOT_APPLICABLE,
+    )
+
+    def __init__(
+        self,
+        initial_state: SourceState[T],
+        collector: Callable[[], AdapterResult[T]],
+    ) -> None:
+        if not isinstance(initial_state, SourceState):
+            raise ValueError("initial_state must be a SourceState")
+        if initial_state.active_revision is not None:
+            raise ValueError("initial_state cannot have an active attempt")
+        validation_now = 0.0
+        if initial_state.last_attempt is not None:
+            validation_now = max(
+                validation_now, initial_state.last_attempt.completed_mono_s
+            )
+        if initial_state.last_valid is not None:
+            validation_now = max(
+                validation_now, initial_state.last_valid.completed_mono_s
+            )
+        validate_source_state(initial_state, validation_now)
+        if not callable(collector):
+            raise ValueError("collector must be callable")
+
+        self._state = initial_state
+        self._collector = collector
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._work_pending = False
+        self._pending_revision: Optional[int] = None
+        self._force_pending = False
+        self._failure_count = 0
+        self._next_due_mono_s: Optional[float] = None
+        self._automatic_stopped = False
+        self._closed = False
+        self._initialize_schedule(initial_state)
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def _initialize_schedule(self, state: SourceState[T]) -> None:
+        attempt = state.last_attempt
+        if attempt is None:
+            return
+        if attempt.outcome is AttemptOutcome.SUCCESS:
+            self._next_due_mono_s = (
+                attempt.completed_mono_s + state.expected_cadence_s
+            )
+        elif attempt.outcome in self._TERMINAL_OUTCOMES:
+            self._automatic_stopped = True
+        else:
+            self._failure_count = 1
+            self._next_due_mono_s = attempt.completed_mono_s + 1.0
+
+    @staticmethod
+    def _validate_mono(value: float, label: str) -> float:
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+        ):
+            raise ValueError("%s must be a finite int or float" % label)
+        return float(value)
+
+    def tick(
+        self, now_mono_s: float, force: bool = False
+    ) -> SourceState[T]:
+        now_mono_s = self._validate_mono(now_mono_s, "now_mono_s")
+        if type(force) is not bool:
+            raise ValueError("force must be a bool")
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("source poller is closed")
+            if self._state.active_revision is not None:
+                if force:
+                    self._failure_count = 0
+                    self._automatic_stopped = False
+                    self._next_due_mono_s = None
+                    self._force_pending = True
+                return self._state
+
+            due = (
+                not self._automatic_stopped
+                and (
+                    self._next_due_mono_s is None
+                    or now_mono_s >= self._next_due_mono_s
+                )
+            )
+            if force or due:
+                state, revision = start_attempt(self._state, now_mono_s)
+                self._state = state
+                self._pending_revision = revision
+                self._work_pending = True
+                if force:
+                    self._failure_count = 0
+                    self._automatic_stopped = False
+                    self._next_due_mono_s = None
+                self._condition.notify_all()
+            return self._state
+
+    def snapshot(self) -> SourceState[T]:
+        with self._condition:
+            return self._state
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        timeout_s = self._validate_mono(timeout_s, "timeout_s")
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be nonnegative")
+        with self._condition:
+            self._closed = True
+            self._force_pending = False
+            if (
+                self._work_pending
+                and self._pending_revision is not None
+                and self._state.active_revision == self._pending_revision
+            ):
+                completed_mono_s, completed_at_utc = self._fallback_completion(
+                    self._state.active_started_mono_s or 0.0
+                )
+                self._state = complete_failure(
+                    self._state,
+                    self._pending_revision,
+                    AttemptOutcome.CANCELLED,
+                    FailureCode.USER_CANCELLED,
+                    completed_mono_s,
+                    completed_at_utc,
+                )
+                self._pending_revision = None
+            self._work_pending = False
+            self._condition.notify_all()
+            worker = self._worker
+        if worker is not threading.current_thread():
+            worker.join(timeout_s)
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._work_pending:
+                    if self._closed:
+                        return
+                    self._condition.wait()
+                if self._closed:
+                    self._work_pending = False
+                    return
+                revision = self._pending_revision
+                self._work_pending = False
+
+            try:
+                result: Any = self._collector()
+            except BaseException:
+                result = None
+
+            with self._condition:
+                if revision is None or self._state.active_revision != revision:
+                    if self._pending_revision == revision:
+                        self._pending_revision = None
+                    self._condition.notify_all()
+                    if self._closed:
+                        return
+                    continue
+
+                completion_mono_s = self._complete_locked(revision, result)
+                self._pending_revision = None
+                if self._force_pending and not self._closed:
+                    self._force_pending = False
+                    self._failure_count = 0
+                    self._automatic_stopped = False
+                    self._next_due_mono_s = None
+                    state, next_revision = start_attempt(
+                        self._state, completion_mono_s
+                    )
+                    self._state = state
+                    self._pending_revision = next_revision
+                    self._work_pending = True
+                self._condition.notify_all()
+                if self._closed and not self._work_pending:
+                    return
+
+    def _complete_locked(self, revision: int, result: Any) -> float:
+        started_mono_s = self._state.active_started_mono_s
+        if started_mono_s is None:
+            return 0.0
+        validated = self._validated_result(result, started_mono_s)
+        if validated is None:
+            completed_mono_s, completed_at_utc = self._fallback_completion(
+                started_mono_s
+            )
+            self._state = complete_failure(
+                self._state,
+                revision,
+                AttemptOutcome.UNKNOWN_ERROR,
+                FailureCode.UNEXPECTED_EXCEPTION,
+                completed_mono_s,
+                completed_at_utc,
+            )
+            outcome = AttemptOutcome.UNKNOWN_ERROR
+        elif validated.outcome is AttemptOutcome.SUCCESS:
+            self._state = complete_success(
+                self._state,
+                revision,
+                validated.value,
+                validated.completed_mono_s,
+                validated.completed_at_utc,
+            )
+            completed_mono_s = validated.completed_mono_s
+            outcome = validated.outcome
+        else:
+            self._state = complete_failure(
+                self._state,
+                revision,
+                validated.outcome,
+                validated.failure,
+                validated.completed_mono_s,
+                validated.completed_at_utc,
+            )
+            completed_mono_s = validated.completed_mono_s
+            outcome = validated.outcome
+
+        if outcome is AttemptOutcome.SUCCESS:
+            self._failure_count = 0
+            self._automatic_stopped = False
+            self._next_due_mono_s = (
+                completed_mono_s + self._state.expected_cadence_s
+            )
+        elif outcome in self._TERMINAL_OUTCOMES:
+            self._automatic_stopped = True
+            self._next_due_mono_s = None
+        else:
+            self._failure_count += 1
+            delay_index = min(
+                self._failure_count - 1, len(self._RETRY_DELAYS) - 1
+            )
+            self._automatic_stopped = False
+            self._next_due_mono_s = (
+                completed_mono_s + self._RETRY_DELAYS[delay_index]
+            )
+        return completed_mono_s
+
+    @staticmethod
+    def _validated_result(
+        result: Any, accepted_started_mono_s: float
+    ) -> Optional[AdapterResult[Any]]:
+        if not isinstance(result, AdapterResult):
+            return None
+        try:
+            validated = AdapterResult(
+                result.value,
+                result.started_mono_s,
+                result.completed_mono_s,
+                result.completed_at_utc,
+                result.outcome,
+                result.failure,
+            )
+        except BaseException:
+            return None
+        if validated.started_mono_s < accepted_started_mono_s:
+            return None
+        return validated
+
+    @staticmethod
+    def _fallback_completion(started_mono_s: float) -> tuple[float, datetime]:
+        try:
+            sampled_mono_s = time.monotonic()
+        except BaseException:
+            sampled_mono_s = started_mono_s
+        if (
+            type(sampled_mono_s) not in (int, float)
+            or not math.isfinite(sampled_mono_s)
+        ):
+            sampled_mono_s = started_mono_s
+        completed_mono_s = max(float(sampled_mono_s), started_mono_s)
+        try:
+            completed_at_utc = _normalize_utc_timestamp(
+                utc_now(), "source completion timestamp"
+            )
+        except BaseException:
+            completed_at_utc = datetime.now(timezone.utc)
+        return completed_mono_s, completed_at_utc
 
 
 def run_command(args: list[str], timeout: float = 2.0) -> str:

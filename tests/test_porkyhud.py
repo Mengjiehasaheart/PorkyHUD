@@ -1968,6 +1968,610 @@ class AsyncPollerTests(unittest.TestCase):
         self.assertEqual(poller.last_finish, 50.0)
 
 
+class SourcePollerTests(unittest.TestCase):
+    UTC = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+
+    class ScriptedCollector:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+            self.condition = threading.Condition()
+
+        def __call__(self):
+            with self.condition:
+                index = self.calls
+                self.calls += 1
+                self.condition.notify_all()
+            outcome = self.outcomes[index]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if callable(outcome):
+                return outcome()
+            return outcome
+
+        def wait_for_calls(self, count, timeout=2.0):
+            with self.condition:
+                return self.condition.wait_for(lambda: self.calls >= count, timeout)
+
+    class BlockingCollector:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.condition = threading.Condition()
+
+        def __call__(self):
+            with self.condition:
+                index = self.calls
+                self.calls += 1
+                self.condition.notify_all()
+            if index == 0:
+                self.started.set()
+                if not self.release.wait(2.0):
+                    raise RuntimeError("test collector was not released")
+            return self.outcomes[index]
+
+        def wait_for_calls(self, count, timeout=2.0):
+            with self.condition:
+                return self.condition.wait_for(lambda: self.calls >= count, timeout)
+
+    @classmethod
+    def success(cls, value, started, completed):
+        return porkyhud.AdapterResult(
+            value,
+            started,
+            completed,
+            cls.UTC,
+            core.AttemptOutcome.SUCCESS,
+            None,
+        )
+
+    @classmethod
+    def failure(cls, outcome, failure, started, completed):
+        return porkyhud.AdapterResult(
+            None,
+            started,
+            completed,
+            cls.UTC,
+            outcome,
+            failure,
+        )
+
+    def register_poller(self, poller, release=None):
+        self.addCleanup(poller.close)
+        if release is not None:
+            self.addCleanup(release.set)
+        return poller
+
+    def wait_for_state(self, poller, predicate, timeout=2.0):
+        with poller._condition:
+            return poller._condition.wait_for(
+                lambda: predicate(poller._state), timeout
+            )
+
+    def assert_completed_revision(self, poller, revision):
+        self.assertTrue(
+            self.wait_for_state(
+                poller,
+                lambda state: state.active_revision is None
+                and state.last_attempt is not None
+                and state.last_attempt.revision == revision,
+            )
+        )
+
+    def test_pristine_source_starts_immediately_and_cadence_boundary_is_inclusive(self):
+        collector = self.ScriptedCollector(
+            [self.success("first", 0.0, 0.25), self.success("second", 1.25, 1.5)]
+        )
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                collector,
+            )
+        )
+
+        active = poller.tick(0.0)
+        self.assertEqual(active.active_revision, 1)
+        self.assert_completed_revision(poller, 1)
+        self.assertEqual(poller.snapshot().last_valid.value, "first")
+
+        poller.tick(1.249)
+        self.assertEqual(collector.calls, 1)
+        poller.tick(1.25)
+        self.assertTrue(collector.wait_for_calls(2))
+        self.assert_completed_revision(poller, 2)
+        self.assertEqual(poller.snapshot().last_valid.value, "second")
+
+    def test_retry_backoff_is_one_two_four_ten_ten_and_success_resets_it(self):
+        failure = (core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT)
+        results = [
+            self.failure(*failure, 0.0, 0.1),
+            self.failure(*failure, 1.1, 1.2),
+            self.failure(*failure, 3.2, 3.3),
+            self.failure(*failure, 7.3, 7.4),
+            self.failure(*failure, 17.4, 17.5),
+            self.failure(*failure, 27.5, 27.6),
+            self.success("recovered", 37.6, 37.7),
+            self.failure(*failure, 38.7, 38.8),
+            self.success("reset", 39.8, 39.9),
+        ]
+        collector = self.ScriptedCollector(results)
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                collector,
+            )
+        )
+
+        poller.tick(0.0)
+        self.assert_completed_revision(poller, 1)
+        due_times = [1.1, 3.2, 7.3, 17.4, 27.5, 37.6, 38.7, 39.8]
+        for expected_calls, due in enumerate(due_times, start=2):
+            poller.tick(due - 0.001)
+            self.assertEqual(collector.calls, expected_calls - 1)
+            poller.tick(due)
+            self.assertTrue(collector.wait_for_calls(expected_calls))
+            self.assert_completed_revision(poller, expected_calls)
+        self.assertEqual(poller.snapshot().last_valid.value, "reset")
+
+    def test_every_nonterminal_failure_retries_at_the_first_backoff_boundary(self):
+        failures = (
+            (core.AttemptOutcome.PERMISSION_DENIED, core.FailureCode.PERMISSION_DENIED),
+            (core.AttemptOutcome.MISSING_DEPENDENCY, core.FailureCode.MISSING_EXECUTABLE),
+            (core.AttemptOutcome.TIMEOUT, core.FailureCode.DEADLINE_EXCEEDED),
+            (core.AttemptOutcome.COMMAND_ERROR, core.FailureCode.NONZERO_EXIT),
+            (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.PARSER_REJECTED),
+            (core.AttemptOutcome.CANCELLED, core.FailureCode.USER_CANCELLED),
+            (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+        )
+        for outcome, failure in failures:
+            with self.subTest(outcome=outcome):
+                collector = self.ScriptedCollector(
+                    [
+                        self.failure(outcome, failure, 0.0, 0.2),
+                        self.success("ready", 1.2, 1.3),
+                    ]
+                )
+                poller = porkyhud.SourcePoller(
+                    core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                    collector,
+                )
+                try:
+                    poller.tick(0.0)
+                    self.assert_completed_revision(poller, 1)
+                    poller.tick(1.199)
+                    self.assertEqual(collector.calls, 1)
+                    poller.tick(1.2)
+                    self.assertTrue(collector.wait_for_calls(2))
+                    self.assert_completed_revision(poller, 2)
+                finally:
+                    poller.close()
+
+    def test_terminal_outcomes_stop_automatic_attempts_but_force_recovers(self):
+        terminal = (
+            (core.AttemptOutcome.UNSUPPORTED, core.FailureCode.UNSUPPORTED_CAPABILITY),
+            (core.AttemptOutcome.NOT_APPLICABLE, core.FailureCode.NOT_APPLICABLE),
+        )
+        for outcome, failure in terminal:
+            with self.subTest(outcome=outcome):
+                collector = self.ScriptedCollector(
+                    [
+                        self.failure(outcome, failure, 0.0, 0.2),
+                        self.success("rechecked", 100.0, 100.2),
+                    ]
+                )
+                poller = porkyhud.SourcePoller(
+                    core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                    collector,
+                )
+                try:
+                    poller.tick(0.0)
+                    self.assert_completed_revision(poller, 1)
+                    poller.tick(100.0)
+                    self.assertEqual(collector.calls, 1)
+                    poller.tick(100.0, force=True)
+                    self.assertTrue(collector.wait_for_calls(2))
+                    self.assert_completed_revision(poller, 2)
+                    self.assertEqual(poller.snapshot().last_valid.value, "rechecked")
+                finally:
+                    poller.close()
+
+    def test_force_during_backoff_resets_the_failure_sequence(self):
+        timeout = (core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT)
+        collector = self.ScriptedCollector(
+            [
+                self.failure(*timeout, 0.0, 0.2),
+                self.failure(*timeout, 0.3, 0.4),
+                self.success("ready", 1.4, 1.5),
+            ]
+        )
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            )
+        )
+        poller.tick(0.0)
+        self.assert_completed_revision(poller, 1)
+        poller.tick(0.3, force=True)
+        self.assert_completed_revision(poller, 2)
+        poller.tick(1.399)
+        self.assertEqual(collector.calls, 2)
+        poller.tick(1.4)
+        self.assert_completed_revision(poller, 3)
+
+    def test_force_while_running_queues_exactly_one_follow_up_including_terminal_result(self):
+        collector = self.BlockingCollector(
+            [
+                self.failure(
+                    core.AttemptOutcome.UNSUPPORTED,
+                    core.FailureCode.UNSUPPORTED_CAPABILITY,
+                    0.0,
+                    0.2,
+                ),
+                self.success("forced", 0.2, 0.3),
+            ]
+        )
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            ),
+            collector.release,
+        )
+        poller.tick(0.0, force=True)
+        self.assertTrue(collector.started.wait(1.0))
+        poller.tick(0.1, force=True)
+        poller.tick(0.15, force=True)
+        collector.release.set()
+        self.assertTrue(collector.wait_for_calls(2))
+        self.assert_completed_revision(poller, 2)
+        self.assertEqual(collector.calls, 2)
+        self.assertEqual(poller.snapshot().last_valid.value, "forced")
+
+    def test_force_during_the_forced_follow_up_queues_only_one_more_attempt(self):
+        class MultiBlockingCollector:
+            def __init__(self, outcomes):
+                self.outcomes = outcomes
+                self.calls = 0
+                self.started = [threading.Event() for _ in outcomes]
+                self.release = [threading.Event() for _ in outcomes]
+                self.condition = threading.Condition()
+
+            def __call__(self):
+                with self.condition:
+                    index = self.calls
+                    self.calls += 1
+                    self.condition.notify_all()
+                self.started[index].set()
+                if not self.release[index].wait(2.0):
+                    raise RuntimeError("test collector was not released")
+                return self.outcomes[index]
+
+            def wait_for_calls(self, count):
+                with self.condition:
+                    return self.condition.wait_for(lambda: self.calls >= count, 2.0)
+
+        collector = MultiBlockingCollector(
+            [
+                self.success("first", 0.0, 0.2),
+                self.success("second", 0.2, 0.4),
+                self.success("third", 0.4, 0.6),
+            ]
+        )
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+        )
+        self.addCleanup(poller.close)
+        self.addCleanup(lambda: [event.set() for event in collector.release])
+
+        poller.tick(0.0)
+        self.assertTrue(collector.started[0].wait(1.0))
+        poller.tick(0.1, force=True)
+        collector.release[0].set()
+        self.assertTrue(collector.wait_for_calls(2))
+        self.assertTrue(collector.started[1].wait(1.0))
+        poller.tick(0.3, force=True)
+        poller.tick(0.35, force=True)
+        collector.release[1].set()
+        self.assertTrue(collector.wait_for_calls(3))
+        collector.release[2].set()
+        self.assert_completed_revision(poller, 3)
+        self.assertEqual(collector.calls, 3)
+
+    def test_failed_refresh_retains_last_valid_and_latest_failure(self):
+        initial = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        initial, revision = core.start_attempt(initial, 0.0)
+        initial = core.complete_success(initial, revision, "old", 0.2, self.UTC)
+        collector = self.ScriptedCollector(
+            [
+                self.failure(
+                    core.AttemptOutcome.PARSE_ERROR,
+                    core.FailureCode.PARSER_REJECTED,
+                    1.2,
+                    1.3,
+                )
+            ]
+        )
+        poller = self.register_poller(porkyhud.SourcePoller(initial, collector))
+        poller.tick(1.2)
+        self.assert_completed_revision(poller, 2)
+        state = poller.snapshot()
+        self.assertEqual((state.last_valid.value, state.last_valid.revision), ("old", 1))
+        self.assertEqual(state.last_attempt.outcome, core.AttemptOutcome.PARSE_ERROR)
+        self.assertFalse(core.is_decision_ready(state, 1.3))
+
+    def test_exception_wrong_type_and_corrupt_timing_become_bounded_unknown_failures(self):
+        corrupt = object.__new__(porkyhud.AdapterResult)
+        for name, value in (
+            ("value", "bad"),
+            ("started_mono_s", 9.0),
+            ("completed_mono_s", 10.1),
+            ("completed_at_utc", self.UTC),
+            ("outcome", core.AttemptOutcome.SUCCESS),
+            ("failure", None),
+        ):
+            object.__setattr__(corrupt, name, value)
+        cases = (
+            RuntimeError("secret collector detail"),
+            object(),
+            corrupt,
+        )
+        for case in cases:
+            with self.subTest(case=type(case).__name__):
+                collector = self.ScriptedCollector([case])
+                poller = porkyhud.SourcePoller(
+                    core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+                    collector,
+                )
+                try:
+                    with mock.patch.object(porkyhud.time, "monotonic", return_value=10.5), \
+                            mock.patch.object(porkyhud, "utc_now", return_value=self.UTC):
+                        poller.tick(10.0)
+                        self.assert_completed_revision(poller, 1)
+                    attempt = poller.snapshot().last_attempt
+                    self.assertEqual(
+                        (attempt.outcome, attempt.failure),
+                        (
+                            core.AttemptOutcome.UNKNOWN_ERROR,
+                            core.FailureCode.UNEXPECTED_EXCEPTION,
+                        ),
+                    )
+                    self.assertEqual(attempt.started_mono_s, 10.0)
+                    self.assertEqual(attempt.completed_mono_s, 10.5)
+                finally:
+                    poller.close()
+
+    def test_stale_private_completion_cannot_overwrite_a_newer_active_revision(self):
+        returned = threading.Event()
+        holder = []
+
+        def stale_collector():
+            newer = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+            newer, revision = core.start_attempt(newer, 0.0)
+            newer = core.complete_success(newer, revision, "newer", 0.05, self.UTC)
+            newer, _ = core.start_attempt(newer, 0.1)
+            with holder[0]._condition:
+                holder[0]._state = newer
+            returned.set()
+            return self.success("stale", 0.0, 0.2)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), stale_collector
+        )
+        holder.append(poller)
+        self.addCleanup(poller.close)
+        poller.tick(0.0)
+        self.assertTrue(returned.wait(1.0))
+        with poller._condition:
+            self.assertTrue(
+                poller._condition.wait_for(
+                    lambda: poller._state.active_revision == 2, 1.0
+                )
+            )
+        poller.close()
+        state = poller.snapshot()
+        self.assertEqual(state.active_revision, 2)
+        self.assertEqual(state.last_valid.value, "newer")
+
+    def test_invalid_tick_and_close_values_are_rejected_without_closing(self):
+        collector = self.ScriptedCollector([self.success("ready", 0.0, 0.1)])
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            )
+        )
+        for invalid in (True, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(kind="tick", invalid=invalid), self.assertRaises(ValueError):
+                poller.tick(invalid)
+        for invalid in (True, -0.1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(kind="close", invalid=invalid), self.assertRaises(ValueError):
+                poller.close(invalid)
+        poller.tick(0.0)
+        self.assert_completed_revision(poller, 1)
+
+    def test_initial_active_state_is_rejected_and_all_completed_shapes_schedule_correctly(self):
+        active = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        active, _ = core.start_attempt(active, 0.0)
+        with self.assertRaises(ValueError):
+            porkyhud.SourcePoller(active, self.ScriptedCollector([]))
+
+        success = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        success, revision = core.start_attempt(success, 0.0)
+        success = core.complete_success(success, revision, "old", 0.2, self.UTC)
+        retry = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        retry, revision = core.start_attempt(retry, 0.0)
+        retry = core.complete_failure(
+            retry,
+            revision,
+            core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+            0.2,
+            self.UTC,
+        )
+        terminal = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        terminal, revision = core.start_attempt(terminal, 0.0)
+        terminal = core.complete_failure(
+            terminal,
+            revision,
+            core.AttemptOutcome.NOT_APPLICABLE,
+            core.FailureCode.NOT_APPLICABLE,
+            0.2,
+            self.UTC,
+        )
+
+        states_and_boundaries = (
+            (success, 1.199, 1.2, True),
+            (retry, 1.199, 1.2, True),
+            (terminal, 100.0, 100.0, False),
+        )
+        for state, before, due, starts in states_and_boundaries:
+            with self.subTest(outcome=state.last_attempt.outcome):
+                start_time = due
+                collector = self.ScriptedCollector(
+                    [self.success("fresh", start_time, start_time + 0.1)]
+                )
+                poller = porkyhud.SourcePoller(state, collector)
+                try:
+                    poller.tick(before)
+                    self.assertEqual(collector.calls, 0)
+                    poller.tick(due)
+                    if starts:
+                        self.assertTrue(collector.wait_for_calls(1))
+                        self.assert_completed_revision(poller, 2)
+                    else:
+                        self.assertEqual(collector.calls, 0)
+                finally:
+                    poller.close()
+
+    def test_one_persistent_worker_stays_single_flight_across_one_thousand_ticks(self):
+        collector = self.BlockingCollector([self.success("ready", 0.0, 0.2)])
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            ),
+            collector.release,
+        )
+        worker = poller._worker
+        poller.tick(0.0)
+        self.assertTrue(collector.started.wait(1.0))
+        for index in range(1000):
+            poller.tick(index / 1000.0)
+        self.assertIs(poller._worker, worker)
+        self.assertEqual(collector.calls, 1)
+        collector.release.set()
+        self.assert_completed_revision(poller, 1)
+        poller.close()
+        self.assertFalse(worker.is_alive())
+
+    def test_close_suppresses_queued_force_is_idempotent_and_tick_then_raises(self):
+        collector = self.BlockingCollector(
+            [
+                self.success("first", 0.0, 0.2),
+                self.success("forbidden", 0.2, 0.3),
+            ]
+        )
+        poller = self.register_poller(
+            porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            ),
+            collector.release,
+        )
+        worker = poller._worker
+        poller.tick(0.0)
+        self.assertTrue(collector.started.wait(1.0))
+        poller.tick(0.1, force=True)
+        collector.release.set()
+        poller.close(1.0)
+        poller.close(1.0)
+        self.assertEqual(collector.calls, 1)
+        self.assertFalse(worker.is_alive())
+        with self.assertRaises(RuntimeError):
+            poller.tick(1.0)
+
+    def test_zero_timeout_close_is_bounded_and_worker_exits_after_collector_release(self):
+        collector = self.BlockingCollector([self.success("ready", 0.0, 0.2)])
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+        )
+        worker = poller._worker
+        poller.tick(0.0)
+        self.assertTrue(collector.started.wait(1.0))
+        poller.close(0.0)
+        self.assertTrue(worker.is_alive())
+        collector.release.set()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+
+    def test_close_before_worker_consumes_accepted_work_suppresses_collection(self):
+        real_thread = threading.Thread
+
+        class GatedThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.gate = threading.Event()
+                self.thread = real_thread(target=self.run, daemon=daemon)
+
+            def run(self):
+                self.gate.wait(2.0)
+                self.target()
+
+            def start(self):
+                self.thread.start()
+
+            def join(self, timeout=None):
+                self.thread.join(timeout)
+
+            def is_alive(self):
+                return self.thread.is_alive()
+
+        collector = self.ScriptedCollector([self.success("forbidden", 0.0, 0.2)])
+        with mock.patch.object(porkyhud.threading, "Thread", GatedThread):
+            poller = porkyhud.SourcePoller(
+                core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+            )
+        worker = poller._worker
+        try:
+            poller.tick(0.0)
+            poller.close(0.0)
+            worker.gate.set()
+            worker.join(1.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(collector.calls, 0)
+            state = poller.snapshot()
+            self.assertIsNone(state.active_revision)
+            self.assertEqual(
+                (state.last_attempt.outcome, state.last_attempt.failure),
+                (
+                    core.AttemptOutcome.CANCELLED,
+                    core.FailureCode.USER_CANCELLED,
+                ),
+            )
+        finally:
+            worker.gate.set()
+            worker.join(1.0)
+
+    def test_worker_can_close_its_own_poller_without_self_joining(self):
+        holder = []
+        closed_inside = threading.Event()
+
+        def collector():
+            holder[0].close()
+            closed_inside.set()
+            return self.success("ready", 0.0, 0.2)
+
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5), collector
+        )
+        holder.append(poller)
+        worker = poller._worker
+        poller.tick(0.0)
+        self.assertTrue(closed_inside.wait(1.0))
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        with self.assertRaises(RuntimeError):
+            poller.tick(1.0)
+
+
 class LayoutAndRenderingTests(unittest.TestCase):
     def test_narrow_cpu_lane_fallback_is_total_and_shows_100_percent(self) -> None:
         with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
