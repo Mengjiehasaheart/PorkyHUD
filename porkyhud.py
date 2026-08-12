@@ -433,6 +433,19 @@ class HealthFrame:
             raise ValueError("assessment must be a HealthAssessment")
         if not isinstance(self.origin, FrameOrigin):
             raise ValueError("origin must be a FrameOrigin")
+        if not isinstance(self.contributor, CpuContributor):
+            raise ValueError("contributor must be a CpuContributor")
+        for value, value_type, name in (
+            (self.cpu_percent, float, "cpu_percent"),
+            (self.memory_pressure, MemoryPressure, "memory_pressure"),
+            (self.thermal, OsThermalState, "thermal"),
+            (self.disk_capacity, DiskCapacity, "disk_capacity"),
+        ):
+            if value is not None and not isinstance(value, value_type):
+                raise ValueError("%s has the wrong type" % name)
+        if self.cpu_percent is not None and (
+                not math.isfinite(self.cpu_percent) or self.cpu_percent < 0 or self.cpu_percent > 100):
+            raise ValueError("cpu_percent must be finite in 0..100")
         if (type(self.captured_mono_s) not in (int, float)
                 or not math.isfinite(self.captured_mono_s)):
             raise ValueError("captured_mono_s must be finite")
@@ -440,6 +453,10 @@ class HealthFrame:
                 type(self.decisive_triggered_mono_s) not in (int, float)
                 or not math.isfinite(self.decisive_triggered_mono_s)):
             raise ValueError("decisive_triggered_mono_s must be finite or None")
+        if self.decisive_triggered_mono_s is not None and (
+                self.decisive_triggered_mono_s < 0
+                or self.decisive_triggered_mono_s > self.captured_mono_s):
+            raise ValueError("decisive trigger must be nonnegative and no later than capture")
         ordered = dict(self.source_views)
         if tuple(ordered) != tuple(source_id for source_id, _cadence, _stale in LIVE_SOURCE_SPECS):
             raise ValueError("source_views must contain the live registry in order")
@@ -4204,15 +4221,7 @@ def _sanitized_process_state(
     rows = state.last_valid.value
     if type(rows) is not tuple or any(not isinstance(row, ProcessRow) for row in rows):
         raise ValueError("process table sample must contain ProcessRow values")
-    facts = tuple(
-        ProcessFact(
-            row.pid,
-            visible_command(row.command, 160) or "a process",
-            row.cpu,
-            parse_elapsed_seconds(row.etime),
-        )
-        for row in rows
-    )
+    facts = process_facts(rows)
     sample = replace(state.last_valid, value=facts)
     return replace(state, last_valid=sample)
 
@@ -4339,6 +4348,7 @@ class LiveHealthCoordinator:
         self._frame = initial_health_frame(0.0)
         self._per_core: tuple[float, ...] = ()
         self._per_core_revision = 0
+        self._cpu_per_core_by_completion: dict[tuple[int, float], tuple[float, ...]] = {}
         self._system_gpu_percent: Optional[float] = None
         self._previous_time: Optional[tuple[float, datetime]] = None
         self._cpu_sampler: MacCpuSampler
@@ -4355,6 +4365,11 @@ class LiveHealthCoordinator:
 
         def collect_cpu() -> AdapterResult[CpuUsage]:
             result = cpu_sampler.sample_usage()
+            per_core = tuple(cpu_sampler.last_per_core)
+            if result.outcome is AttemptOutcome.SUCCESS:
+                with self._lock:
+                    if self._generation == generation and not self._closed:
+                        self._cpu_per_core_by_completion[(generation, result.completed_mono_s)] = per_core
             return result
 
         def collect_gpu() -> AdapterResult[GpuProcessSample]:
@@ -4446,7 +4461,9 @@ class LiveHealthCoordinator:
                     and cpu.last_attempt.outcome is AttemptOutcome.SUCCESS
                     and cpu.last_valid is not None
                     and cpu.last_valid.revision != self._per_core_revision):
-                self._per_core = tuple(self._cpu_sampler.last_per_core)
+                self._per_core = self._cpu_per_core_by_completion.get(
+                    (self._generation, cpu.last_valid.completed_mono_s), (),
+                )
                 self._per_core_revision = cpu.last_valid.revision
             return self._frame
 
@@ -5673,6 +5690,19 @@ def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
 
 
 def hud(screen: curses.window) -> None:
+    """Own terminal-session cleanup even when input or drawing raises."""
+
+    coordinators: list[LiveHealthCoordinator] = []
+    try:
+        _hud_impl(screen, coordinators)
+    finally:
+        if coordinators:
+            coordinators[0].close()
+
+
+def _hud_impl(
+    screen: curses.window, coordinators: list[LiveHealthCoordinator],
+) -> None:
     try:
         curses.curs_set(0)
     except curses.error:
@@ -5690,6 +5720,7 @@ def hud(screen: curses.window) -> None:
     screen.refresh()
 
     coordinator = LiveHealthCoordinator()
+    coordinators.append(coordinator)
     static: dict[str, Any] = {}
 
     def collect_live_static() -> dict[str, Any]:
@@ -5739,7 +5770,8 @@ def hud(screen: curses.window) -> None:
     last_render = 0.0
 
     def quit_hud() -> None:
-        coordinator.close()
+        # The outer hud() finally owns the single aggregate close.
+        return None
 
     while True:
         now = time.monotonic()
@@ -5849,6 +5881,7 @@ def hud(screen: curses.window) -> None:
         sampled_sensor, sensor_age, _sensor_error = sensor_poller.snapshot(now)
         if sampled_sensor is not None:
             sensor = replace(sampled_sensor, sensor_sample_age_s=sensor_age)
+            coordinator.set_system_gpu_percent(sensor.gpu_active_percent)
 
         disk_activity_poller.tick(now, force_disk_activity)
         sampled_activity, activity_age, _activity_error = disk_activity_poller.snapshot(now)
