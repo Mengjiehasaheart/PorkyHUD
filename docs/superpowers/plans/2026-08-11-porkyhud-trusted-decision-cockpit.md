@@ -447,7 +447,7 @@ def test_storage_requires_both_entry_thresholds(self):
         (100 * gib, 9 * gib, True),
         (300 * gib, 25 * gib, False),
         (100 * gib, 10 * gib, False),
-        (1000 * gib, 19 * gib, False),
+        (1000 * gib, 19 * gib, True),
     )
     for total, free, expected_active in cases:
         with self.subTest(total=total, free=free):

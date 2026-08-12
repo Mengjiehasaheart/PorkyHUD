@@ -689,3 +689,473 @@ def _failure_status(source_id: SourceId, outcome: AttemptOutcome) -> SourceViewS
     if outcome is AttemptOutcome.MISSING_DEPENDENCY:
         return SourceViewStatus.MISSING
     return SourceViewStatus.ERROR
+
+
+class HealthSeverity(str, Enum):
+    NORMAL = "normal"
+    WATCH = "watch"
+    CRITICAL = "critical"
+    UNKNOWN = "unknown"
+
+
+class LatchPhase(str, Enum):
+    CLEAR = "clear"
+    ACTIVE = "active"
+    RECOVERING = "recovering"
+
+
+class RuleId(str, Enum):
+    MEMORY_CRITICAL = "memory.critical"
+    THERMAL_WATCH = "thermal.watch"
+    MEMORY_WATCH = "memory.watch"
+    STORAGE_WATCH = "storage.watch"
+    CPU_WATCH = "cpu.watch"
+
+
+@dataclass(frozen=True)
+class TriggerEvidence:
+    source_id: SourceId
+    revision: int
+    triggered_mono_s: float
+    value_text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_id, SourceId):
+            raise ValueError("trigger source_id must be a SourceId")
+        if type(self.revision) is not int or self.revision <= 0:
+            raise ValueError("trigger revision must be a positive int")
+        _require_finite_mono(self.triggered_mono_s, "triggered_mono_s")
+        if not isinstance(self.value_text, str) or not self.value_text:
+            raise ValueError("trigger value_text must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class RuleLatch:
+    rule_id: RuleId
+    severity: Optional[HealthSeverity]
+    phase: LatchPhase
+    trigger: Optional[TriggerEvidence]
+    recovery_count: int
+    recovery_started_mono_s: Optional[float]
+    last_processed_revision: int
+    recovery_identity: Optional[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rule_id, RuleId):
+            raise ValueError("rule_id must be a RuleId")
+        if self.severity is not None and not isinstance(self.severity, HealthSeverity):
+            raise ValueError("severity must be a HealthSeverity or None")
+        if not isinstance(self.phase, LatchPhase):
+            raise ValueError("phase must be a LatchPhase")
+        if self.trigger is not None and not isinstance(self.trigger, TriggerEvidence):
+            raise ValueError("trigger must be TriggerEvidence or None")
+        if type(self.recovery_count) is not int or self.recovery_count < 0:
+            raise ValueError("recovery_count must be a nonnegative int")
+        if self.recovery_started_mono_s is not None:
+            _require_finite_mono(self.recovery_started_mono_s,
+                                 "recovery_started_mono_s")
+        if type(self.last_processed_revision) is not int or self.last_processed_revision < 0:
+            raise ValueError("last_processed_revision must be a nonnegative int")
+        if self.recovery_identity is not None and not isinstance(self.recovery_identity, str):
+            raise ValueError("recovery_identity must be a string or None")
+        if self.phase is LatchPhase.CLEAR:
+            if any((self.severity is not None, self.trigger is not None,
+                    self.recovery_count != 0,
+                    self.recovery_started_mono_s is not None,
+                    self.recovery_identity is not None)):
+                raise ValueError("clear latch cannot retain warning or recovery metadata")
+            return
+        if self.severity not in (HealthSeverity.WATCH, HealthSeverity.CRITICAL):
+            raise ValueError("active latch severity must be watch or critical")
+        if self.trigger is None:
+            raise ValueError("active latch requires trigger evidence")
+        if not _rule_matches(self.rule_id, self.severity):
+            raise ValueError("rule_id is incompatible with latch severity")
+        if self.trigger.source_id is not _rule_source_for(self.rule_id):
+            raise ValueError("trigger source_id is incompatible with rule_id")
+        if self.phase is LatchPhase.ACTIVE:
+            if any((self.recovery_count != 0,
+                    self.recovery_started_mono_s is not None,
+                    self.recovery_identity is not None)):
+                raise ValueError("active latch cannot carry a recovery streak")
+        elif self.recovery_count > 0 and self.recovery_started_mono_s is None:
+            raise ValueError("recovery streak requires its start time")
+        if self.recovery_identity is not None:
+            last_recovery_mono_s = _recovery_last_time(self.recovery_identity)
+            if (self.recovery_started_mono_s is not None
+                    and last_recovery_mono_s < self.recovery_started_mono_s):
+                raise ValueError("recovery marker cannot precede recovery start")
+
+
+def empty_latch(rule_id: RuleId) -> RuleLatch:
+    """Create the only structurally clear state for a rule family."""
+    if not isinstance(rule_id, RuleId):
+        raise ValueError("rule_id must be a RuleId")
+    return RuleLatch(rule_id, None, LatchPhase.CLEAR, None, 0, None, 0, None)
+
+
+def reduce_memory_latch(
+    latch: RuleLatch, source: SourceState[MemoryPressure], now_mono_s: float
+) -> RuleLatch:
+    """Apply the macOS pressure rule without treating retained evidence as live."""
+    latch = _validate_latch_for(latch, (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL))
+    attempt = _rule_attempt(source, SourceId.MEMORY_PRESSURE, MemoryPressure, now_mono_s)
+    if attempt is None:
+        return latch
+    duplicate = _check_attempt_revision(latch, attempt)
+    if duplicate:
+        return latch
+    if not is_decision_ready(source, now_mono_s):
+        return _reset_recovery(latch, attempt.revision)
+    sample = _rule_success(source, attempt, MemoryPressure)
+    level = sample.value.level
+    if level is MemoryPressureLevel.CRITICAL:
+        return _active_latch(
+            RuleId.MEMORY_CRITICAL, HealthSeverity.CRITICAL, attempt.revision,
+            _trigger(source.source_id, sample, "memory pressure level 4"),
+        )
+    if level is MemoryPressureLevel.WARN:
+        if latch.severity is HealthSeverity.CRITICAL:
+            return _memory_noncritical(latch, sample, attempt.revision, level)
+        return _active_latch(
+            RuleId.MEMORY_WATCH, HealthSeverity.WATCH, attempt.revision,
+            _trigger(source.source_id, sample, "memory pressure level 2"),
+        )
+    if latch.phase is LatchPhase.CLEAR:
+        return _clear_latch(latch.rule_id, attempt.revision)
+    if latch.severity is HealthSeverity.CRITICAL:
+        return _memory_noncritical(latch, sample, attempt.revision, level)
+    return _advance_streak(latch, attempt.revision, sample.completed_mono_s,
+                           2.5, 10, 9.0, None)
+
+
+def reduce_thermal_latch(
+    latch: RuleLatch, source: SourceState[OsThermalState], now_mono_s: float
+) -> RuleLatch:
+    """Apply the explicit OS thermal-warning rule."""
+    latch = _validate_latch_for(latch, (RuleId.THERMAL_WATCH,))
+    attempt = _rule_attempt(source, SourceId.THERMAL_OS, OsThermalState, now_mono_s)
+    if attempt is None:
+        return latch
+    duplicate = _check_attempt_revision(latch, attempt)
+    if duplicate:
+        return latch
+    if not is_decision_ready(source, now_mono_s):
+        return _reset_recovery(latch, attempt.revision)
+    sample = _rule_success(source, attempt, OsThermalState)
+    value = sample.value
+    if value.thermal_warning_level > 0 or value.performance_warning_level > 0:
+        return _active_latch(
+            RuleId.THERMAL_WATCH, HealthSeverity.WATCH, attempt.revision,
+            _trigger(source.source_id, sample,
+                     "thermal=%d performance=%d" % (
+                         value.thermal_warning_level, value.performance_warning_level)),
+        )
+    if latch.phase is LatchPhase.CLEAR:
+        return _clear_latch(latch.rule_id, attempt.revision)
+    return _advance_streak(latch, attempt.revision, sample.completed_mono_s,
+                           12.0, 3, 10.0, None)
+
+
+def reduce_storage_latch(
+    latch: RuleLatch, source: SourceState[DiskCapacity], now_mono_s: float
+) -> RuleLatch:
+    """Apply low-headroom entry and same-volume recovery confirmation."""
+    latch = _validate_latch_for(latch, (RuleId.STORAGE_WATCH,))
+    attempt = _rule_attempt(source, SourceId.DISK_CAPACITY, DiskCapacity, now_mono_s)
+    if attempt is None:
+        return latch
+    duplicate = _check_attempt_revision(latch, attempt)
+    if duplicate:
+        return latch
+    if not is_decision_ready(source, now_mono_s):
+        return _reset_recovery(latch, attempt.revision)
+    sample = _rule_success(source, attempt, DiskCapacity)
+    disk = sample.value
+    if _storage_low(disk):
+        return _active_latch(
+            RuleId.STORAGE_WATCH, HealthSeverity.WATCH, attempt.revision,
+            _trigger(source.source_id, sample,
+                     "%d bytes free of %d bytes on %s" % (
+                         disk.free_bytes, disk.total_bytes, disk.volume_id)),
+        )
+    if latch.phase is LatchPhase.CLEAR:
+        return _clear_latch(latch.rule_id, attempt.revision)
+    if not _storage_recovered(disk):
+        return _reset_recovery(latch, attempt.revision)
+    return _advance_streak(latch, attempt.revision, sample.completed_mono_s,
+                           75.0, 2, 30.0,
+                           _volume_identity(disk))
+
+
+def reduce_cpu_latch(
+    latch: RuleLatch,
+    source: SourceState[CpuUsage],
+    window: CpuWindow,
+    now_mono_s: float,
+) -> RuleLatch:
+    """Latch only sustained, continuously represented CPU pressure."""
+    latch = _validate_latch_for(latch, (RuleId.CPU_WATCH,))
+    attempt = _rule_attempt(source, SourceId.CPU_USAGE, CpuUsage, now_mono_s)
+    if not isinstance(window, CpuWindow):
+        raise ValueError("window must be a CpuWindow")
+    if attempt is None:
+        return latch
+    duplicate = _check_attempt_revision(latch, attempt)
+    if duplicate:
+        return latch
+    if window.last_attempt_revision != attempt.revision:
+        raise ValueError("CPU window must include the latest source attempt")
+    if not is_decision_ready(source, now_mono_s):
+        return _reset_recovery(latch, attempt.revision)
+    sample = _rule_success(source, attempt, CpuUsage)
+    entry = cpu_window_summary(window, 15.0)
+    if entry is not None and entry.mean_percent >= 90.0:
+        return _active_latch(
+            RuleId.CPU_WATCH, HealthSeverity.WATCH, attempt.revision,
+            _trigger(source.source_id, sample,
+                     "%.1f%% mean over 15s" % entry.mean_percent),
+        )
+    if latch.phase is LatchPhase.CLEAR:
+        return _clear_latch(latch.rule_id, attempt.revision)
+    recovery = cpu_window_summary(window, 10.0)
+    if recovery is not None and recovery.mean_percent <= 70.0:
+        return _clear_latch(latch.rule_id, attempt.revision)
+    return RuleLatch(latch.rule_id, latch.severity, LatchPhase.RECOVERING,
+                     latch.trigger, 0, None, attempt.revision, None)
+
+
+def _rule_matches(rule_id: RuleId, severity: HealthSeverity) -> bool:
+    return (
+        (rule_id is RuleId.MEMORY_CRITICAL and severity is HealthSeverity.CRITICAL)
+        or (rule_id in (RuleId.MEMORY_WATCH, RuleId.THERMAL_WATCH,
+                        RuleId.STORAGE_WATCH, RuleId.CPU_WATCH)
+            and severity is HealthSeverity.WATCH)
+    )
+
+
+def _rule_source_for(rule_id: RuleId) -> SourceId:
+    if rule_id in (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL):
+        return SourceId.MEMORY_PRESSURE
+    if rule_id is RuleId.THERMAL_WATCH:
+        return SourceId.THERMAL_OS
+    if rule_id is RuleId.STORAGE_WATCH:
+        return SourceId.DISK_CAPACITY
+    return SourceId.CPU_USAGE
+
+
+def _validate_latch_for(latch: RuleLatch, permitted: Tuple[RuleId, ...]) -> RuleLatch:
+    if not isinstance(latch, RuleLatch) or latch.rule_id not in permitted:
+        raise ValueError("latch has the wrong rule family")
+    if latch.trigger is not None and latch.trigger.source_id not in _rule_sources(permitted):
+        raise ValueError("latch trigger belongs to the wrong source family")
+    return latch
+
+
+def _rule_sources(rule_ids: Tuple[RuleId, ...]) -> Tuple[SourceId, ...]:
+    sources = []
+    for rule_id in rule_ids:
+        if rule_id in (RuleId.MEMORY_WATCH, RuleId.MEMORY_CRITICAL):
+            sources.append(SourceId.MEMORY_PRESSURE)
+        elif rule_id is RuleId.THERMAL_WATCH:
+            sources.append(SourceId.THERMAL_OS)
+        elif rule_id is RuleId.STORAGE_WATCH:
+            sources.append(SourceId.DISK_CAPACITY)
+        else:
+            sources.append(SourceId.CPU_USAGE)
+    return tuple(sources)
+
+
+def _rule_attempt(
+    source: SourceState[T], source_id: SourceId, value_type: type,
+    now_mono_s: float,
+) -> Optional[CollectionAttempt]:
+    _require_finite_mono(now_mono_s, "now_mono_s")
+    if not isinstance(source, SourceState) or source.source_id is not source_id:
+        raise ValueError("source has the wrong SourceId")
+    _require_finite_positive(source.expected_cadence_s, "source.expected_cadence_s")
+    _require_finite_positive(source.stale_after_s, "source.stale_after_s")
+    if source.stale_after_s < source.expected_cadence_s:
+        raise ValueError("source stale_after_s is shorter than cadence")
+    if type(source.revision) is not int or source.revision < 0:
+        raise ValueError("source revision must be a nonnegative int")
+    if source.active_revision is None:
+        if source.active_started_mono_s is not None:
+            raise ValueError("inactive source cannot retain an active start time")
+    else:
+        if (type(source.active_revision) is not int or source.active_revision <= 0
+                or source.active_revision != source.revision):
+            raise ValueError("active source revision is inconsistent")
+        if source.active_started_mono_s is None:
+            raise ValueError("active source requires an active start time")
+        _require_finite_mono(source.active_started_mono_s,
+                             "source.active_started_mono_s")
+    attempt = source.last_attempt
+    if attempt is None:
+        if source.last_valid is not None:
+            raise ValueError("source cannot retain a sample without an attempt")
+        if source.active_revision is None and source.revision != 0:
+            raise ValueError("inactive source cannot have an uncompleted revision")
+        return None
+    _validate_cpu_attempt(attempt)
+    if source.active_revision is None:
+        if attempt.revision != source.revision:
+            raise ValueError("completed attempt must match source revision")
+    elif (attempt.revision != source.active_revision - 1
+          or source.active_started_mono_s < attempt.completed_mono_s):
+        raise ValueError("active source cannot skip or precede an attempt")
+    if attempt.outcome is AttemptOutcome.SUCCESS:
+        _rule_success(source, attempt, value_type)
+    elif source.last_valid is not None:
+        _validate_rule_sample(source.last_valid, value_type)
+    return attempt
+
+
+def _rule_success(
+    source: SourceState[T], attempt: CollectionAttempt, value_type: type
+) -> Sample[T]:
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        raise ValueError("successful source sample requires a successful attempt")
+    sample = source.last_valid
+    if sample is None or sample.revision != attempt.revision:
+        raise ValueError("successful attempt lacks matching sample revision")
+    _validate_rule_sample(sample, value_type)
+    if (sample.started_mono_s != attempt.started_mono_s
+            or sample.completed_mono_s != attempt.completed_mono_s
+            or sample.completed_at_utc != attempt.completed_at_utc):
+        raise ValueError("successful sample does not match completed attempt")
+    return sample
+
+
+def _validate_rule_sample(sample: Sample[T], value_type: type) -> None:
+    if not isinstance(sample, Sample):
+        raise ValueError("source last_valid must be a Sample")
+    if not isinstance(sample.value, value_type):
+        raise ValueError("sample value has the wrong normalized fact type")
+    if type(sample.revision) is not int or sample.revision <= 0:
+        raise ValueError("sample revision must be a positive int")
+    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
+    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
+    if sample.completed_mono_s < sample.started_mono_s:
+        raise ValueError("sample completion cannot precede its start")
+    if sample.completed_at_utc.tzinfo is None or sample.completed_at_utc.utcoffset() is None:
+        raise ValueError("sample completion timestamp must be timezone-aware")
+
+
+def _check_attempt_revision(latch: RuleLatch, attempt: CollectionAttempt) -> bool:
+    if attempt.revision == latch.last_processed_revision:
+        return True
+    if attempt.revision < latch.last_processed_revision:
+        raise ValueError("source attempt revision cannot go backwards")
+    if latch.trigger is not None and attempt.completed_mono_s < latch.trigger.triggered_mono_s:
+        raise ValueError("source completion cannot precede latch trigger")
+    return False
+
+
+def _trigger(source_id: SourceId, sample: Sample[T], value_text: str) -> TriggerEvidence:
+    return TriggerEvidence(source_id, sample.revision, sample.completed_mono_s, value_text)
+
+
+def _active_latch(
+    rule_id: RuleId, severity: HealthSeverity, revision: int,
+    trigger: TriggerEvidence,
+) -> RuleLatch:
+    return RuleLatch(rule_id, severity, LatchPhase.ACTIVE, trigger,
+                     0, None, revision, None)
+
+
+def _clear_latch(rule_id: RuleId, revision: int) -> RuleLatch:
+    return RuleLatch(rule_id, None, LatchPhase.CLEAR, None,
+                     0, None, revision, None)
+
+
+def _reset_recovery(latch: RuleLatch, revision: int) -> RuleLatch:
+    if latch.phase is LatchPhase.CLEAR:
+        return _clear_latch(latch.rule_id, revision)
+    return RuleLatch(latch.rule_id, latch.severity, LatchPhase.ACTIVE,
+                     latch.trigger, 0, None, revision, None)
+
+
+def _memory_noncritical(
+    latch: RuleLatch, sample: Sample[MemoryPressure], revision: int,
+    level: MemoryPressureLevel,
+) -> RuleLatch:
+    progress = _advance_streak(latch, revision, sample.completed_mono_s,
+                               2.5, 5, 4.0, None)
+    if progress.severity is HealthSeverity.CRITICAL:
+        return progress
+    if level is MemoryPressureLevel.WARN:
+        return _active_latch(RuleId.MEMORY_WATCH, HealthSeverity.WATCH,
+                             revision, latch.trigger)
+    # The fifth non-critical normal observation becomes the first independent
+    # normal proof for the subsequent watch recovery.
+    return RuleLatch(RuleId.MEMORY_WATCH, HealthSeverity.WATCH,
+                     LatchPhase.RECOVERING, latch.trigger,
+                     1, sample.completed_mono_s, revision,
+                     _recovery_marker(None, sample.completed_mono_s))
+
+
+def _advance_streak(
+    latch: RuleLatch, revision: int, completed_mono_s: float, max_gap_s: float,
+    required_count: int, required_span_s: float, identity: Optional[str],
+) -> RuleLatch:
+    previous_time = _recovery_last_time(latch.recovery_identity)
+    same_identity = _recovery_base_identity(latch.recovery_identity) == identity
+    if (latch.phase is not LatchPhase.RECOVERING or not same_identity
+            or previous_time is None):
+        count = 1
+        started = completed_mono_s
+    else:
+        if completed_mono_s < previous_time:
+            raise ValueError("recovery sample time cannot go backwards")
+        if completed_mono_s - previous_time > max_gap_s:
+            count = 1
+            started = completed_mono_s
+        else:
+            count = latch.recovery_count + 1
+            started = latch.recovery_started_mono_s
+    marker = _recovery_marker(identity, completed_mono_s)
+    if count >= required_count and completed_mono_s - started >= required_span_s:
+        return _clear_latch(latch.rule_id, revision)
+    return RuleLatch(latch.rule_id, latch.severity, LatchPhase.RECOVERING,
+                     latch.trigger, count, started, revision, marker)
+
+
+def _recovery_marker(identity: Optional[str], last_mono_s: float) -> str:
+    base = "" if identity is None else identity
+    return "%s\x1f%.17g" % (base, last_mono_s)
+
+
+def _recovery_base_identity(marker: Optional[str]) -> Optional[str]:
+    if marker is None:
+        return None
+    if "\x1f" not in marker:
+        raise ValueError("recovery_identity is malformed")
+    base, _ = marker.rsplit("\x1f", 1)
+    return base or None
+
+
+def _recovery_last_time(marker: Optional[str]) -> Optional[float]:
+    if marker is None:
+        return None
+    if "\x1f" not in marker:
+        raise ValueError("recovery_identity is malformed")
+    _, encoded = marker.rsplit("\x1f", 1)
+    try:
+        value = float(encoded)
+    except ValueError:
+        raise ValueError("recovery_identity has an invalid timestamp")
+    _require_finite_mono(value, "recovery_identity timestamp")
+    return value
+
+
+def _storage_low(disk: DiskCapacity) -> bool:
+    return disk.free_bytes * 100 < disk.total_bytes * 10 and disk.free_bytes < 20 * 1024 ** 3
+
+
+def _storage_recovered(disk: DiskCapacity) -> bool:
+    return disk.free_bytes * 100 >= disk.total_bytes * 12 or disk.free_bytes >= 25 * 1024 ** 3
+
+
+def _volume_identity(disk: DiskCapacity) -> str:
+    return "%s\x1f%s" % (disk.volume_id, disk.mount_point)
