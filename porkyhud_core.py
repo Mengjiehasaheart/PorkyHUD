@@ -139,6 +139,8 @@ def new_source(
     source_id: SourceId, expected_cadence_s: float, stale_after_s: float
 ) -> SourceState[T]:
     """Create an empty source state with a validated freshness budget."""
+    if not isinstance(source_id, SourceId):
+        raise ValueError("source_id must be a SourceId")
     _require_finite_positive(expected_cadence_s, "expected_cadence_s")
     _require_finite_positive(stale_after_s, "stale_after_s")
     if stale_after_s < expected_cadence_s:
@@ -206,6 +208,10 @@ def complete_failure(
     completed_at_utc: datetime,
 ) -> SourceState[T]:
     """Record a proven failed attempt without replacing the last valid sample."""
+    if not isinstance(outcome, AttemptOutcome):
+        raise ValueError("outcome must be an AttemptOutcome")
+    if failure is not None and not isinstance(failure, FailureCode):
+        raise ValueError("failure must be a FailureCode or None")
     if outcome is AttemptOutcome.SUCCESS:
         raise ValueError("success must be completed with complete_success")
     if failure not in _LEGAL_FAILURES.get(outcome, set()):
@@ -281,13 +287,14 @@ def source_view(state: SourceState[T], now_mono_s: float) -> SourceView:
 
 
 def _require_finite_positive(value: float, name: str) -> None:
-    if not math.isfinite(value) or value <= 0:
+    _require_finite_mono(value, name)
+    if value <= 0:
         raise ValueError("%s must be finite and positive" % name)
 
 
 def _require_finite_mono(value: float, name: str) -> None:
-    if not math.isfinite(value):
-        raise ValueError("%s must be finite" % name)
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError("%s must be a finite int or float" % name)
 
 
 def _validate_completion(
@@ -296,6 +303,8 @@ def _validate_completion(
     completed_mono_s: float,
     completed_at_utc: datetime,
 ) -> Tuple[float, datetime]:
+    if type(revision) is not int:
+        raise ValueError("revision must be an int")
     if state.active_revision != revision or state.active_started_mono_s is None:
         raise ValueError("completion does not match an active revision")
     _require_finite_mono(completed_mono_s, "completed_mono_s")

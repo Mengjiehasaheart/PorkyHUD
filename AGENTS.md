@@ -59,15 +59,17 @@ The intended direction is:
 
 ```text
 entry points and presentation
-        ↓
-effects orchestration
-        ↓
-pure policy and shared models
-        ↓
-macOS commands and native adapters
+              ↓
+     effects orchestration
+       ↙                 ↘
+pure policy and       collectors and
+shared models         effect adapters
+                            ↓
+                  macOS commands and
+                     native APIs
 ```
 
-`porkyhud_core.py` may depend only on the standard-library pure-model allowlist (`dataclasses`, `datetime`, `enum`, `math`, and `typing`) and must not import `porkyhud.py`, clocks, I/O, or platform APIs. Rendering may consume models and formatter helpers. Collectors must not depend on curses or panel geometry. Native and subprocess adapters must not decide layout. Snapshot and future integration adapters should consume collector results without driving the interactive HUD.
+Effects orchestration may depend on both the pure policy module and collectors/adapters; neither branch depends on the other. `porkyhud_core.py` may depend only on the standard-library pure-model allowlist (`dataclasses`, `datetime`, `enum`, `math`, and `typing`) and must not import `porkyhud.py`, clocks, I/O, or platform APIs. Rendering may consume models and formatter helpers. Collectors must not depend on curses or panel geometry. Native and subprocess adapters must not decide layout. Snapshot and future integration adapters should consume collector results without driving the interactive HUD.
 
 ### `area:source-state`
 

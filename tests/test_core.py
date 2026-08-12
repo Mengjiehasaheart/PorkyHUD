@@ -87,6 +87,16 @@ class SourceStateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     new_source(SourceId.CPU_USAGE, cadence, stale_after)
 
+    def test_source_id_must_be_an_enum_member(self):
+        with self.assertRaises(ValueError):
+            new_source(SourceId.SENSOR_POWERMETRICS.value, 1.0, 2.5)
+
+    def test_source_configuration_rejects_boolean_values(self):
+        for cadence, stale_after in ((True, 2.5), (1.0, True)):
+            with self.subTest(cadence=cadence, stale_after=stale_after):
+                with self.assertRaises(ValueError):
+                    new_source(SourceId.CPU_USAGE, cadence, stale_after)
+
     def test_reducers_return_new_immutable_state_and_increase_revisions(self):
         initial = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
         active, first_revision = start_attempt(initial, 10.0)
@@ -113,6 +123,24 @@ class SourceStateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     complete_success(active, revision, "normal", completed, UTC_NOW)
 
+    def test_attempt_start_rejects_boolean_monotonic_time(self):
+        state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        with self.assertRaises(ValueError):
+            start_attempt(state, True)
+
+    def test_completion_rejects_boolean_monotonic_time(self):
+        state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        active, revision = start_attempt(state, 0.0)
+        with self.assertRaises(ValueError):
+            complete_success(active, revision, "normal", True, UTC_NOW)
+
+    def test_sample_age_rejects_boolean_current_time(self):
+        state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        active, revision = start_attempt(state, 0.0)
+        complete = complete_success(active, revision, "normal", 0.5, UTC_NOW)
+        with self.assertRaises(ValueError):
+            sample_age_s(complete, True)
+
     def test_completions_require_an_active_matching_revision_once(self):
         state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
         active, revision = start_attempt(state, 10.0)
@@ -121,6 +149,34 @@ class SourceStateTests(unittest.TestCase):
         complete = complete_success(active, revision, "normal", 10.1, UTC_NOW)
         with self.assertRaises(ValueError):
             complete_success(complete, revision, "normal", 10.2, UTC_NOW)
+
+    def test_completions_require_plain_integer_revisions(self):
+        for completion in ("success", "failure"):
+            for invalid_revision in (1.0, True):
+                with self.subTest(
+                    completion=completion,
+                    invalid_revision=invalid_revision,
+                ):
+                    state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+                    active, _ = start_attempt(state, 10.0)
+                    with self.assertRaises(ValueError):
+                        if completion == "success":
+                            complete_success(
+                                active,
+                                invalid_revision,
+                                "normal",
+                                10.1,
+                                UTC_NOW,
+                            )
+                        else:
+                            complete_failure(
+                                active,
+                                invalid_revision,
+                                AttemptOutcome.TIMEOUT,
+                                FailureCode.COMMAND_TIMEOUT,
+                                10.1,
+                                UTC_NOW,
+                            )
 
     def test_completed_timestamp_requires_timezone_and_normalizes_to_utc(self):
         state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
@@ -132,40 +188,50 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(complete.last_valid.completed_at_utc, UTC_NOW)
         self.assertEqual(complete.last_valid.completed_at_utc.tzinfo, timezone.utc)
 
-    def test_success_requires_no_failure_and_non_success_requires_legal_pair(self):
+    def test_outcome_failure_matrix_is_exhaustive(self):
         state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
         active, revision = start_attempt(state, 10.0)
-        with self.assertRaises(ValueError):
-            complete_failure(
-                active,
-                revision,
-                AttemptOutcome.SUCCESS,
-                FailureCode.COMMAND_TIMEOUT,
-                10.1,
-                UTC_NOW,
-            )
-        with self.assertRaises(ValueError):
-            complete_failure(
-                active,
-                revision,
-                AttemptOutcome.TIMEOUT,
-                None,
-                10.1,
-                UTC_NOW,
-            )
+        successful = complete_success(active, revision, "normal", 10.1, UTC_NOW)
+        self.assertEqual(successful.last_attempt.outcome, AttemptOutcome.SUCCESS)
+        self.assertIsNone(successful.last_attempt.failure)
 
-    def test_every_legal_failure_pair_completes_and_every_other_pair_rejects(self):
-        all_failures = set(FailureCode)
-        for outcome, legal_failures in LEGAL_FAILURES.items():
-            for failure in all_failures:
+        candidates = (None,) + tuple(FailureCode)
+        for outcome in AttemptOutcome:
+            for failure in candidates:
                 state = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
                 active, revision = start_attempt(state, 10.0)
-                if failure in legal_failures:
+                legal_failures = LEGAL_FAILURES.get(outcome, set())
+                if outcome is not AttemptOutcome.SUCCESS and failure in legal_failures:
                     complete = complete_failure(active, revision, outcome, failure, 10.1, UTC_NOW)
                     self.assertEqual(complete.last_attempt.failure, failure)
                 else:
                     with self.assertRaises(ValueError):
                         complete_failure(active, revision, outcome, failure, 10.1, UTC_NOW)
+
+    def test_failure_outcome_and_code_must_be_enum_members(self):
+        cases = (
+            (
+                AttemptOutcome.PERMISSION_DENIED.value,
+                FailureCode.PERMISSION_DENIED,
+            ),
+            (
+                AttemptOutcome.PERMISSION_DENIED,
+                FailureCode.PERMISSION_DENIED.value,
+            ),
+        )
+        for outcome, failure in cases:
+            with self.subTest(outcome=outcome, failure=failure):
+                state = new_source(SourceId.SENSOR_POWERMETRICS, 1.0, 2.5)
+                active, revision = start_attempt(state, 10.0)
+                with self.assertRaises(ValueError):
+                    complete_failure(
+                        active,
+                        revision,
+                        outcome,
+                        failure,
+                        10.1,
+                        UTC_NOW,
+                    )
 
     def test_freshness_boundary_is_inclusive_and_stale_after_is_strict(self):
         state = self.successful_source(SourceId.CPU_USAGE, 1.0, 2.5, 10.0)
@@ -202,6 +268,9 @@ class SourceStateTests(unittest.TestCase):
             AttemptOutcome.PERMISSION_DENIED,
             FailureCode.PERMISSION_DENIED,
         )
+        self.assertIs(locked.source_id, SourceId.SENSOR_POWERMETRICS)
+        self.assertIs(locked.last_attempt.outcome, AttemptOutcome.PERMISSION_DENIED)
+        self.assertIs(locked.last_attempt.failure, FailureCode.PERMISSION_DENIED)
         self.assertEqual(source_view(locked, 10.2).status, SourceViewStatus.LOCKED)
         self.assertEqual(source_view(denied, 10.2).status, SourceViewStatus.PERMISSION_DENIED)
 
