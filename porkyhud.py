@@ -49,6 +49,7 @@ from porkyhud_core import (
     FailureCode,
     HealthAssessment,
     HealthFacts,
+    HealthSeverity,
     MemoryPressure,
     MemoryPressureLevel,
     OsThermalState,
@@ -5086,67 +5087,45 @@ def simple_process_name(command: str) -> str:
     return visible_command(name, 22)
 
 
-def system_read(
-    per_core: list[float],
-    mem: dict[str, float],
-    disk: DiskInfo,
-    activity: DiskActivity,
-    battery: BatteryInfo,
-    sensor: SensorInfo,
-    rows: list[ProcessRow],
-    net_down: float = 0.0,
-    net_up: float = 0.0,
-) -> tuple[str, str]:
-    cpu_pct = cpu_total_percent(per_core)
-    mem_pct = ram_percent(mem)
-    disk_pct = disk_percent(disk)
-    swap_total = mem.get("swap_total", 0.0)
-    swap_pct = mem.get("swap_used", 0.0) / swap_total * 100.0 if swap_total else 0.0
-    hottest = max(
-        [value for value in (sensor.cpu_temp_c, sensor.gpu_temp_c, battery.temp_c) if value is not None],
-        default=None,
-    )
-    max_fan_pct = max((fan_percent(fan) for fan in sensor.fans), default=0.0)
-    top_cpu = rows[0] if rows else None
-    measured_gpu_rows = [row for row in rows if row.gpu is not None]
-    top_gpu = max(measured_gpu_rows, key=lambda row: row.gpu, default=None)
-    net_bps = net_down + net_up
+READ_LEVELS = {
+    HealthSeverity.NORMAL: "good",
+    HealthSeverity.WATCH: "watch",
+    HealthSeverity.CRITICAL: "hot",
+    HealthSeverity.UNKNOWN: "unknown",
+}
 
-    settled_states = ("nominal", "pending", "checking", "unavailable")
-    if sensor.performance_warning not in settled_states:
-        return ("read: macOS is holding performance back; heat is the reason.", "hot")
-    if sensor.thermal_warning not in settled_states:
-        return ("read: Thermal pressure is active; fans need time to catch up.", "hot")
-    if hottest is not None and hottest >= 92 and cpu_pct >= 55:
-        return ("read: Hot CPU work is driving the machine right now.", "hot")
-    if hottest is not None and hottest >= 88 and max_fan_pct >= 80:
-        return ("read: Very warm, with fans already working hard.", "hot")
-    if mem_pct >= 90 or swap_pct >= 25:
-        return ("read: Memory is tight; closing heavy apps would help.", "hot")
-    if top_cpu and cpu_pct >= 72 and top_cpu.cpu >= 80:
-        return (f"read: CPU is busy; {simple_process_name(top_cpu.command)} is the main pull.", "watch")
-    if cpu_pct >= 72:
-        return ("read: CPU is busy; something is working hard.", "watch")
-    if top_gpu and (sensor.gpu_active_percent or top_gpu.gpu or 0.0) >= 45:
-        name = simple_process_name(top_gpu.command) if (top_gpu.gpu or 0.0) >= 8 else "graphics work"
-        return (f"read: GPU is busy; {name} is driving it.", "watch")
-    if max_fan_pct >= 75:
-        return ("read: Fans are high; this is a sustained workload.", "watch")
-    if sensor.package_power_w is not None and sensor.package_power_w >= 70:
-        return ("read: Power draw is high, but thermals still look controlled.", "watch")
-    if activity.bytes_per_sec >= 900_000_000 or activity.iops >= 15_000:
-        return ("read: Disk is moving a lot of data right now.", "watch")
-    if mem_pct >= 82:
-        return ("read: Memory use is high, but there is still room.", "watch")
-    if disk_pct >= 88:
-        return ("read: Storage is getting full; keep an eye on free space.", "watch")
-    if battery.present and not battery.external_connected and (cpu_pct >= 45 or net_bps >= 25_000_000):
-        return ("read: Running hard on battery; runtime will drop.", "watch")
-    if hottest is not None and hottest >= 78 and cpu_pct < 30:
-        return ("read: Warm for a light load; charging or displays may be adding heat.", "watch")
-    if cpu_pct <= 25 and mem_pct <= 75 and (hottest is None or hottest <= 70):
-        return ("read: Quiet. Nothing unusual stands out.", "good")
-    return ("read: Normal workload; no obvious pressure right now.", "good")
+
+def legacy_read_projection(assessment: HealthAssessment) -> dict[str, str]:
+    """Project the pure health assessment into the established snapshot shape."""
+
+    return {
+        "message": f"read: {assessment.reason}",
+        "level": READ_LEVELS[assessment.severity],
+    }
+
+
+def source_state_from_result(
+    state: SourceState[T], result: AdapterResult[T],
+) -> SourceState[T]:
+    """Complete one inactive source attempt using the adapter's exact timestamps."""
+
+    if not isinstance(state, SourceState) or not isinstance(result, AdapterResult):
+        raise TypeError("state and result must be source and adapter results")
+    if state.active_revision is not None:
+        raise ValueError("snapshot source state must be inactive")
+    validate_source_state(state, result.started_mono_s, state.source_id)
+    active, revision = start_attempt(state, result.started_mono_s)
+    if result.outcome is AttemptOutcome.SUCCESS:
+        if result.value is None:
+            raise ValueError("successful adapter result requires a value")
+        return complete_success(
+            active, revision, result.value, result.completed_mono_s,
+            result.completed_at_utc,
+        )
+    return complete_failure(
+        active, revision, result.outcome, result.failure,
+        result.completed_mono_s, result.completed_at_utc,
+    )
 
 
 def read_attr(level: str) -> int:
@@ -6348,57 +6327,261 @@ def _hud_impl(
         time.sleep(0.03)
 
 
-def collect_snapshot() -> dict[str, Any]:
-    cpu_sampler = MacCpuSampler()
+def _snapshot_adapter_attempt(
+    collector: Callable[[], AdapterResult[T]],
+) -> AdapterResult[T]:
+    """Turn ordinary typed-collector faults into explicit unavailable evidence."""
+
+    started_mono_s = time.monotonic()
+    try:
+        result = collector()
+    except Exception:
+        completed_mono_s = time.monotonic()
+        return AdapterResult(
+            None, started_mono_s, completed_mono_s, utc_now(),
+            AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+        )
+    if isinstance(result, AdapterResult):
+        return result
+    completed_mono_s = time.monotonic()
+    return AdapterResult(
+        None, started_mono_s, completed_mono_s, utc_now(),
+        AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+    )
+
+
+def _snapshot_unknown_result() -> AdapterResult[Any]:
+    """Represent an ordinary adapter setup failure without exposing its details."""
+
+    started_mono_s = time.monotonic()
+    return AdapterResult(
+        None, started_mono_s, time.monotonic(), utc_now(),
+        AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+    )
+
+
+def _snapshot_cpu_result(cpu_sampler: MacCpuSampler) -> tuple[AdapterResult[CpuUsage], tuple[float, ...]]:
+    """Prime one native CPU delta and reject windows that outlive its freshness budget."""
+
     time.sleep(0.25)
-    per_core = cpu_sampler.sample()
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="porkyhud-snapshot") as pool:
+    result = _snapshot_adapter_attempt(cpu_sampler.sample_usage)
+    if result.outcome is AttemptOutcome.SUCCESS and result.value is not None:
+        window_s = result.value.window_completed_mono_s - result.value.window_started_mono_s
+        cpu_stale_after_s = next(
+            stale_after_s for source_id, _cadence_s, stale_after_s in LIVE_SOURCE_SPECS
+            if source_id is SourceId.CPU_USAGE
+        )
+        if window_s <= 0 or window_s > cpu_stale_after_s:
+            result = AdapterResult(
+                None, result.started_mono_s, result.completed_mono_s,
+                result.completed_at_utc, AttemptOutcome.PARSE_ERROR,
+                FailureCode.PARSER_REJECTED,
+            )
+    per_core = tuple(getattr(cpu_sampler, "last_per_core", ()))
+    return result, per_core if result.outcome is AttemptOutcome.SUCCESS else ()
+
+
+def _snapshot_system_fallback() -> dict[str, Any]:
+    try:
+        hostname = socket.gethostname().split(".")[0]
+    except Exception:
+        hostname = "unavailable"
+    return {
+        "host": hostname,
+        "os": "unavailable", "build": "unavailable", "kernel": "unavailable",
+        "model": "unavailable", "chip": "unavailable", "physical_cpu": None,
+        "logical_cpu": None, "memory": "unavailable", "cpu_clusters": [],
+        "core_labels": [], "cpu_index_map": [], "core_counts": {}, "gpus": [],
+        "gpu_core_count": None, "max_gpu_freq_mhz": None, "model_id": "unavailable",
+        "cpu_cores": "unavailable",
+    }
+
+
+def _snapshot_battery_fallback() -> dict[str, Any]:
+    return {
+        "percent": None, "present": None, "source": "unavailable", "state": "unavailable",
+        "remaining": "unavailable", "external_connected": None, "is_charging": None,
+        "fully_charged": None, "cycle_count": None, "design_cycles": None,
+        "health_percent": None, "temp_c": None, "virtual_temp_c": None,
+        "voltage_v": None, "amperage_a": None, "charger_watts": None,
+        "charger_name": "unavailable",
+    }
+
+
+def _snapshot_sensor_fallback() -> dict[str, Any]:
+    return {
+        "thermal_warning": "unavailable", "performance_warning": "unavailable",
+        "cpu_power_w": None, "gpu_power_w": None, "cpu_temp_c": None,
+        "gpu_temp_c": None, "fan_rpm": None, "privileged_locked": None,
+        "raw_hint": "unavailable", "ane_power_w": None, "dram_power_w": None,
+        "gpu_sram_power_w": None, "package_power_w": None, "gpu_active_percent": None,
+        "gpu_freq_mhz": None, "e_cluster_active": None, "p_cluster_active": None,
+        "s_cluster_active": None, "e_cluster_freq_mhz": None, "p_cluster_freq_mhz": None,
+        "s_cluster_freq_mhz": None, "dram_read_gbs": None, "dram_write_gbs": None,
+        "fan_count": None, "fans": [], "temp_sensors": [], "sensor_sample_age_s": None,
+    }
+
+
+def _snapshot_memory_projection(memory: Optional[dict[str, float]]) -> dict[str, Optional[float]]:
+    if memory is None:
+        return {
+            "used_percent": None, "used_bytes": None, "total_bytes": None,
+            "swap_used_bytes": None, "swap_total_bytes": None,
+        }
+    total = memory.get("total")
+    used = memory.get("used")
+    valid_total = isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0
+    valid_used = isinstance(used, (int, float)) and not isinstance(used, bool)
+    return {
+        "used_percent": (float(used) / float(total) * 100.0) if valid_total and valid_used else None,
+        "used_bytes": used if valid_used else None,
+        "total_bytes": total if valid_total else None,
+        "swap_used_bytes": memory.get("swap_used") if isinstance(memory.get("swap_used"), (int, float)) else None,
+        "swap_total_bytes": memory.get("swap_total") if isinstance(memory.get("swap_total"), (int, float)) else None,
+    }
+
+
+def _snapshot_result(future: Any, fallback: Callable[[], T]) -> T:
+    try:
+        return future.result()
+    except Exception:
+        return fallback()
+
+
+def _snapshot_frame(
+    states: Mapping[SourceId, SourceState[Any]], now_mono_s: float,
+) -> HealthFrame:
+    """Build a snapshot frame through the common validated policy boundary."""
+
+    _policy, frame = build_health_frame(initial_policy_state(), states, now_mono_s)
+    return replace(frame, origin=FrameOrigin.SNAPSHOT)
+
+
+def collect_snapshot() -> dict[str, Any]:
+    """Collect one truthful, isolated snapshot without creating live pollers."""
+
+    futures: list[Any] = []
+    pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="porkyhud-snapshot")
+    try:
+        try:
+            cpu_sampler: Optional[MacCpuSampler] = MacCpuSampler()
+        except Exception:
+            cpu_sampler = None
+        try:
+            gpu_sampler: Optional[GPUProcessSampler] = GPUProcessSampler()
+        except Exception:
+            gpu_sampler = None
+        memory_pressure_future = pool.submit(_snapshot_adapter_attempt, collect_memory_pressure)
+        thermal_future = pool.submit(_snapshot_adapter_attempt, collect_os_thermal_state)
+        capacity_future = pool.submit(_snapshot_adapter_attempt, collect_disk_capacity)
+        processes_future = pool.submit(_snapshot_adapter_attempt, collect_process_rows)
+        agx_first_future = (
+            pool.submit(_snapshot_adapter_attempt,
+                        lambda: collect_gpu_process_sample(gpu_sampler, None))
+            if gpu_sampler is not None else None
+        )
         static_future = pool.submit(collect_static_info)
         memory_future = pool.submit(memory_stats)
         battery_future = pool.submit(battery_info)
-        sensor_future = pool.submit(sensor_info)
-        disk_future = pool.submit(disk_info)
         activity_future = pool.submit(disk_activity)
-        static = static_future.result()
-        mem = memory_future.result()
-        battery = battery_future.result()
-        sensor = sensor_future.result()
-        disk = disk_future.result()
-        activity = activity_future.result()
-    rows = process_rows("CPU")[:12]
-    read_text, read_level = system_read(per_core, mem, disk, activity, battery, sensor, rows)
-    return {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "read": {
-            "message": read_text,
-            "level": read_level,
-        },
-        "system": static,
-        "cpu": {
-            "average_percent": cpu_total_percent(per_core),
-            "cores": [
-                {"label": label, "percent": percent}
-                for percent, label in zip(*display_core_usage(per_core, static))
+        futures.extend((static_future, memory_future, battery_future, activity_future,
+                        memory_pressure_future, thermal_future, capacity_future,
+                        processes_future))
+        if agx_first_future is not None:
+            futures.append(agx_first_future)
+
+        cpu_result, per_core = (
+            _snapshot_cpu_result(cpu_sampler)
+            if cpu_sampler is not None else (_snapshot_unknown_result(), ())
+        )
+        memory_pressure_result = memory_pressure_future.result()
+        thermal_result = thermal_future.result()
+        capacity_result = capacity_future.result()
+        processes_result = processes_future.result()
+        agx_first_result = (
+            agx_first_future.result()
+            if agx_first_future is not None else _snapshot_unknown_result()
+        )
+        if gpu_sampler is not None:
+            agx_second_future = pool.submit(
+                _snapshot_adapter_attempt,
+                lambda: collect_gpu_process_sample(gpu_sampler, None),
+            )
+            futures.append(agx_second_future)
+            agx_second_result = agx_second_future.result()
+        else:
+            agx_second_result = _snapshot_unknown_result()
+        thermal_value = thermal_result.value if thermal_result.outcome is AttemptOutcome.SUCCESS else None
+        sensor_future = pool.submit(sensor_info, thermal_value)
+        futures.append(sensor_future)
+
+        states: dict[SourceId, SourceState[Any]] = dict(_registry_states())
+        states[SourceId.CPU_USAGE] = source_state_from_result(states[SourceId.CPU_USAGE], cpu_result)
+        states[SourceId.MEMORY_PRESSURE] = source_state_from_result(
+            states[SourceId.MEMORY_PRESSURE], memory_pressure_result,
+        )
+        states[SourceId.THERMAL_OS] = source_state_from_result(states[SourceId.THERMAL_OS], thermal_result)
+        states[SourceId.DISK_CAPACITY] = source_state_from_result(states[SourceId.DISK_CAPACITY], capacity_result)
+        states[SourceId.PROCESS_TABLE] = source_state_from_result(
+            states[SourceId.PROCESS_TABLE], processes_result,
+        )
+        gpu_state = source_state_from_result(states[SourceId.PROCESS_GPU], agx_first_result)
+        states[SourceId.PROCESS_GPU] = source_state_from_result(gpu_state, agx_second_result)
+
+        now_mono_s = time.monotonic()
+        latest_completion = max(
+            state.last_attempt.completed_mono_s
+            for state in states.values() if state.last_attempt is not None
+        )
+        if now_mono_s < latest_completion:
+            raise ValueError("snapshot clock precedes typed evidence completion")
+        frame = _snapshot_frame(states, now_mono_s)
+
+        static = _snapshot_result(static_future, _snapshot_system_fallback)
+        memory = _snapshot_result(memory_future, lambda: None)
+        battery = _snapshot_result(battery_future, _snapshot_battery_fallback)
+        activity = _snapshot_result(activity_future, lambda: None)
+        sensor = _snapshot_result(sensor_future, _snapshot_sensor_fallback)
+        rows = tuple(processes_result.value or ()) if processes_result.outcome is AttemptOutcome.SUCCESS else ()
+        if rows:
+            rows = merge_gpu_process_rows(rows, states[SourceId.PROCESS_GPU], now_mono_s)
+        rows = tuple(sort_process_rows(rows, "CPU")[:12])
+        capacity = capacity_result.value if capacity_result.outcome is AttemptOutcome.SUCCESS else None
+        capacity_projection = (
+            {"label": capacity.volume_name.lower(), "mount": capacity.mount_point,
+             "total": capacity.total_bytes, "used": capacity.total_bytes - capacity.free_bytes,
+             "free": capacity.free_bytes}
+            if capacity is not None else
+            {"label": None, "mount": None, "total": None, "used": None, "free": None}
+        )
+        activity_projection = (
+            asdict(activity) if isinstance(activity, DiskActivity) else
+            {"bytes_per_sec": None, "iops": None, "sample_age": None, "source": "unavailable"}
+        )
+        core_values, core_labels = display_core_usage(list(per_core), static)
+        return {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "read": legacy_read_projection(frame.assessment),
+            "system": static,
+            "cpu": {
+                "average_percent": cpu_result.value.percent if cpu_result.value is not None else None,
+                "cores": ([{"label": label, "percent": percent}
+                           for percent, label in zip(core_values, core_labels)]
+                          if cpu_result.value is not None else []),
+            },
+            "memory": _snapshot_memory_projection(memory),
+            "battery": asdict(battery) if isinstance(battery, BatteryInfo) else battery,
+            "sensors": asdict(sensor) if isinstance(sensor, SensorInfo) else sensor,
+            "disk": {"capacity": capacity_projection, "activity": activity_projection},
+            "processes": [
+                {**asdict(row), "command": sanitize_command(row.command)}
+                for row in rows
             ],
-        },
-        "memory": {
-            "used_percent": ram_percent(mem),
-            "used_bytes": mem.get("used", 0.0),
-            "total_bytes": mem.get("total", 0.0),
-            "swap_used_bytes": mem.get("swap_used", 0.0),
-            "swap_total_bytes": mem.get("swap_total", 0.0),
-        },
-        "battery": asdict(battery),
-        "sensors": asdict(sensor),
-        "disk": {
-            "capacity": asdict(disk),
-            "activity": asdict(activity),
-        },
-        "processes": [
-            {**asdict(row), "command": sanitize_command(row.command)}
-            for row in rows
-        ],
-    }
+        }
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def print_text_snapshot(snapshot: dict[str, Any]) -> None:
@@ -6408,11 +6591,20 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
     sensors = snapshot["sensors"]
     disk = snapshot["disk"]
     print("PorkyHUD snapshot")
-    print(snapshot.get("read", {}).get("message", "read: snapshot collected"))
+    print(snapshot.get("read", {}).get("message", "read: health assessment unavailable."))
     print(f"Mac: {system.get('chip', 'Mac')} / {system.get('model', '')}")
-    print(f"CPU: {cpu['average_percent']:.1f}% across {len(cpu['cores'])} sampled workers")
-    print(f"RAM: {human_bytes(memory['used_bytes'])} / {human_bytes(memory['total_bytes'])} ({memory['used_percent']:.1f}%)")
-    print(f"Thermal: {sensors.get('thermal_warning')}  Package: {format_watts(sensors.get('package_power_w'))}")
+    average = cpu.get("average_percent")
+    if average is None:
+        print("CPU: unavailable")
+    else:
+        print(f"CPU: {average:.1f}% across {len(cpu.get('cores') or [])} sampled workers")
+    if memory.get("used_bytes") is None or memory.get("total_bytes") is None or memory.get("used_percent") is None:
+        print("RAM: unavailable")
+    else:
+        print(f"RAM: {human_bytes(memory['used_bytes'])} / {human_bytes(memory['total_bytes'])} ({memory['used_percent']:.1f}%)")
+    package_power = sensors.get("package_power_w")
+    package_text = format_watts(package_power) if package_power is not None else "--"
+    print(f"Thermal: {sensors.get('thermal_warning', 'unavailable')}  Package: {package_text}")
     fan_rows = sensors.get("fans") or []
     if fan_rows:
         print("Fans: " + ", ".join(f"{fan['name']} {fan['rpm']}rpm" for fan in fan_rows[:4]))
@@ -6420,7 +6612,11 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
     if temp_rows:
         hottest = ", ".join(f"{temp['name']} {temp['value_c']:.1f}C" for temp in temp_rows[:4])
         print(f"Hottest sensors: {hottest}")
-    print(f"Disk: {human_bytes(disk['activity']['bytes_per_sec'])}/s, {disk['activity']['iops']:.0f} iops")
+    activity = disk.get("activity") or {}
+    if activity.get("bytes_per_sec") is None or activity.get("iops") is None:
+        print("Disk: unavailable")
+    else:
+        print(f"Disk: {human_bytes(activity['bytes_per_sec'])}/s, {activity['iops']:.0f} iops")
     print("Top processes:")
     for row in snapshot["processes"][:8]:
         gpu = row.get("gpu")

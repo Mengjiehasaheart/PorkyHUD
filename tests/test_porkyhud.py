@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1717,11 +1718,6 @@ class DecisionAdapterTests(unittest.TestCase):
             unavailable = porkyhud.sensor_info()
         self.assertEqual((unavailable.thermal_warning, unavailable.performance_warning),
                          ("unavailable", "unavailable"))
-        message, level = porkyhud.system_read([], {"total": 1.0, "used": 0.0},
-                                               porkyhud.DiskInfo("root", "/", 100, 0, 100),
-                                               porkyhud.DiskActivity(), make_battery(), unavailable, [])
-        self.assertEqual(level, "good")
-        self.assertIn("Quiet", message)
 
     def test_sudoers_rule_has_intrinsic_timeout_and_check_only_validation(self) -> None:
         expected = (
@@ -1823,18 +1819,6 @@ class BatteryBehaviorTests(unittest.TestCase):
             porkyhud.battery_summary(battery),
             "AC Power: no internal battery",
         )
-
-        message, level = porkyhud.system_read(
-            [45.0],
-            {"total": 100.0, "used": 50.0, "swap_total": 0.0},
-            porkyhud.DiskInfo("data", "/", 100, 50, 50),
-            porkyhud.DiskActivity(),
-            battery,
-            settled_sensor(),
-            [],
-        )
-        self.assertNotIn("battery", message.lower())
-        self.assertEqual(level, "good")
 
     def test_batteryless_power_panel_has_no_empty_battery_bar(self) -> None:
         screen = FakeScreen(12, 60)
@@ -4308,6 +4292,421 @@ class ProcessEvidenceTests(unittest.TestCase):
 
 
 class RuntimeProcessAndSnapshotTests(unittest.TestCase):
+    def collect_snapshot_with(
+        self,
+        *,
+        memory_pressure: int = 1,
+        thermal: tuple[int, int] = (0, 0),
+        free_fraction: float = 0.5,
+        cpu_percent: float = 5.0,
+        cpu_failure: bool = False,
+        cpu_constructor_error: bool = False,
+        typed_failure: str | None = None,
+        descriptive_failure: str | None = None,
+        typed_interrupt: bool = False,
+        interrupt_marker: BaseException | None = None,
+        process_rows_data: tuple[object, ...] = (),
+        agx_results: list[object] | None = None,
+        ram_used_percent: float = 50.0,
+        compressed_bytes: float = 0.0,
+        swap_used_bytes: float = 0.0,
+    ) -> dict[str, object]:
+        """Collect a deterministic one-shot snapshot through its public boundary."""
+
+        total = 100 * 1024 ** 3
+        free = int(total * free_fraction)
+        memory = {
+            "total": float(total),
+            "used": float(total * ram_used_percent / 100.0),
+            "compressed": compressed_bytes,
+            "swap_total": float(total),
+            "swap_used": swap_used_bytes,
+        }
+        static = {
+            "host": "snapshot-test-host",
+            "chip": "Test Silicon",
+            "model": "Test Mac",
+            "core_labels": ["P0"],
+            "cpu_index_map": [0],
+        }
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+
+        def success(value: object, started: float = 0.25, completed: float = 0.5):
+            return porkyhud.AdapterResult(
+                value, started, completed, completed_at,
+                core.AttemptOutcome.SUCCESS, None,
+            )
+
+        class FakeCpuSampler:
+            def __init__(self) -> None:
+                if cpu_constructor_error:
+                    raise RuntimeError("CPU adapter unavailable")
+                self.last_per_core = ()
+                self.calls = 0
+
+            def sample_usage(self):
+                self.calls += 1
+                if cpu_failure:
+                    return porkyhud.AdapterResult(
+                        None, 0.25, 0.5, completed_at,
+                        core.AttemptOutcome.UNKNOWN_ERROR,
+                        core.FailureCode.UNEXPECTED_EXCEPTION,
+                    )
+                self.last_per_core = (cpu_percent,)
+                return success(core.CpuUsage(cpu_percent, 0.1, 0.5))
+
+            def sample(self) -> list[float]:
+                return [cpu_percent]
+
+        sensor = settled_sensor()
+        disk = porkyhud.DiskInfo("data", "/System/Volumes/Data", total,
+                                 total - free, free)
+        with mock.patch.object(porkyhud, "MacCpuSampler", FakeCpuSampler), \
+                mock.patch.object(porkyhud.time, "sleep"), \
+                mock.patch.object(porkyhud.time, "monotonic", return_value=2.0), \
+                mock.patch.object(porkyhud, "collect_static_info", return_value=static,
+                                  side_effect=RuntimeError("private") if descriptive_failure == "collect_static_info" else None), \
+                mock.patch.object(porkyhud, "memory_stats", return_value=memory,
+                                  side_effect=RuntimeError("private") if descriptive_failure == "memory_stats" else None), \
+                mock.patch.object(porkyhud, "battery_info", return_value=make_battery(),
+                                  side_effect=RuntimeError("private") if descriptive_failure == "battery_info" else None), \
+                mock.patch.object(porkyhud, "sensor_info", return_value=sensor,
+                                  side_effect=RuntimeError("private") if descriptive_failure == "sensor_info" else None), \
+                mock.patch.object(porkyhud, "disk_info", return_value=disk), \
+                mock.patch.object(porkyhud, "disk_activity", return_value=porkyhud.DiskActivity(),
+                                  side_effect=RuntimeError("private") if descriptive_failure == "disk_activity" else None), \
+                mock.patch.object(porkyhud, "collect_memory_pressure",
+                                  return_value=success(core.MemoryPressure(core.MemoryPressureLevel(memory_pressure))),
+                                  side_effect=(interrupt_marker if interrupt_marker is not None else (KeyboardInterrupt() if typed_interrupt else RuntimeError("private"))) if typed_failure == "collect_memory_pressure" else None), \
+                mock.patch.object(porkyhud, "collect_os_thermal_state",
+                                  return_value=success(core.OsThermalState(*thermal)),
+                                  side_effect=RuntimeError("private") if typed_failure == "collect_os_thermal_state" else None), \
+                mock.patch.object(porkyhud, "collect_disk_capacity", return_value=success(
+                    core.DiskCapacity("test-data", "data", "/System/Volumes/Data", total, free)),
+                    side_effect=RuntimeError("private") if typed_failure == "collect_disk_capacity" else None), \
+                mock.patch.object(porkyhud, "collect_process_rows", return_value=success(process_rows_data),
+                                  side_effect=RuntimeError("private") if typed_failure == "collect_process_rows" else None), \
+                mock.patch.object(porkyhud, "collect_gpu_process_sample", side_effect=[
+                    success(porkyhud.GpuProcessSample({}, {}, True, False), 0.0, 0.1),
+                    success(porkyhud.GpuProcessSample({}, {}, True, True), 0.6, 0.7),
+                ] if agx_results is None else agx_results), \
+                mock.patch.object(porkyhud, "process_rows", return_value=[]):
+            return porkyhud.collect_snapshot()
+
+    def test_one_shot_without_immediate_warning_is_unknown(self) -> None:
+        """A one-point CPU sample must not become an all-clear health verdict."""
+
+        snapshot = self.collect_snapshot_with(
+            memory_pressure=1, thermal=(0, 0), free_fraction=0.5,
+            cpu_percent=5.0,
+        )
+
+        self.assertEqual(snapshot["read"], {
+            "message": "read: CPU trend requires live monitoring.",
+            "level": "unknown",
+        })
+
+    def test_normal_pressure_never_advises_closing_apps_from_ram_detail(self) -> None:
+        """Detail counters must not override the OS memory-pressure source."""
+
+        snapshot = self.collect_snapshot_with(
+            memory_pressure=1, ram_used_percent=99.0,
+            compressed_bytes=64 * 1024 ** 3,
+            swap_used_bytes=32 * 1024 ** 3,
+        )
+
+        self.assertNotIn("close", snapshot["read"]["message"].lower())
+        self.assertNotIn("quit", snapshot["read"]["message"].lower())
+
+    def test_immediate_memory_thermal_and_storage_warnings_survive_one_shot_cpu_limits(self) -> None:
+        """Fresh decisive sources must surface their own warning without CPU history."""
+
+        for inputs, level, phrase in (
+            ({"memory_pressure": 4}, "hot", "critical memory pressure"),
+            ({"thermal": (1, 0)}, "watch", "active thermal or performance warning"),
+            ({"free_fraction": 0.05}, "watch", "Storage headroom is low"),
+        ):
+            with self.subTest(inputs=inputs):
+                snapshot = self.collect_snapshot_with(**inputs)
+                self.assertEqual(snapshot["read"]["level"], level)
+                self.assertIn(phrase, snapshot["read"]["message"])
+
+    def test_failed_cpu_projects_null_and_text_never_formats_it_as_zero(self) -> None:
+        """A failed CPU adapter is unavailable, never a fabricated idle sample."""
+
+        snapshot = self.collect_snapshot_with(cpu_failure=True)
+
+        self.assertIsNone(snapshot["cpu"]["average_percent"])
+        self.assertEqual(snapshot["cpu"]["cores"], [])
+        with mock.patch("builtins.print") as output:
+            porkyhud.print_text_snapshot(snapshot)
+        self.assertIn("CPU: unavailable", "\n".join(str(call.args[0]) for call in output.call_args_list))
+
+    def test_cpu_adapter_construction_failure_is_an_unavailable_snapshot_projection(self) -> None:
+        """Ordinary adapter setup faults stay contained at the one-shot boundary."""
+
+        snapshot = self.collect_snapshot_with(cpu_constructor_error=True)
+
+        self.assertIsNone(snapshot["cpu"]["average_percent"])
+        self.assertEqual(snapshot["cpu"]["cores"], [])
+
+    def test_source_state_conversion_preserves_adapter_revision_and_timestamps(self) -> None:
+        """Snapshot conversion must carry adapter evidence into the core unchanged."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        result = porkyhud.AdapterResult(
+            core.MemoryPressure(core.MemoryPressureLevel.WARN), 3.0, 4.0,
+            completed_at, core.AttemptOutcome.SUCCESS, None,
+        )
+        state = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+
+        converted = porkyhud.source_state_from_result(state, result)
+
+        self.assertEqual(converted.revision, 1)
+        self.assertEqual(converted.last_attempt.started_mono_s, 3.0)
+        self.assertEqual(converted.last_attempt.completed_mono_s, 4.0)
+        self.assertEqual(converted.last_valid.completed_at_utc, completed_at)
+        active, _revision = core.start_attempt(state, 1.0)
+        with self.assertRaises(ValueError):
+            porkyhud.source_state_from_result(active, result)
+
+    def test_source_conversion_failure_retains_prior_valid_and_rejects_future_chronology(self) -> None:
+        """Failed refreshes retain display history but never repair an impossible clock."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        state = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        state = porkyhud.source_state_from_result(state, porkyhud.AdapterResult(
+            core.MemoryPressure(core.MemoryPressureLevel.NORMAL), 1.0, 2.0,
+            completed_at, core.AttemptOutcome.SUCCESS, None,
+        ))
+        failed = porkyhud.source_state_from_result(state, porkyhud.AdapterResult(
+            None, 3.0, 4.0, completed_at, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+        ))
+        self.assertEqual(failed.last_valid.revision, 1)
+        self.assertEqual(failed.last_attempt.revision, 2)
+        with self.assertRaises(ValueError):
+            porkyhud.source_state_from_result(state, porkyhud.AdapterResult(
+                None, 1.5, 3.0, completed_at, core.AttemptOutcome.TIMEOUT,
+                core.FailureCode.COMMAND_TIMEOUT,
+            ))
+
+    def test_snapshot_cpu_takes_one_measurement_after_the_short_delay(self) -> None:
+        """The sampler constructor owns baseline priming; snapshot takes one delta."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+
+        class FakeCpuSampler:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.last_per_core = (25.0,)
+
+            def sample_usage(self):
+                self.calls += 1
+                return porkyhud.AdapterResult(
+                    core.CpuUsage(25.0, 0.0, 0.25), 0.0, 0.25, completed_at,
+                    core.AttemptOutcome.SUCCESS, None,
+                )
+
+        sampler = FakeCpuSampler()
+        with mock.patch.object(porkyhud.time, "sleep"):
+            result, per_core = porkyhud._snapshot_cpu_result(sampler)
+        self.assertEqual(sampler.calls, 1)
+        self.assertEqual(result.value.percent, 25.0)
+        self.assertEqual(per_core, (25.0,))
+
+    def test_snapshot_cpu_rejects_a_window_over_its_2_5_second_budget(self) -> None:
+        """Long counter intervals cannot manufacture sustained CPU evidence."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        for duration, outcome in ((2.5, core.AttemptOutcome.SUCCESS),
+                                  (2.5001, core.AttemptOutcome.PARSE_ERROR)):
+            with self.subTest(duration=duration):
+                class FakeCpuSampler:
+                    last_per_core = (91.0,)
+
+                    def sample_usage(self):
+                        return porkyhud.AdapterResult(
+                            core.CpuUsage(91.0, 0.0, duration), 0.0, duration,
+                            completed_at, core.AttemptOutcome.SUCCESS, None,
+                        )
+
+                with mock.patch.object(porkyhud.time, "sleep"):
+                    result, cores = porkyhud._snapshot_cpu_result(FakeCpuSampler())
+                self.assertEqual(result.outcome, outcome)
+                self.assertEqual(cores, (91.0,) if outcome is core.AttemptOutcome.SUCCESS else ())
+
+    def test_snapshot_uses_the_frozen_frame_builder_and_six_worker_budget(self) -> None:
+        """One-shot projection shares the frame contract without live coordination."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        with mock.patch.object(porkyhud, "build_health_frame", wraps=porkyhud.build_health_frame) as builder, \
+                mock.patch.object(porkyhud, "ThreadPoolExecutor", wraps=real_executor) as executor:
+            self.collect_snapshot_with()
+        self.assertEqual(builder.call_count, 1)
+        self.assertEqual(executor.call_args.kwargs["max_workers"], 6)
+
+    def test_snapshot_queues_initial_typed_attempts_before_descriptive_work(self) -> None:
+        """Slow descriptive futures cannot delay the five health evidence attempts."""
+
+        submitted = []
+
+        class ImmediateFuture:
+            def __init__(self, value):
+                self.value = value
+
+            def result(self):
+                return self.value
+
+            def cancel(self):
+                return False
+
+        class ImmediateExecutor:
+            def __init__(self, **_kwargs):
+                pass
+
+            def submit(self, function, *args):
+                submitted.append((function, args))
+                return ImmediateFuture(function(*args))
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        with mock.patch.object(porkyhud, "ThreadPoolExecutor", ImmediateExecutor):
+            self.collect_snapshot_with()
+        self.assertEqual(
+            [function for function, _args in submitted[:5]],
+            [porkyhud._snapshot_adapter_attempt] * 5,
+        )
+        self.assertEqual(
+            [getattr(function, "_mock_name", None) or function.__name__
+             for function, _args in submitted[5:9]],
+            ["collect_static_info", "memory_stats", "battery_info", "disk_activity"],
+        )
+
+    def test_text_snapshot_uses_exact_unknown_fallbacks(self) -> None:
+        """Unknown snapshot fields must not masquerade as a privileged reading."""
+
+        snapshot = {
+            "system": {}, "cpu": {"average_percent": None, "cores": []},
+            "memory": {"used_bytes": None, "total_bytes": None, "used_percent": None},
+            "sensors": {"thermal_warning": "unavailable", "package_power_w": None},
+            "disk": {"activity": {"bytes_per_sec": None, "iops": None}},
+            "processes": [],
+        }
+        with mock.patch("builtins.print") as output:
+            porkyhud.print_text_snapshot(snapshot)
+        text = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("read: health assessment unavailable.", text)
+        self.assertIn("Package: --", text)
+
+    def test_typed_collector_failures_and_descriptive_failures_stay_unavailable(self) -> None:
+        """Snapshot boundaries never leak collector errors or substitute legacy disk data."""
+
+        failures = [
+            "collect_memory_pressure", "collect_os_thermal_state", "collect_disk_capacity",
+            "collect_process_rows",
+        ]
+        for name in failures:
+            with self.subTest(name=name), mock.patch.object(porkyhud, "disk_info") as legacy_disk:
+                snapshot = self.collect_snapshot_with(typed_failure=name)
+            legacy_disk.assert_not_called()
+            self.assertNotIn("private", json.dumps(snapshot))
+            if name == "collect_disk_capacity":
+                self.assertEqual(snapshot["disk"]["capacity"], {
+            "label": None, "mount": None, "total": None, "used": None, "free": None,
+                })
+
+        for name, key in (("memory_stats", "memory"), ("battery_info", "battery"),
+                          ("collect_static_info", "system"), ("sensor_info", "sensors"),
+                          ("disk_activity", "activity")):
+            with self.subTest(name=name):
+                snapshot = self.collect_snapshot_with(descriptive_failure=name)
+            self.assertNotIn("private", json.dumps(snapshot))
+            if key == "memory":
+                self.assertIsNone(snapshot[key]["used_bytes"])
+            elif key == "battery":
+                self.assertIsNone(snapshot[key]["present"])
+            elif key == "system":
+                self.assertEqual(snapshot[key]["host"], socket.gethostname().split(".")[0])
+            elif key == "sensors":
+                self.assertEqual(snapshot[key]["thermal_warning"], "unavailable")
+            else:
+                self.assertEqual(snapshot["disk"]["activity"]["source"], "unavailable")
+
+    def test_snapshot_rejects_now_before_any_typed_completion(self) -> None:
+        """Clock reversal is an invalid snapshot, not a silently fresh assessment."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        states = dict(porkyhud._registry_states())
+        for source_id, value in (
+            (core.SourceId.CPU_USAGE, core.CpuUsage(5.0, 0.0, 1.0)),
+            (core.SourceId.MEMORY_PRESSURE, core.MemoryPressure(core.MemoryPressureLevel.NORMAL)),
+            (core.SourceId.THERMAL_OS, core.OsThermalState(0, 0)),
+            (core.SourceId.DISK_CAPACITY, core.DiskCapacity("d", "d", "/", 100, 75)),
+            (core.SourceId.PROCESS_TABLE, ()),
+        ):
+            states[source_id] = porkyhud.source_state_from_result(states[source_id], porkyhud.AdapterResult(
+                value, 0.0, 1.0, completed_at, core.AttemptOutcome.SUCCESS, None,
+            ))
+        with self.assertRaises(ValueError):
+            porkyhud._snapshot_frame(states, 0.5)
+
+    def test_snapshot_propagates_interruption_after_executor_cleanup(self) -> None:
+        """Interruptions are never converted into a reassuring unavailable snapshot."""
+
+        before = {thread.ident for thread in threading.enumerate()
+                  if thread.name.startswith("porkyhud-snapshot")}
+        marker = KeyboardInterrupt("stop now")
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            self.collect_snapshot_with(
+                typed_failure="collect_memory_pressure", interrupt_marker=marker,
+            )
+        self.assertIs(caught.exception, marker)
+        self.assertEqual(
+            {thread.ident for thread in threading.enumerate()
+             if thread.name.startswith("porkyhud-snapshot")}, before,
+        )
+
+    def test_process_gpu_unknown_zero_and_measurement_keep_distinct_json_and_text_values(self) -> None:
+        """GPU projection distinguishes absent evidence, stable zero, and measured use."""
+
+        for gpu, text_value in ((None, "--"), (0.0, "0.0%"), (7.5, "7.5%")):
+            with self.subTest(gpu=gpu):
+                snapshot = {
+                    "read": {"message": "read: unavailable", "level": "unknown"},
+                    "system": {}, "cpu": {"average_percent": None, "cores": []},
+                    "memory": {"used_bytes": None, "total_bytes": None, "used_percent": None},
+                    "sensors": {}, "disk": {"activity": {"bytes_per_sec": None, "iops": None}},
+                    "processes": [{"pid": 1, "cpu": 1.0, "mem": 1.0, "gpu": gpu, "command": "/bin/x"}],
+                }
+                with mock.patch("builtins.print") as output:
+                    porkyhud.print_text_snapshot(snapshot)
+                self.assertIn(text_value, "\n".join(str(call.args[0]) for call in output.call_args_list))
+
+    def test_snapshot_keeps_processes_when_agx_attempts_fail(self) -> None:
+        """GPU attribution failure never discards otherwise valid process evidence."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        row = porkyhud.ProcessRow(42, 20.0, 1.0, None, "R", "00:01", "/bin/task")
+        first_failed = porkyhud.AdapterResult(
+            None, 0.0, 0.1, completed_at, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+        )
+        second_failed = porkyhud.AdapterResult(
+            None, 0.2, 0.3, completed_at, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+        )
+        for results in ([first_failed, second_failed], [
+                porkyhud.AdapterResult(porkyhud.GpuProcessSample({}, {}, True, False), 0.0, 0.1,
+                                       completed_at, core.AttemptOutcome.SUCCESS, None), second_failed]):
+            with self.subTest(results=results):
+                snapshot = self.collect_snapshot_with(
+                    process_rows_data=(row,), agx_results=results,
+                )
+            self.assertEqual(len(snapshot["processes"]), 1)
+            self.assertIsNone(snapshot["processes"][0]["gpu"])
+
     def test_signal_during_palette_setup_still_restores_terminal_colors(self) -> None:
         stdout = mock.Mock()
         stdout.isatty.return_value = True
@@ -4444,8 +4843,22 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             "00:01",
             "/usr/bin/worker --api-key snapshot-secret --mode test",
         )
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+
+        def success(value: object, started: float = 0.2, completed: float = 0.5):
+            return porkyhud.AdapterResult(value, started, completed, completed_at,
+                                          core.AttemptOutcome.SUCCESS, None)
 
         class FakeCpuSampler:
+            def __init__(self) -> None:
+                self.last_per_core = ()
+                self.calls = 0
+
+            def sample_usage(self):
+                self.calls += 1
+                self.last_per_core = (25.0, 75.0)
+                return success(core.CpuUsage(50.0, 0.1, 0.5))
+
             def sample(self) -> list[float]:
                 return [25.0, 75.0]
 
@@ -4454,6 +4867,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             "MacCpuSampler",
             FakeCpuSampler,
         ), mock.patch.object(porkyhud.time, "sleep"), mock.patch.object(
+            porkyhud.time, "monotonic", return_value=2.0), mock.patch.object(
             porkyhud,
             "memory_stats",
             return_value=memory,
@@ -4465,10 +4879,16 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             porkyhud,
             "disk_activity",
             return_value=activity,
-        ), mock.patch.object(porkyhud,
-            "process_rows",
-            return_value=[process],
-        ), mock.patch.object(porkyhud.time, "strftime", return_value="2026-01-01T00:00:00+0000"):
+        ), mock.patch.object(porkyhud, "collect_memory_pressure", return_value=success(
+            core.MemoryPressure(core.MemoryPressureLevel.NORMAL))), mock.patch.object(
+            porkyhud, "collect_os_thermal_state", return_value=success(core.OsThermalState(0, 0))), mock.patch.object(
+            porkyhud, "collect_disk_capacity", return_value=success(
+                core.DiskCapacity("data", "data", "/", 100, 75))), mock.patch.object(
+            porkyhud, "collect_process_rows", return_value=success((process,))), mock.patch.object(
+            porkyhud, "collect_gpu_process_sample", side_effect=[
+                success(porkyhud.GpuProcessSample({}, {}, True, False), 0.0, 0.1),
+                success(porkyhud.GpuProcessSample({}, {}, True, True), 0.6, 0.7),
+            ]), mock.patch.object(porkyhud.time, "strftime", return_value="2026-01-01T00:00:00+0000"):
             snapshot = porkyhud.collect_snapshot()
 
         self.assertEqual(
@@ -4483,9 +4903,9 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         command = snapshot["processes"][0]["command"]
         self.assertNotIn("snapshot-secret", command)
         self.assertIn("<redacted>", command)
-        self.assertIsNone(snapshot["processes"][0]["gpu"])
+        self.assertEqual(snapshot["processes"][0]["gpu"], 0.0)
         self.assertFalse(snapshot["battery"]["present"])
-        self.assertIsNone(json.loads(json.dumps(snapshot))["processes"][0]["gpu"])
+        self.assertEqual(json.loads(json.dumps(snapshot))["processes"][0]["gpu"], 0.0)
 
 
 if __name__ == "__main__":
