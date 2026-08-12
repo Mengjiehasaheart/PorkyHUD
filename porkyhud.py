@@ -494,12 +494,12 @@ class SourcePoller(Generic[T]):
     def tick(
         self, now_mono_s: float, force: bool = False
     ) -> SourceState[T]:
-        now_mono_s = self._validate_mono(now_mono_s, "now_mono_s")
-        if type(force) is not bool:
-            raise ValueError("force must be a bool")
         with self._condition:
             if self._closed:
                 raise RuntimeError("source poller is closed")
+            now_mono_s = self._validate_mono(now_mono_s, "now_mono_s")
+            if type(force) is not bool:
+                raise ValueError("force must be a bool")
             if self._state.active_revision is not None:
                 if force:
                     self._failure_count = 0

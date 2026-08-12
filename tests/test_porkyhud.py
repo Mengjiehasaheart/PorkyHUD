@@ -2389,6 +2389,24 @@ class SourcePollerTests(unittest.TestCase):
         poller.tick(0.0)
         self.assert_completed_revision(poller, 1)
 
+    def test_closed_tick_rejects_lifecycle_before_invalid_monotonic_time(self):
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            self.ScriptedCollector([]),
+        )
+        poller.close()
+        with self.assertRaises(RuntimeError):
+            poller.tick(float("nan"))
+
+    def test_closed_tick_rejects_lifecycle_before_invalid_force_flag(self):
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+            self.ScriptedCollector([]),
+        )
+        poller.close()
+        with self.assertRaises(RuntimeError):
+            poller.tick(0.0, force=1)
+
     def test_initial_active_state_is_rejected_and_all_completed_shapes_schedule_correctly(self):
         active = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
         active, _ = core.start_attempt(active, 0.0)
