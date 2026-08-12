@@ -92,11 +92,14 @@ class DiskUsageFixture:
 class FakeScreen:
     """Minimal curses-like character buffer for deterministic rendering tests."""
 
-    def __init__(self, height: int, width: int, fill: str = " ") -> None:
+    def __init__(self, height: int, width: int, fill: str = " ",
+                 keys: list[int] | None = None, on_refresh=None) -> None:
         self.height = height
         self.width = width
         self.cells = [[fill for _ in range(width)] for _ in range(height)]
         self.background: tuple[str, int] | None = None
+        self.keys = list(keys or [])
+        self.on_refresh = on_refresh
 
     def getmaxyx(self) -> tuple[int, int]:
         return self.height, self.width
@@ -112,6 +115,19 @@ class FakeScreen:
 
     def erase(self) -> None:
         self.cells = [[" " for _ in range(self.width)] for _ in range(self.height)]
+
+    def nodelay(self, _enabled: bool) -> None:
+        pass
+
+    def keypad(self, _enabled: bool) -> None:
+        pass
+
+    def getch(self) -> int:
+        return self.keys.pop(0) if self.keys else -1
+
+    def refresh(self) -> None:
+        if self.on_refresh is not None:
+            self.on_refresh()
 
     def row(self, y: int) -> str:
         return "".join(self.cells[y])
@@ -1966,6 +1982,163 @@ class AsyncPollerTests(unittest.TestCase):
         self.assertEqual(poller.snapshot(52.0), ("ready", 2.0, ""))
         self.assertEqual(poller.last_start, 50.0)
         self.assertEqual(poller.last_finish, 50.0)
+
+
+class LiveOrchestrationTests(unittest.TestCase):
+    UTC = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+
+    def command_result(
+        self, *, stdout: str = "", stderr: str = "", outcome=core.AttemptOutcome.SUCCESS,
+        failure=None, returncode: int | None = 0,
+    ) -> porkyhud.CommandResult:
+        return porkyhud.CommandResult(
+            "sensor-powermetrics", stdout, stderr, returncode, 1.0, 1.1,
+            self.UTC, outcome, failure,
+        )
+
+    def test_initial_health_frame_is_pristine_and_registry_ordered(self) -> None:
+        frame = porkyhud.initial_health_frame(10.0)
+        self.assertEqual(
+            tuple(frame.source_views),
+            (
+                core.SourceId.CPU_USAGE,
+                core.SourceId.MEMORY_PRESSURE,
+                core.SourceId.THERMAL_OS,
+                core.SourceId.DISK_CAPACITY,
+                core.SourceId.PROCESS_TABLE,
+                core.SourceId.PROCESS_GPU,
+            ),
+        )
+        self.assertEqual(frame.captured_mono_s, 10.0)
+        self.assertEqual(frame.origin, porkyhud.FrameOrigin.LIVE)
+        self.assertEqual(frame.assessment.severity, core.HealthSeverity.UNKNOWN)
+
+    def test_memory_detail_uses_cached_size_and_merge_does_not_mutate(self) -> None:
+        raw = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 2.\n"
+        with mock.patch.object(porkyhud, "MEMORY_SIZE_BYTES", None), \
+                mock.patch.object(porkyhud, "sysctl_value", return_value="8192") as size, \
+                mock.patch.object(porkyhud, "run_command", return_value=raw):
+            first = porkyhud.memory_detail()
+            second = porkyhud.memory_detail()
+        self.assertEqual((first["total"], second["total"]), (8192.0, 8192.0))
+        self.assertEqual(size.call_count, 1)
+        merged = porkyhud.merge_memory_stats(first, (3.0, 4.0))
+        self.assertNotIn("swap_used", first)
+        self.assertEqual((merged["swap_used"], merged["swap_total"]), (3.0, 4.0))
+
+    def test_steady_state_launch_budget_is_exactly_bounded(self) -> None:
+        budget = porkyhud.steady_state_launch_budget()
+        self.assertEqual(budget["scheduled"], 228)
+        self.assertEqual(budget["retry_reserve"], 12)
+        self.assertEqual(budget["total"], 240)
+
+    def test_powermetrics_attempt_uses_one_child_and_only_exact_sudo_proves_lock(self) -> None:
+        denied = self.command_result(
+            stderr="sudo: a password is required\n",
+            outcome=core.AttemptOutcome.COMMAND_ERROR,
+            failure=core.FailureCode.NONZERO_EXIT,
+            returncode=1,
+        )
+        with mock.patch.object(porkyhud, "POWER_METRICS_SAMPLER_INDEX", 0), \
+                mock.patch.object(porkyhud, "run_structured_command", return_value=denied) as runner:
+            attempt = porkyhud._collect_powermetrics_attempt()
+        self.assertEqual(attempt, porkyhud._PowermetricsAttempt("", True))
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args.kwargs["category"], "sensor-powermetrics")
+        self.assertEqual(runner.call_args.kwargs["timeout_s"], 5.5)
+
+    def test_empty_powermetrics_advances_candidate_for_next_attempt_only(self) -> None:
+        empty = self.command_result(stdout="")
+        good = self.command_result(stdout="thermal pressure: nominal")
+        with mock.patch.object(porkyhud, "POWER_METRICS_SAMPLER_INDEX", 0), \
+                mock.patch.object(porkyhud, "run_structured_command", side_effect=[empty, good]) as runner:
+            first = porkyhud._collect_powermetrics_attempt()
+            self.assertEqual(first.text, "")
+            self.assertEqual(runner.call_count, 1)
+            second = porkyhud._collect_powermetrics_attempt()
+        self.assertEqual(second.text, "thermal pressure: nominal")
+        self.assertEqual(runner.call_count, 2)
+        first_args = runner.call_args_list[0].args[0]
+        second_args = runner.call_args_list[1].args[0]
+        self.assertNotEqual(first_args, second_args)
+
+    def test_frame_rejects_missing_extra_and_wrong_registry_states(self) -> None:
+        states = dict(porkyhud._registry_states())
+        missing = dict(states)
+        missing.pop(core.SourceId.PROCESS_GPU)
+        with self.assertRaises(ValueError):
+            porkyhud.build_health_frame(core.initial_policy_state(), missing, 1.0)
+        extra = dict(states)
+        extra[core.SourceId.BATTERY] = core.new_source(core.SourceId.BATTERY, 1.0, 1.0)
+        with self.assertRaises(ValueError):
+            porkyhud.build_health_frame(core.initial_policy_state(), extra, 1.0)
+        wrong = dict(states)
+        wrong[core.SourceId.CPU_USAGE] = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        with self.assertRaises(ValueError):
+            porkyhud.build_health_frame(core.initial_policy_state(), wrong, 1.0)
+
+    def test_default_sensor_is_not_locked_without_permission_proof(self) -> None:
+        self.assertFalse(porkyhud.default_sensor_info().privileged_locked)
+
+    def test_checking_shell_refreshes_before_any_collection(self) -> None:
+        events: list[str] = []
+        screen = FakeScreen(24, 80, keys=[ord("q")],
+                            on_refresh=lambda: events.append("refresh"))
+        coordinator = mock.Mock()
+        with mock.patch.object(porkyhud, "init_colors"), \
+                mock.patch.object(porkyhud, "apply_dark_screen"), \
+                mock.patch.object(porkyhud, "draw_initial_shell",
+                                  side_effect=lambda *_args: events.append("shell")), \
+                mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator), \
+                mock.patch.object(porkyhud, "collect_static_info", side_effect=lambda: events.append("static")), \
+                mock.patch.object(porkyhud, "run_command", side_effect=lambda *_args, **_kwargs: events.append("command")):
+            porkyhud.hud(screen)
+        self.assertEqual(events[:2], ["shell", "refresh"])
+        self.assertNotIn("static", events)
+        self.assertNotIn("command", events)
+        coordinator.close.assert_called_once_with()
+
+    def test_future_worker_completion_is_deferred_until_frame_time_catches_up(self) -> None:
+        source = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+        source, revision = core.start_attempt(source, 10.0)
+        source = core.complete_success(
+            source, revision, core.MemoryPressure(core.MemoryPressureLevel.NORMAL),
+            10.1, self.UTC,
+        )
+        self.assertTrue(porkyhud.LiveHealthCoordinator._is_future_state(source, 10.0))
+        self.assertFalse(porkyhud.LiveHealthCoordinator._is_future_state(source, 10.1))
+
+    def test_coordinator_close_attempts_every_child_with_one_aggregate_deadline(self) -> None:
+        class Child:
+            def __init__(self, error: BaseException | None = None) -> None:
+                self.error = error
+                self.calls: list[float] = []
+
+            def close(self, timeout_s: float) -> None:
+                self.calls.append(timeout_s)
+                if self.error is not None:
+                    raise self.error
+
+        children = {source_id: Child(RuntimeError("first") if source_id is core.SourceId.CPU_USAGE else None)
+                    for source_id, _cadence, _stale in porkyhud.LIVE_SOURCE_SPECS}
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._closed = False
+        coordinator._pollers = children
+        with self.assertRaisesRegex(RuntimeError, "first"):
+            coordinator.close()
+        self.assertTrue(coordinator._closed)
+        self.assertTrue(all(child.calls for child in children.values()))
+
+    def test_calibration_rejects_booleans_and_out_of_range_values(self) -> None:
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._system_gpu_percent = None
+        for invalid in (True, -0.1, 100.1, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                coordinator.set_system_gpu_percent(invalid)
+        coordinator.set_system_gpu_percent(50.0)
+        self.assertEqual(coordinator._system_gpu_percent, 50.0)
 
 
 class SourcePollerTests(unittest.TestCase):

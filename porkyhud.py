@@ -41,17 +41,31 @@ from typing import Any, Callable, Generic, Mapping, Optional, Sequence, TypeVar
 
 from porkyhud_core import (
     AttemptOutcome,
+    ContributorState,
+    CpuContributor,
     CpuUsage,
     DiskCapacity,
+    EvidenceRole,
     FailureCode,
+    HealthAssessment,
+    HealthFacts,
     MemoryPressure,
     MemoryPressureLevel,
     OsThermalState,
+    PolicyState,
     ProcessFact,
     SourceId,
     SourceState,
+    SourceView,
     complete_failure,
     complete_success,
+    initial_policy_state,
+    is_decision_ready,
+    new_source,
+    reduce_health,
+    reset_policy_state,
+    select_cpu_contributor,
+    source_view,
     start_attempt,
     validate_source_state,
 )
@@ -61,6 +75,25 @@ REFRESH_SECONDS = 1.0
 PROCESS_REFRESH_SECONDS = 2.5
 SENSOR_REFRESH_SECONDS = 12.0
 DISK_ACTIVITY_REFRESH_SECONDS = 4.0
+MEMORY_DETAIL_REFRESH_SECONDS = 2.0
+SWAP_REFRESH_SECONDS = 15.0
+NETWORK_REFRESH_SECONDS = 1.0
+BATTERY_REFRESH_SECONDS = 15.0
+OPTIONAL_SENSOR_REFRESH_SECONDS = 15.0
+STEADY_STATE_COMMAND_ALLOWANCES: Mapping[str, int] = MappingProxyType({
+    "memory_pressure": 60,
+    "memory_detail": 30,
+    "swap": 4,
+    "network": 60,
+    "process_table": 24,
+    "thermal": 12,
+    "battery": 8,
+    "disk_capacity": 2,
+    "disk_activity": 12,
+    "process_gpu": 12,
+    "powermetrics": 4,
+})
+RETRY_LAUNCH_RESERVE = 12
 VERSION = "0.1.2"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
@@ -79,6 +112,8 @@ POWER_METRICS_SAMPLER_SETS = [
     "thermal,cpu_power,gpu_power,ane_power,battery",
     "all",
 ]
+POWER_METRICS_SAMPLER_INDEX = 0
+POWER_METRICS_SAMPLER_LOCK = threading.Lock()
 POWER_METRICS_SAMPLE_COUNT = 1
 POWER_METRICS_INTERVAL_MS = 1000
 PRIVILEGED_COMMAND_TIMEOUT_S = 3
@@ -89,6 +124,8 @@ SMC_CMD_READ_INDEX = 8
 SMC_CMD_READ_KEYINFO = 9
 SMC_TEMP_KEY_CACHE: list[str] | None = None
 BOOT_EPOCH: int | None = None
+MEMORY_SIZE_BYTES: float | None = None
+MEMORY_SIZE_LOCK = threading.Lock()
 SENSITIVE_ARGUMENT_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?:--?|/)(?:api[-_]?key|access[-_]?token|auth(?:orization)?|password|passwd|secret|token)(?:=|\s+))"
     r"(?P<value>\"[^\"]*\"|'[^']*'|\S+)"
@@ -348,6 +385,67 @@ class MetricHistory:
         self.ram.append(clamp(ram_pct))
         self.net.append(max(0.0, net_bps))
         self.disk.append(clamp(disk_pct))
+
+
+LIVE_SOURCE_SPECS: tuple[tuple[SourceId, float, float], ...] = (
+    (SourceId.CPU_USAGE, 1.0, 2.5),
+    (SourceId.MEMORY_PRESSURE, 1.0, 2.5),
+    (SourceId.THERMAL_OS, 5.0, 12.0),
+    (SourceId.DISK_CAPACITY, 30.0, 75.0),
+    (SourceId.PROCESS_TABLE, 2.5, 7.5),
+    (SourceId.PROCESS_GPU, 5.0, 15.0),
+)
+
+
+def steady_state_launch_budget() -> Mapping[str, int]:
+    """Publish the fixed half-open minute allowance used by live scheduling tests."""
+
+    scheduled = sum(STEADY_STATE_COMMAND_ALLOWANCES.values())
+    return MappingProxyType({
+        "scheduled": scheduled,
+        "retry_reserve": RETRY_LAUNCH_RESERVE,
+        "total": scheduled + RETRY_LAUNCH_RESERVE,
+    })
+
+
+class FrameOrigin(str, Enum):
+    LIVE = "live"
+    SNAPSHOT = "snapshot"
+
+
+@dataclass(frozen=True)
+class HealthFrame:
+    """Immutable presentation projection of one chronologically coherent reduction."""
+
+    assessment: HealthAssessment
+    source_views: Mapping[SourceId, SourceView]
+    cpu_percent: Optional[float]
+    memory_pressure: Optional[MemoryPressure]
+    thermal: Optional[OsThermalState]
+    disk_capacity: Optional[DiskCapacity]
+    contributor: CpuContributor
+    origin: FrameOrigin
+    captured_mono_s: float
+    decisive_triggered_mono_s: Optional[float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.assessment, HealthAssessment):
+            raise ValueError("assessment must be a HealthAssessment")
+        if not isinstance(self.origin, FrameOrigin):
+            raise ValueError("origin must be a FrameOrigin")
+        if (type(self.captured_mono_s) not in (int, float)
+                or not math.isfinite(self.captured_mono_s)):
+            raise ValueError("captured_mono_s must be finite")
+        if self.decisive_triggered_mono_s is not None and (
+                type(self.decisive_triggered_mono_s) not in (int, float)
+                or not math.isfinite(self.decisive_triggered_mono_s)):
+            raise ValueError("decisive_triggered_mono_s must be finite or None")
+        ordered = dict(self.source_views)
+        if tuple(ordered) != tuple(source_id for source_id, _cadence, _stale in LIVE_SOURCE_SPECS):
+            raise ValueError("source_views must contain the live registry in order")
+        if any(view.source_id is not source_id for source_id, view in ordered.items()):
+            raise ValueError("source view has the wrong source id")
+        object.__setattr__(self, "source_views", MappingProxyType(ordered))
 
 
 class AsyncPoller:
@@ -2618,7 +2716,7 @@ def default_sensor_info() -> SensorInfo:
         cpu_temp_c=None,
         gpu_temp_c=None,
         fan_rpm=None,
-        privileged_locked=True,
+        privileged_locked=False,
         raw_hint="checking sensors",
     )
 
@@ -2726,15 +2824,64 @@ def parse_frequency_mhz(raw: str, labels: list[str]) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class _PowermetricsAttempt:
+    """Private classified optional-sensor result with no diagnostic projection."""
+
+    text: str
+    permission_denied: bool
+
+
+def _powermetrics_permission_denied(result: CommandResult) -> bool:
+    """Accept only the exact sudo -n password prompt as lock proof."""
+
+    return (
+        result.outcome is AttemptOutcome.COMMAND_ERROR
+        and result.failure is FailureCode.NONZERO_EXIT
+        and result.stderr.strip() == "sudo: a password is required"
+    )
+
+
+def _powermetrics_capability_rejection(result: CommandResult) -> bool:
+    """Recognize only bounded fixture-shaped sampler capability rejections."""
+
+    return (
+        result.outcome is AttemptOutcome.COMMAND_ERROR
+        and result.failure is FailureCode.NONZERO_EXIT
+        and result.stderr.startswith("powermetrics: ")
+    )
+
+
+def _collect_powermetrics_attempt() -> _PowermetricsAttempt:
+    """Run exactly one selected powermetrics child and advance only next attempt."""
+
+    global POWER_METRICS_SAMPLER_INDEX
+    with POWER_METRICS_SAMPLER_LOCK:
+        index = min(POWER_METRICS_SAMPLER_INDEX, len(POWER_METRICS_SAMPLER_SETS) - 1)
+        samplers = POWER_METRICS_SAMPLER_SETS[index]
+    result = run_structured_command(
+        [SUDO_PATH, "-n", *powermetrics_args(samplers)],
+        category="sensor-powermetrics",
+        timeout_s=POWER_METRICS_RUNNER_TIMEOUT_S,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    if result.outcome is AttemptOutcome.SUCCESS and result.stdout:
+        with POWER_METRICS_SAMPLER_LOCK:
+            POWER_METRICS_SAMPLER_INDEX = index
+        return _PowermetricsAttempt(result.stdout, False)
+    if ((result.outcome is AttemptOutcome.SUCCESS and not result.stdout)
+            or _powermetrics_capability_rejection(result)):
+        with POWER_METRICS_SAMPLER_LOCK:
+            if index < len(POWER_METRICS_SAMPLER_SETS) - 1:
+                POWER_METRICS_SAMPLER_INDEX = index + 1
+    return _PowermetricsAttempt("", _powermetrics_permission_denied(result))
+
+
 def powermetrics_sample() -> str:
-    for samplers in POWER_METRICS_SAMPLER_SETS:
-        raw = run_command(
-            [SUDO_PATH, "-n", *powermetrics_args(samplers)],
-            timeout=POWER_METRICS_RUNNER_TIMEOUT_S,
-        )
-        if raw:
-            return raw
-    return ""
+    """Legacy text-only optional sensor projection."""
+
+    return _collect_powermetrics_attempt().text
 
 
 def parse_fan_readings(raw: str) -> list[FanReading]:
@@ -3305,14 +3452,31 @@ def boot_seconds() -> int:
     return max(0, int(time.time()) - BOOT_EPOCH)
 
 
-def memory_stats() -> dict[str, float]:
-    total_raw = sysctl_value("hw.memsize")
-    total = float(total_raw or 0)
-    if total <= 0:
+def _physical_memory_bytes() -> float:
+    """Read physical memory once because it cannot change within a HUD session."""
+
+    global MEMORY_SIZE_BYTES
+    with MEMORY_SIZE_LOCK:
+        if MEMORY_SIZE_BYTES is not None:
+            return MEMORY_SIZE_BYTES
+        total_raw = sysctl_value("hw.memsize")
         try:
-            total = float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
-        except (OSError, ValueError):
+            total = float(total_raw or 0)
+        except (TypeError, ValueError):
             total = 0.0
+        if total <= 0:
+            try:
+                total = float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+            except (OSError, ValueError):
+                total = 0.0
+        MEMORY_SIZE_BYTES = total
+        return total
+
+
+def memory_detail() -> dict[str, float]:
+    """Return vm_stat-derived detail using the cached physical byte size."""
+
+    total = _physical_memory_bytes()
     raw = run_command(["vm_stat"], timeout=1.5)
     page_match = re.search(r"page size of (\d+) bytes", raw)
     page_size = int(page_match.group(1)) if page_match else 4096
@@ -3338,13 +3502,6 @@ def memory_stats() -> dict[str, float]:
     used = min(total, max(0.0, app + wired + compressed))
     available = min(total, max(0.0, free + cached))
 
-    swap_raw = run_command(["sysctl", "vm.swapusage"])
-    swap_total = swap_used = 0.0
-    swap_match = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M", swap_raw)
-    if swap_match:
-        swap_total = float(swap_match.group(1)) * 1024 * 1024
-        swap_used = float(swap_match.group(2)) * 1024 * 1024
-
     return {
         "total": total,
         "used": used,
@@ -3356,9 +3513,37 @@ def memory_stats() -> dict[str, float]:
         "inactive": inactive,
         "wired": wired,
         "compressed": compressed,
-        "swap_total": swap_total,
-        "swap_used": swap_used,
     }
+
+
+def swap_stats() -> tuple[float, float]:
+    """Return swap used/total bytes from one bounded legacy probe."""
+
+    swap_raw = run_command(["sysctl", "vm.swapusage"])
+    swap_total = swap_used = 0.0
+    swap_match = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M", swap_raw)
+    if swap_match:
+        swap_total = float(swap_match.group(1)) * 1024 * 1024
+        swap_used = float(swap_match.group(2)) * 1024 * 1024
+
+    return swap_used, swap_total
+
+
+def merge_memory_stats(
+    detail: Mapping[str, float], swap: tuple[float, float],
+) -> dict[str, float]:
+    """Compose separate descriptive probes without mutating their retained values."""
+
+    result = dict(detail)
+    result["swap_used"] = swap[0]
+    result["swap_total"] = swap[1]
+    return result
+
+
+def memory_stats() -> dict[str, float]:
+    """Snapshot compatibility composition for callers that need one mapping."""
+
+    return merge_memory_stats(memory_detail(), swap_stats())
 
 
 def battery_info() -> BatteryInfo:
@@ -3440,8 +3625,9 @@ def sensor_info(os_thermal: Optional[OsThermalState] = None) -> SensorInfo:
 
     smc_fans, smc_temp_sensors = read_smc_sensors()
     smc_online = bool(smc_fans or smc_temp_sensors)
-    power_raw = powermetrics_sample()
-    locked = not bool(power_raw)
+    power_attempt = _collect_powermetrics_attempt()
+    power_raw = power_attempt.text
+    locked = power_attempt.permission_denied
     fans = smc_fans or parse_fan_readings(power_raw)
     temp_sensors = merge_temperature_readings(smc_temp_sensors, parse_temperature_readings(power_raw))
     cpu_temp = parse_temp_value(power_raw, r"(?:CPU|processor)[^\n:]*temperature[^\d-]*(-?[\d.]+)\s*(?:C|°C)")
@@ -3994,6 +4180,348 @@ def collect_gpu_process_sample(
     sample = sampler.update(snapshot, command.completed_mono_s, system_gpu_percent)
     return AdapterResult(sample, command.started_mono_s, command.completed_mono_s,
                          command.completed_at_utc, AttemptOutcome.SUCCESS, None)
+
+
+def _registry_states() -> Mapping[SourceId, SourceState[Any]]:
+    """Create the canonical live registry without starting any workers."""
+
+    return MappingProxyType({
+        source_id: new_source(
+            source_id, cadence_s, stale_after_s,
+        )
+        for source_id, cadence_s, stale_after_s in LIVE_SOURCE_SPECS
+    })
+
+
+def _sanitized_process_state(
+    state: SourceState[Any], now_mono_s: float,
+) -> SourceState[tuple[ProcessFact, ...]]:
+    """Copy retained process rows across the effect/policy privacy boundary."""
+
+    validate_source_state(state, now_mono_s, SourceId.PROCESS_TABLE)
+    if state.last_valid is None:
+        return state
+    rows = state.last_valid.value
+    if type(rows) is not tuple or any(not isinstance(row, ProcessRow) for row in rows):
+        raise ValueError("process table sample must contain ProcessRow values")
+    facts = tuple(
+        ProcessFact(
+            row.pid,
+            visible_command(row.command, 160) or "a process",
+            row.cpu,
+            parse_elapsed_seconds(row.etime),
+        )
+        for row in rows
+    )
+    sample = replace(state.last_valid, value=facts)
+    return replace(state, last_valid=sample)
+
+
+def _validated_live_states(
+    states: Mapping[SourceId, SourceState[Any]], now_mono_s: float,
+) -> Mapping[SourceId, SourceState[Any]]:
+    """Reject malformed, missing, extra, or misplaced evidence before reduction."""
+
+    if not isinstance(states, Mapping):
+        raise ValueError("states must be a mapping")
+    expected = tuple(source_id for source_id, _cadence, _stale in LIVE_SOURCE_SPECS)
+    if tuple(states) != expected:
+        raise ValueError("states must use the exact live registry order")
+    copied: dict[SourceId, SourceState[Any]] = {}
+    for source_id in expected:
+        state = states[source_id]
+        validate_source_state(state, now_mono_s, source_id)
+        copied[source_id] = state
+    copied[SourceId.PROCESS_TABLE] = _sanitized_process_state(
+        copied[SourceId.PROCESS_TABLE], now_mono_s,
+    )
+    return MappingProxyType(copied)
+
+
+def _ready_value(
+    state: SourceState[Any], expected_type: type, now_mono_s: float,
+) -> Optional[Any]:
+    if not is_decision_ready(state, now_mono_s) or state.last_valid is None:
+        return None
+    value = state.last_valid.value
+    if not isinstance(value, expected_type):
+        raise ValueError("ready source value has the wrong type")
+    return value
+
+
+def _latch_for_rule(policy: PolicyState, rule: Any) -> Any:
+    name = {
+        "memory.watch": "memory_latch",
+        "memory.critical": "memory_latch",
+        "thermal.watch": "thermal_latch",
+        "storage.watch": "storage_latch",
+        "cpu.watch": "cpu_latch",
+    }.get(getattr(rule, "value", ""))
+    if name is None:
+        raise ValueError("unknown active rule")
+    return getattr(policy, name)
+
+
+def _decisive_trigger_time(
+    policy: PolicyState, assessment: HealthAssessment,
+) -> Optional[float]:
+    if not assessment.active_rules:
+        return None
+    latch = _latch_for_rule(policy, assessment.active_rules[0])
+    trigger = latch.trigger
+    if trigger is None:
+        return None
+    for ref in assessment.evidence:
+        if (ref.role is EvidenceRole.TRIGGER
+                and ref.source_id is trigger.source_id
+                and ref.revision == trigger.revision):
+            return trigger.triggered_mono_s
+    return None
+
+
+def build_health_frame(
+    policy_state: PolicyState,
+    states: Mapping[SourceId, SourceState[Any]],
+    now_mono_s: float,
+) -> tuple[PolicyState, HealthFrame]:
+    """Reduce one validated live registry into a privacy-safe frame."""
+
+    if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
+        raise ValueError("now_mono_s must be finite")
+    checked = _validated_live_states(states, float(now_mono_s))
+    facts = HealthFacts(
+        checked[SourceId.CPU_USAGE],
+        checked[SourceId.MEMORY_PRESSURE],
+        checked[SourceId.THERMAL_OS],
+        checked[SourceId.DISK_CAPACITY],
+        checked[SourceId.PROCESS_TABLE],
+    )
+    next_policy, assessment = reduce_health(policy_state, facts, float(now_mono_s))
+    views = MappingProxyType({
+        source_id: source_view(checked[source_id], float(now_mono_s))
+        for source_id, _cadence, _stale in LIVE_SOURCE_SPECS
+    })
+    contributor = select_cpu_contributor(
+        next_policy.process_history, checked[SourceId.PROCESS_TABLE], float(now_mono_s),
+    )
+    frame = HealthFrame(
+        assessment=assessment,
+        source_views=views,
+        cpu_percent=_ready_value(checked[SourceId.CPU_USAGE], CpuUsage, float(now_mono_s)).percent
+        if _ready_value(checked[SourceId.CPU_USAGE], CpuUsage, float(now_mono_s)) is not None else None,
+        memory_pressure=_ready_value(checked[SourceId.MEMORY_PRESSURE], MemoryPressure, float(now_mono_s)),
+        thermal=_ready_value(checked[SourceId.THERMAL_OS], OsThermalState, float(now_mono_s)),
+        disk_capacity=_ready_value(checked[SourceId.DISK_CAPACITY], DiskCapacity, float(now_mono_s)),
+        contributor=contributor,
+        origin=FrameOrigin.LIVE,
+        captured_mono_s=float(now_mono_s),
+        decisive_triggered_mono_s=_decisive_trigger_time(next_policy, assessment),
+    )
+    return next_policy, frame
+
+
+def initial_health_frame(now_mono_s: float) -> HealthFrame:
+    """Return an effect-free initial CHECKING projection for progressive startup."""
+
+    _policy, frame = build_health_frame(initial_policy_state(), _registry_states(), now_mono_s)
+    return frame
+
+
+class LiveHealthCoordinator:
+    """Own typed polling, coherent health reduction, and live collector baselines."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._closed = False
+        self._generation = 0
+        self._policy = initial_policy_state()
+        self._frame_states = _registry_states()
+        self._frame = initial_health_frame(0.0)
+        self._per_core: tuple[float, ...] = ()
+        self._per_core_revision = 0
+        self._system_gpu_percent: Optional[float] = None
+        self._previous_time: Optional[tuple[float, datetime]] = None
+        self._cpu_sampler: MacCpuSampler
+        self._gpu_sampler: GPUProcessSampler
+        self._pollers: Mapping[SourceId, SourcePoller[Any]]
+        self._create_generation()
+
+    def _create_generation(self) -> None:
+        self._generation += 1
+        generation = self._generation
+        cpu_sampler = MacCpuSampler()
+        gpu_sampler = GPUProcessSampler()
+        pollers: dict[SourceId, SourcePoller[Any]] = {}
+
+        def collect_cpu() -> AdapterResult[CpuUsage]:
+            result = cpu_sampler.sample_usage()
+            return result
+
+        def collect_gpu() -> AdapterResult[GpuProcessSample]:
+            with self._lock:
+                calibration = self._system_gpu_percent
+                current = self._generation == generation and not self._closed
+            if not current:
+                return AdapterResult(
+                    None, time.monotonic(), time.monotonic(), utc_now(),
+                    AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
+                )
+            return collect_gpu_process_sample(gpu_sampler, calibration)
+
+        collectors: Mapping[SourceId, Callable[[], AdapterResult[Any]]] = {
+            SourceId.CPU_USAGE: collect_cpu,
+            SourceId.MEMORY_PRESSURE: collect_memory_pressure,
+            SourceId.THERMAL_OS: collect_os_thermal_state,
+            SourceId.DISK_CAPACITY: collect_disk_capacity,
+            SourceId.PROCESS_TABLE: collect_process_rows,
+            SourceId.PROCESS_GPU: collect_gpu,
+        }
+        deadline = time.monotonic() + 1.0
+        try:
+            for source_id, cadence_s, stale_after_s in LIVE_SOURCE_SPECS:
+                pollers[source_id] = SourcePoller(
+                    new_source(
+                        source_id, cadence_s, stale_after_s,
+                    ),
+                    collectors[source_id],
+                )
+        except BaseException:
+            self._close_poller_set(pollers, deadline)
+            raise
+        self._cpu_sampler = cpu_sampler
+        self._gpu_sampler = gpu_sampler
+        self._pollers = MappingProxyType(pollers)
+
+    @staticmethod
+    def _close_poller_set(
+        pollers: Mapping[SourceId, SourcePoller[Any]], deadline: float,
+    ) -> Optional[BaseException]:
+        first_error: Optional[BaseException] = None
+        for source_id, _cadence, _stale in LIVE_SOURCE_SPECS:
+            poller = pollers.get(source_id)
+            if poller is None:
+                continue
+            try:
+                poller.close(max(0.0, deadline - time.monotonic()))
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        return first_error
+
+    @staticmethod
+    def _is_future_state(state: SourceState[Any], now_mono_s: float) -> bool:
+        times = []
+        if state.active_started_mono_s is not None:
+            times.append(state.active_started_mono_s)
+        if state.last_attempt is not None:
+            times.append(state.last_attempt.completed_mono_s)
+        if state.last_valid is not None:
+            times.append(state.last_valid.completed_mono_s)
+        return any(value > now_mono_s for value in times)
+
+    def tick(self, now_mono_s: float, force: bool = False) -> HealthFrame:
+        if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
+            raise ValueError("now_mono_s must be finite")
+        if type(force) is not bool:
+            raise ValueError("force must be a bool")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
+            snapshots: dict[SourceId, SourceState[Any]] = {}
+            for source_id, _cadence, _stale in LIVE_SOURCE_SPECS:
+                self._pollers[source_id].tick(float(now_mono_s), force)
+            for source_id, _cadence, _stale in LIVE_SOURCE_SPECS:
+                snapshots[source_id] = self._pollers[source_id].snapshot()
+            frame_states = dict(self._frame_states)
+            for source_id, state in snapshots.items():
+                if not self._is_future_state(state, float(now_mono_s)):
+                    frame_states[source_id] = state
+            self._policy, self._frame = build_health_frame(
+                self._policy, MappingProxyType(frame_states), float(now_mono_s),
+            )
+            self._frame_states = MappingProxyType(frame_states)
+            cpu = frame_states[SourceId.CPU_USAGE]
+            if (cpu.last_attempt is not None
+                    and cpu.last_attempt.outcome is AttemptOutcome.SUCCESS
+                    and cpu.last_valid is not None
+                    and cpu.last_valid.revision != self._per_core_revision):
+                self._per_core = tuple(self._cpu_sampler.last_per_core)
+                self._per_core_revision = cpu.last_valid.revision
+            return self._frame
+
+    def source_state(self, source_id: SourceId) -> SourceState[Any]:
+        if not isinstance(source_id, SourceId):
+            raise ValueError("source_id must be a SourceId")
+        with self._lock:
+            return self._pollers[source_id].snapshot()
+
+    def process_rows(self, now_mono_s: float) -> tuple[ProcessRow, ...]:
+        if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
+            raise ValueError("now_mono_s must be finite")
+        with self._lock:
+            process = self._pollers[SourceId.PROCESS_TABLE].snapshot()
+            if process.last_valid is None or type(process.last_valid.value) is not tuple:
+                return ()
+            rows = process.last_valid.value
+            if any(not isinstance(row, ProcessRow) for row in rows):
+                raise ValueError("process table sample must contain ProcessRow values")
+            return merge_gpu_process_rows(
+                rows, self._pollers[SourceId.PROCESS_GPU].snapshot(), float(now_mono_s),
+            )
+
+    def per_core(self) -> tuple[float, ...]:
+        with self._lock:
+            return self._per_core
+
+    def set_system_gpu_percent(self, percent: Optional[float]) -> None:
+        if percent is not None and (
+                type(percent) not in (int, float)
+                or not math.isfinite(percent)
+                or percent < 0 or percent > 100):
+            raise ValueError("system GPU percent must be a finite 0..100 value or None")
+        with self._lock:
+            self._system_gpu_percent = None if percent is None else float(percent)
+
+    def reset_policy(self) -> None:
+        with self._lock:
+            self._policy = reset_policy_state()
+
+    def observe_time(self, now_mono_s: float, now_utc: datetime) -> bool:
+        if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
+            raise ValueError("now_mono_s must be finite")
+        normalized = _normalize_utc_timestamp(now_utc, "now_utc")
+        with self._lock:
+            previous = self._previous_time
+            self._previous_time = (float(now_mono_s), normalized)
+            if previous is None:
+                return False
+            mono_delta = float(now_mono_s) - previous[0]
+            wall_delta = (normalized - previous[1]).total_seconds()
+            reset_sources = mono_delta < 0 or mono_delta > 30.0
+            reset_policy_only = abs(wall_delta - mono_delta) > 5.0
+            if not reset_sources and not reset_policy_only:
+                return False
+            self._policy = reset_policy_state()
+            if reset_sources:
+                old_pollers = self._pollers
+                self._per_core = ()
+                self._per_core_revision = 0
+                self._frame_states = _registry_states()
+                self._create_generation()
+                error = self._close_poller_set(old_pollers, time.monotonic() + 1.0)
+                if error is not None:
+                    raise error
+            return True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            pollers = self._pollers
+        error = self._close_poller_set(pollers, time.monotonic() + 1.0)
+        if error is not None:
+            raise error
 
 
 def merge_gpu_process_rows(
@@ -5123,6 +5651,18 @@ def draw_small_screen(screen: curses.window, height: int, width: int) -> None:
     screen.refresh()
 
 
+def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
+    """Draw the effect-free progressive startup shell before any collection begins."""
+
+    del config
+    height, width = screen.getmaxyx()
+    screen.erase()
+    safe_add(screen, 0, 1, "PorkyHUD · CHECKING", color_pair(1) | curses.A_BOLD)
+    if height > 2:
+        safe_add(screen, 2, 1, "Establishing independent system evidence…"[: max(0, width - 2)], color_pair(6))
+    return 3
+
+
 def hud(screen: curses.window) -> None:
     try:
         curses.curs_set(0)
@@ -5137,55 +5677,73 @@ def hud(screen: curses.window) -> None:
     config = HudConfig()
     init_colors(config.theme_index)
     apply_dark_screen(screen)
+    draw_initial_shell(screen, config)
+    screen.refresh()
 
-    static = collect_static_info()
-    uptime_at_start = boot_seconds()
+    coordinator = LiveHealthCoordinator()
+    static: dict[str, Any] = {}
+
+    def collect_live_static() -> dict[str, Any]:
+        result = collect_static_info()
+        result["boot_seconds"] = boot_seconds()
+        return result
+
+    static_poller = AsyncPoller(3600.0, collect_live_static, static)
+    uptime_at_start = 0
     uptime_clock_start = time.monotonic()
-    cpu_sampler = MacCpuSampler()
-    per_core = cpu_sampler.sample()
-    runtime_stats = collect_runtime_stats()
-    runtime_poller = AsyncPoller(
-        REFRESH_SECONDS,
-        collect_runtime_stats,
-        runtime_stats,
-        initial_is_fresh=True,
-    )
-    mem = runtime_stats.memory
-    battery = runtime_stats.battery
-    disk = runtime_stats.disk
+    per_core: list[float] = []
+    mem: dict[str, float] = {}
+    battery = BatteryInfo(None, False, "Power", "checking", "checking", False,
+                          False, False, None, None, None, None, None, None, None,
+                          None, None)
+    disk = DiskInfo("checking", "/", 1, 0, 1)
     net_down = 0.0
     net_up = 0.0
-    process_source_rows: list[ProcessRow] = []
-    process_poller = AsyncPoller(
-        PROCESS_REFRESH_SECONDS,
-        lambda: list(collect_process_rows().value or ()),
-        process_source_rows,
-    )
     rows: list[ProcessRow] = []
     sort_mode = "CPU"
     scroll = 0
     sensor = default_sensor_info()
-    sensor_poller = AsyncPoller(SENSOR_REFRESH_SECONDS, sensor_info, sensor)
+    latest_thermal: list[Optional[OsThermalState]] = [None]
     activity = DiskActivity()
+    memory_poller = AsyncPoller(MEMORY_DETAIL_REFRESH_SECONDS, memory_detail, mem)
+    swap_poller = AsyncPoller(SWAP_REFRESH_SECONDS, swap_stats, (0.0, 0.0))
+    network_poller = AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes, (0, 0))
+    battery_poller = AsyncPoller(BATTERY_REFRESH_SECONDS, battery_info, battery)
+    sensor_poller = AsyncPoller(
+        OPTIONAL_SENSOR_REFRESH_SECONDS,
+        lambda: sensor_info(latest_thermal[0]),
+        sensor,
+    )
     disk_activity_poller = AsyncPoller(DISK_ACTIVITY_REFRESH_SECONDS, disk_activity, activity)
     history = MetricHistory()
     history.add(cpu_total_percent(per_core), ram_percent(mem), 0.0, disk_percent(disk))
-    force_runtime = False
-    force_process = True
+    force_live = True
+    force_static = True
+    force_memory = True
+    force_swap = True
+    force_network = True
+    force_battery = True
     force_sensor = True
     force_disk_activity = True
+    prior_network = (0, 0)
+    prior_network_at = time.monotonic()
     last_render = 0.0
+
+    def quit_hud() -> None:
+        coordinator.close()
 
     while True:
         now = time.monotonic()
         key = screen.getch()
         if key in (ord("q"), ord("Q")):
+            quit_hud()
             return
         if config.show_help:
             if key in (27, ord("h"), ord("H"), ord("?")):
                 config.show_help = False
                 set_message(config, "shortcut panel closed")
         elif key == 27:
+            quit_hud()
             return
         elif key in (ord("h"), ord("H"), ord("?")):
             config.show_help = True
@@ -5216,9 +5774,8 @@ def hud(screen: curses.window) -> None:
         elif key in (ord("m"), ord("M")):
             sort_modes = ["CPU", "MEM", "GPU"]
             sort_mode = sort_modes[(sort_modes.index(sort_mode) + 1) % len(sort_modes)]
-            rows = sort_process_rows(process_source_rows, sort_mode)
+            rows = sort_process_rows(rows, sort_mode)
             scroll = 0
-            force_process = True
             set_message(config, f"process sort: {sort_mode}")
         elif key in (curses.KEY_DOWN, ord("j")):
             scroll += 1
@@ -5233,37 +5790,51 @@ def hud(screen: curses.window) -> None:
         elif key == curses.KEY_END:
             scroll = 10**9
         elif key in (ord("r"), ord("R")):
-            force_runtime = True
-            force_process = True
+            force_live = True
+            force_memory = True
+            force_swap = True
+            force_network = True
+            force_battery = True
             force_sensor = True
             force_disk_activity = True
             set_message(config, "refreshing live telemetry")
 
-        runtime_poller.tick(now, force_runtime)
-        sampled_runtime, runtime_age, runtime_error = runtime_poller.snapshot(now)
-        if sampled_runtime is not None and sampled_runtime is not runtime_stats:
-            elapsed = max(0.1, sampled_runtime.collected_at - runtime_stats.collected_at)
-            net_down = max(
-                0.0,
-                (sampled_runtime.network_totals[0] - runtime_stats.network_totals[0]) / elapsed,
-            )
-            net_up = max(
-                0.0,
-                (sampled_runtime.network_totals[1] - runtime_stats.network_totals[1]) / elapsed,
-            )
-            runtime_stats = sampled_runtime
-            mem = runtime_stats.memory
-            battery = runtime_stats.battery
-            disk = runtime_stats.disk
-            sampled_cpu = cpu_sampler.sample()
-            if sampled_cpu:
-                per_core = sampled_cpu
-            history.add(
-                cpu_total_percent(per_core),
-                ram_percent(mem),
-                net_down + net_up,
-                disk_percent(disk),
-            )
+        coordinator.observe_time(now, utc_now())
+        frame = coordinator.tick(now, force_live)
+        latest_thermal[0] = frame.thermal
+        per_core = list(coordinator.per_core())
+        if frame.disk_capacity is not None:
+            capacity = frame.disk_capacity
+            disk = DiskInfo(capacity.volume_name.lower(), capacity.mount_point,
+                            capacity.total_bytes, capacity.total_bytes - capacity.free_bytes,
+                            capacity.free_bytes)
+        rows = sort_process_rows(coordinator.process_rows(now), sort_mode)
+
+        static_poller.tick(now, force_static)
+        sampled_static, _static_age, _static_error = static_poller.snapshot(now)
+        if sampled_static:
+            static = sampled_static
+            uptime_at_start = int(static.get("boot_seconds", uptime_at_start) or 0)
+        memory_poller.tick(now, force_memory)
+        sampled_memory, _memory_age, _memory_error = memory_poller.snapshot(now)
+        if sampled_memory:
+            mem = sampled_memory
+        swap_poller.tick(now, force_swap)
+        sampled_swap, _swap_age, _swap_error = swap_poller.snapshot(now)
+        if sampled_swap is not None:
+            mem = merge_memory_stats(mem, sampled_swap)
+        network_poller.tick(now, force_network)
+        sampled_network, _network_age, _network_error = network_poller.snapshot(now)
+        if sampled_network is not None and sampled_network != prior_network:
+            elapsed = max(0.1, now - prior_network_at)
+            net_down = max(0.0, (sampled_network[0] - prior_network[0]) / elapsed)
+            net_up = max(0.0, (sampled_network[1] - prior_network[1]) / elapsed)
+            prior_network = sampled_network
+            prior_network_at = now
+        battery_poller.tick(now, force_battery)
+        sampled_battery, _battery_age, _battery_error = battery_poller.snapshot(now)
+        if sampled_battery is not None:
+            battery = sampled_battery
 
         sensor_poller.tick(now, force_sensor)
         sampled_sensor, sensor_age, _sensor_error = sensor_poller.snapshot(now)
@@ -5275,14 +5846,13 @@ def hud(screen: curses.window) -> None:
         if sampled_activity is not None:
             activity = replace(sampled_activity, sample_age=activity_age)
 
-        process_poller.tick(now, force_process)
-        sampled_processes, process_age, process_error = process_poller.snapshot(now)
-        if sampled_processes is not None and sampled_processes is not process_source_rows:
-            process_source_rows = sampled_processes
-            rows = sort_process_rows(process_source_rows, sort_mode)
-
-        force_runtime = False
-        force_process = False
+        history.add(cpu_total_percent(per_core), ram_percent(mem), net_down + net_up, disk_percent(disk))
+        force_live = False
+        force_static = False
+        force_memory = False
+        force_swap = False
+        force_network = False
+        force_battery = False
         force_sensor = False
         force_disk_activity = False
 
@@ -5306,7 +5876,10 @@ def hud(screen: curses.window) -> None:
         footer_lines = 2 if height >= 24 else 1
         body_height = height - header_h - footer_lines
         uptime_seconds = uptime_at_start + int(max(0.0, now - uptime_clock_start))
-        load_average = runtime_stats.load_average
+        try:
+            load_average = os.getloadavg()
+        except OSError:
+            load_average = (0.0, 0.0, 0.0)
 
         if width >= 118 and height >= 34:
             layout = config.layout_name
@@ -5392,25 +5965,11 @@ def hud(screen: curses.window) -> None:
             draw_help_overlay(screen, config, sensor)
 
         if footer_lines == 2:
-            read_text, read_level = system_read(per_core, mem, disk, activity, battery, sensor, rows, net_down, net_up)
-            safe_add(screen, height - 2, 1, read_text[: width - 2], read_attr(read_level))
+            safe_add(screen, height - 2, 1, frame.assessment.reason[: width - 2], color_pair(1))
         status = shortcut_status(width)
         if config.message and now < config.message_until:
             suffix = status if width >= 100 else "h help  q quit"
             status = f"{config.message} | {suffix}"
-        else:
-            delayed_sources = []
-            if runtime_error and runtime_age > REFRESH_SECONDS * 2:
-                delayed_sources.append("stats")
-            if process_error and process_age > PROCESS_REFRESH_SECONDS * 2:
-                delayed_sources.append("processes")
-            if _sensor_error and sensor_age > SENSOR_REFRESH_SECONDS * 2:
-                delayed_sources.append("sensors")
-            if _activity_error and activity_age > DISK_ACTIVITY_REFRESH_SECONDS * 2:
-                delayed_sources.append("disk")
-            if delayed_sources:
-                suffix = status if width >= 100 else "h help  q quit"
-                status = f"{','.join(delayed_sources)} delayed | {suffix}"
         safe_add(screen, height - 1, 1, status[: width - 2], color_pair(6))
         screen.refresh()
         time.sleep(0.03)
