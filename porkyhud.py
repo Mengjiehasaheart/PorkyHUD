@@ -473,18 +473,61 @@ def _command_result(
     )
 
 
-def _close_command_streams(selector: selectors.BaseSelector, streams: Sequence[Any]) -> None:
+def _unregister_command_stream(selector: selectors.BaseSelector, stream: Any) -> None:
+    selector.unregister(stream)
+
+
+def _close_command_stream(stream: Any) -> None:
+    stream.close()
+
+
+def _close_command_selector(selector: selectors.BaseSelector) -> None:
+    selector.close()
+
+
+def _run_cleanup_actions(
+    actions: Sequence[Callable[[], None]],
+    suppress_ordinary_exceptions: bool,
+    preserve_pending_base_exception: bool,
+) -> None:
+    """Attempt every cleanup step without losing a result or prior interrupt."""
+
+    cleanup_failure: Optional[BaseException] = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            if preserve_pending_base_exception:
+                continue
+            if isinstance(exc, Exception) and suppress_ordinary_exceptions:
+                continue
+            if not isinstance(exc, Exception) or cleanup_failure is None:
+                cleanup_failure = exc
+    if cleanup_failure is not None:
+        raise cleanup_failure
+
+
+def _cleanup_structured_command(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    streams: Sequence[Any],
+    terminate_process_group: bool,
+    suppress_ordinary_exceptions: bool,
+    preserve_pending_base_exception: bool,
+) -> None:
+    actions: list[Callable[[], None]] = []
+    if terminate_process_group:
+        actions.append(lambda: _terminate_and_reap_process_group(process))
     for stream in streams:
-        if stream is None:
-            continue
-        try:
-            selector.unregister(stream)
-        except (KeyError, ValueError, OSError):
-            pass
-        try:
-            stream.close()
-        except OSError:
-            pass
+        if stream is not None:
+            actions.append(lambda stream=stream: _unregister_command_stream(selector, stream))
+            actions.append(lambda stream=stream: _close_command_stream(stream))
+    actions.append(lambda: _close_command_selector(selector))
+    _run_cleanup_actions(
+        actions,
+        suppress_ordinary_exceptions=suppress_ordinary_exceptions,
+        preserve_pending_base_exception=preserve_pending_base_exception,
+    )
 
 
 def _signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
@@ -509,8 +552,9 @@ def _terminate_and_reap_process_group(process: subprocess.Popen[bytes]) -> None:
     """Stop the dedicated session, including descendants that inherited its pipes."""
 
     _signal_process_group(process, signal.SIGTERM)
-    _wait_for_process(process, time.monotonic() + COMMAND_TERMINATE_GRACE_SECONDS)
-    # The leader can exit while a descendant ignores SIGTERM and keeps a pipe open.
+    # Do not poll or wait here: retaining the zombie leader prevents its numeric
+    # process-group ID from being reused before the SIGKILL escalation.
+    time.sleep(COMMAND_TERMINATE_GRACE_SECONDS)
     _signal_process_group(process, signal.SIGKILL)
     _wait_for_process(process, time.monotonic() + COMMAND_KILL_REAP_SECONDS)
 
@@ -538,6 +582,7 @@ def run_structured_command(
     outcome: Optional[AttemptOutcome] = None
     result_payload: Optional[tuple[str, str, AttemptOutcome, Optional[FailureCode]]] = None
     terminate_process_group = False
+    pending_base_exception: Optional[BaseException] = None
 
     try:
         process = subprocess.Popen(
@@ -589,7 +634,6 @@ def run_structured_command(
                 data = os.read(key.fileobj.fileno(), min(COMMAND_READ_CHUNK_BYTES, remaining_capacity + 1))
                 if not data:
                     selector.unregister(key.fileobj)
-                    key.fileobj.close()
                     continue
                 if len(data) > remaining_capacity:
                     outcome = AttemptOutcome.COMMAND_ERROR
@@ -599,17 +643,6 @@ def run_structured_command(
             if failure is not None:
                 break
 
-        if failure is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                outcome = AttemptOutcome.TIMEOUT
-                failure = FailureCode.COMMAND_TIMEOUT
-            else:
-                try:
-                    process.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    outcome = AttemptOutcome.TIMEOUT
-                    failure = FailureCode.COMMAND_TIMEOUT
         if failure is not None:
             terminate_process_group = True
             result_payload = (
@@ -625,27 +658,47 @@ def run_structured_command(
                     "", "", AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
                 )
             else:
-                if process.returncode != 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    terminate_process_group = True
                     result_payload = (
-                        stdout, stderr, AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
+                        "", "", AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
                     )
                 else:
-                    result_payload = (stdout, stderr, AttemptOutcome.SUCCESS, None)
+                    try:
+                        process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        terminate_process_group = True
+                        result_payload = (
+                            "", "", AttemptOutcome.TIMEOUT, FailureCode.COMMAND_TIMEOUT,
+                        )
+                    else:
+                        if process.returncode != 0:
+                            result_payload = (
+                                stdout, stderr, AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
+                            )
+                        else:
+                            result_payload = (stdout, stderr, AttemptOutcome.SUCCESS, None)
     except Exception:
         terminate_process_group = True
         result_payload = (
             "", "", AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
         )
-    except BaseException:
+    except BaseException as exc:
         terminate_process_group = True
+        pending_base_exception = exc
         raise
     finally:
-        try:
-            if terminate_process_group:
-                _terminate_and_reap_process_group(process)
-        finally:
-            _close_command_streams(selector, streams)
-            selector.close()
+        _cleanup_structured_command(
+            process,
+            selector,
+            streams,
+            terminate_process_group=terminate_process_group,
+            suppress_ordinary_exceptions=(
+                pending_base_exception is not None or result_payload is not None
+            ),
+            preserve_pending_base_exception=pending_base_exception is not None,
+        )
 
     assert result_payload is not None
     stdout, stderr, result_outcome, result_failure = result_payload

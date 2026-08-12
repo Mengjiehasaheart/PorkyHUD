@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -288,16 +289,25 @@ class StructuredCommandTests(unittest.TestCase):
         with open(heartbeat_path, encoding="utf-8") as heartbeat:
             self.assertEqual(heartbeat.read(), before)
 
-    def cleanup_recorded_process_group(self, pid_path: str) -> None:
+    def cleanup_recorded_fixture_processes(self, pid_path: str, fixture_token: str) -> None:
         if not os.path.exists(pid_path):
             return
         with open(pid_path, encoding="utf-8") as pids:
             values = [int(value) for value in pids.read().splitlines() if value]
-        if values:
+        for pid in values:
             try:
-                os.killpg(values[0], signal.SIGKILL)
+                command = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "command="], text=True, timeout=0.2,
+                )
             except ProcessLookupError:
-                pass
+                continue
+            except subprocess.CalledProcessError:
+                continue
+            if fixture_token in command:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def assert_recorded_processes_are_gone(self, pid_path: str) -> None:
         with open(pid_path, encoding="utf-8") as pids:
@@ -410,8 +420,9 @@ class StructuredCommandTests(unittest.TestCase):
                 result = self.run_fixture(code, timeout_s=1.0)
                 self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
                 self.assert_heartbeat_stopped(heartbeat_path)
+                self.assert_recorded_processes_are_gone(pid_path)
             finally:
-                self.cleanup_recorded_process_group(pid_path)
+                self.cleanup_recorded_fixture_processes(pid_path, directory)
 
     def test_selector_interruption_reaps_group_and_reraises_original_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -448,7 +459,151 @@ class StructuredCommandTests(unittest.TestCase):
                 self.assert_heartbeat_stopped(heartbeat_path)
                 self.assert_recorded_processes_are_gone(pid_path)
             finally:
-                self.cleanup_recorded_process_group(pid_path)
+                self.cleanup_recorded_fixture_processes(pid_path, directory)
+
+    def test_cleanup_fault_does_not_replace_prepared_timeout_result(self) -> None:
+        class CleanupFault(Exception):
+            pass
+
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, _heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
+            try:
+                original_cleanup = porkyhud._terminate_and_reap_process_group
+
+                def cleanup_then_fault(process: object) -> None:
+                    original_cleanup(process)
+                    events.append("terminate")
+                    raise CleanupFault()
+
+                original_selector_close = porkyhud._close_command_selector
+
+                def close_selector(selector: object) -> None:
+                    events.append("selector")
+                    original_selector_close(selector)
+
+                with mock.patch.object(
+                    porkyhud, "_terminate_and_reap_process_group", side_effect=cleanup_then_fault,
+                ), mock.patch.object(
+                    porkyhud, "_close_command_selector", side_effect=close_selector,
+                ):
+                    result = self.run_fixture(code, timeout_s=0.1)
+                self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+                self.assertEqual(result.failure, core.FailureCode.COMMAND_TIMEOUT)
+                self.assertEqual(events, ["terminate", "selector"])
+            finally:
+                self.cleanup_recorded_fixture_processes(pid_path, directory)
+
+    def test_cleanup_fault_preserves_pending_keyboard_interrupt_identity(self) -> None:
+        class CleanupFault(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
+            interruption = KeyboardInterrupt("fixture interruption")
+            real_selector = porkyhud.selectors.DefaultSelector
+
+            class InterruptingSelector:
+                def __init__(self) -> None:
+                    self._selector = real_selector()
+
+                def register(self, *args: object, **kwargs: object) -> object:
+                    return self._selector.register(*args, **kwargs)
+
+                def unregister(self, *args: object, **kwargs: object) -> object:
+                    return self._selector.unregister(*args, **kwargs)
+
+                def get_map(self) -> object:
+                    return self._selector.get_map()
+
+                def select(self, _timeout: float | None = None) -> object:
+                    self_outer.wait_for_heartbeat(heartbeat_path)
+                    raise interruption
+
+                def close(self) -> None:
+                    self._selector.close()
+
+            self_outer = self
+            try:
+                original_cleanup = porkyhud._terminate_and_reap_process_group
+
+                def cleanup_then_fault(process: object) -> None:
+                    original_cleanup(process)
+                    raise CleanupFault()
+
+                with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector), mock.patch.object(
+                    porkyhud, "_terminate_and_reap_process_group", side_effect=cleanup_then_fault,
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        self.run_fixture(code, timeout_s=1.0)
+                self.assertIs(raised.exception, interruption)
+            finally:
+                self.cleanup_recorded_fixture_processes(pid_path, directory)
+
+    def test_ready_success_suppresses_cleanup_faults_and_attempts_every_step(self) -> None:
+        class CleanupFault(Exception):
+            pass
+
+        events: list[str] = []
+
+        def fail_after_recording(name: str) -> object:
+            def fault(*_args: object) -> None:
+                events.append(name)
+                raise CleanupFault(name)
+            return fault
+
+        secret = "cleanup-fixture-secret"
+        with mock.patch.object(
+            porkyhud, "_unregister_command_stream", side_effect=fail_after_recording("unregister"),
+        ), mock.patch.object(
+            porkyhud, "_close_command_stream", side_effect=fail_after_recording("stream-close"),
+        ), mock.patch.object(
+            porkyhud, "_close_command_selector", side_effect=fail_after_recording("selector-close"),
+        ):
+            result = self.run_fixture("print('ok') # " + secret)
+        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+        self.assertEqual(result.stdout, "ok\n")
+        self.assertNotIn(secret, repr(result))
+        self.assertEqual(events.count("unregister"), 2)
+        self.assertEqual(events.count("stream-close"), 2)
+        self.assertEqual(events.count("selector-close"), 1)
+
+    def test_decode_cleanup_signals_before_the_leader_is_reaped(self) -> None:
+        original_signal = porkyhud._signal_process_group
+
+        def traced_result(code: str) -> tuple[object, list[tuple[int, int | None, int | None]]]:
+            signals: list[tuple[int, int | None, int | None]] = []
+
+            def trace_signal(process: object, sig: int) -> None:
+                try:
+                    pgid = os.getpgid(process.pid)
+                except ProcessLookupError:
+                    pgid = None
+                signals.append((sig, process.returncode, pgid))
+                original_signal(process, sig)
+
+            with mock.patch.object(porkyhud, "_signal_process_group", side_effect=trace_signal):
+                return self.run_fixture(code), signals
+
+        result, signals = traced_result("import sys; sys.stdout.buffer.write(b'\\xff')")
+        self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+        self.assertEqual([signal_value for signal_value, _returncode, _pgid in signals], [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
+            try:
+                result, signals = traced_result(code)
+                self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+                self.assertEqual(
+                    [signal_value for signal_value, _returncode, _pgid in signals],
+                    [signal.SIGTERM, signal.SIGKILL],
+                )
+                self.assertTrue(all(returncode is None for _sig, returncode, _pgid in signals))
+                self.assert_heartbeat_stopped(heartbeat_path)
+                self.assert_recorded_processes_are_gone(pid_path)
+            finally:
+                self.cleanup_recorded_fixture_processes(pid_path, directory)
 
     def test_timeout_terminates_a_child_ignoring_sigterm(self) -> None:
         started = time.monotonic()
