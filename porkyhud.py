@@ -377,6 +377,21 @@ def run_command(args: list[str], timeout: float = 2.0) -> str:
         return ""
 
 
+def _normalize_utc_timestamp(value: datetime, label: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("%s must be timezone-aware" % label)
+    try:
+        offset = value.utcoffset()
+    except Exception as exc:
+        raise ValueError("%s must have a valid UTC offset" % label) from exc
+    if offset is None:
+        raise ValueError("%s must be timezone-aware" % label)
+    try:
+        return value.astimezone(timezone.utc)
+    except Exception as exc:
+        raise ValueError("%s must have a valid UTC offset" % label) from exc
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """A bounded, classified command execution result for effect adapters."""
@@ -410,9 +425,11 @@ class CommandResult:
             or self.completed_mono_s < self.started_mono_s
         ):
             raise ValueError("command timestamps must be finite and ordered")
-        if not isinstance(self.completed_at_utc, datetime) or self.completed_at_utc.tzinfo is None:
-            raise ValueError("command completion timestamp must be timezone-aware")
-        object.__setattr__(self, "completed_at_utc", self.completed_at_utc.astimezone(timezone.utc))
+        object.__setattr__(
+            self,
+            "completed_at_utc",
+            _normalize_utc_timestamp(self.completed_at_utc, "command completion timestamp"),
+        )
         if not isinstance(self.outcome, AttemptOutcome):
             raise TypeError("command outcome must be an AttemptOutcome")
         if self.failure is not None and not isinstance(self.failure, FailureCode):
@@ -460,9 +477,11 @@ class AdapterResult(Generic[T]):
             or self.completed_mono_s < self.started_mono_s
         ):
             raise ValueError("adapter timestamps must be finite and ordered")
-        if not isinstance(self.completed_at_utc, datetime) or self.completed_at_utc.tzinfo is None:
-            raise ValueError("adapter completion timestamp must be timezone-aware")
-        object.__setattr__(self, "completed_at_utc", self.completed_at_utc.astimezone(timezone.utc))
+        object.__setattr__(
+            self,
+            "completed_at_utc",
+            _normalize_utc_timestamp(self.completed_at_utc, "adapter completion timestamp"),
+        )
         legal_failures = {
             AttemptOutcome.SUCCESS: set(),
             AttemptOutcome.NOT_APPLICABLE: {FailureCode.NOT_APPLICABLE},

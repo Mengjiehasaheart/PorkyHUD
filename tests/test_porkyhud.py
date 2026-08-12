@@ -10,11 +10,23 @@ import threading
 import time
 import unittest
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from unittest import mock
 
 import porkyhud
 import porkyhud_core as core
+
+
+class OffsetTimezone(tzinfo):
+    """Timezone fixture for missing, exceptional, and interrupted offsets."""
+
+    def __init__(self, failure: BaseException | None = None) -> None:
+        self.failure = failure
+
+    def utcoffset(self, _value: datetime | None) -> timedelta | None:
+        if self.failure is not None:
+            raise self.failure
+        return None
 
 
 class FakeScreen:
@@ -863,6 +875,33 @@ class StructuredCommandTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises((TypeError, ValueError)):
                 porkyhud.CommandResult(**{**values, **overrides})
 
+    def test_command_result_requires_a_real_utc_offset(self) -> None:
+        values = {
+            "category": "fixture",
+            "stdout": "",
+            "stderr": "",
+            "returncode": 0,
+            "started_mono_s": 1.0,
+            "completed_mono_s": 2.0,
+            "outcome": core.AttemptOutcome.SUCCESS,
+            "failure": None,
+        }
+        missing_offset = datetime(2026, 8, 12, 2, 0, tzinfo=OffsetTimezone())
+        with self.assertRaises(ValueError):
+            porkyhud.CommandResult(**values, completed_at_utc=missing_offset)
+
+        exceptional = datetime(
+            2026, 8, 12, 2, 0, tzinfo=OffsetTimezone(RuntimeError("bad timezone")),
+        )
+        with self.assertRaises(ValueError):
+            porkyhud.CommandResult(**values, completed_at_utc=exceptional)
+
+        interruption = KeyboardInterrupt("stop timezone validation")
+        interrupted = datetime(2026, 8, 12, 2, 0, tzinfo=OffsetTimezone(interruption))
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            porkyhud.CommandResult(**values, completed_at_utc=interrupted)
+        self.assertIs(raised.exception, interruption)
+
     def test_missing_executable_is_classified_without_echoing_arguments(self) -> None:
         secret = "never-display-this-argument"
         result = porkyhud.run_structured_command(
@@ -1219,6 +1258,42 @@ class DecisionAdapterTests(unittest.TestCase):
             porkyhud.AdapterResult(None, 1.0, 2.0, completed,
                                    core.AttemptOutcome.SUCCESS,
                                    core.FailureCode.PARSER_REJECTED)
+
+    def test_adapter_result_requires_a_real_offset_and_normalizes_failed_attempts(self) -> None:
+        missing_offset = datetime(2026, 8, 11, 7, tzinfo=OffsetTimezone())
+        with self.assertRaises(ValueError):
+            porkyhud.AdapterResult(
+                "value", 1.0, 2.0, missing_offset, core.AttemptOutcome.SUCCESS, None,
+            )
+
+        exceptional = datetime(
+            2026, 8, 11, 7, tzinfo=OffsetTimezone(RuntimeError("bad timezone")),
+        )
+        with self.assertRaises(ValueError):
+            porkyhud.AdapterResult(
+                "value", 1.0, 2.0, exceptional, core.AttemptOutcome.SUCCESS, None,
+            )
+
+        interruption = KeyboardInterrupt("stop timezone validation")
+        interrupted = datetime(2026, 8, 11, 7, tzinfo=OffsetTimezone(interruption))
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            porkyhud.AdapterResult(
+                "value", 1.0, 2.0, interrupted, core.AttemptOutcome.SUCCESS, None,
+            )
+        self.assertIs(raised.exception, interruption)
+
+        failed = porkyhud.AdapterResult(
+            None,
+            1.0,
+            2.0,
+            datetime(2026, 8, 11, 7, tzinfo=timezone(timedelta(hours=-5))),
+            core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+        )
+        self.assertEqual(
+            failed.completed_at_utc,
+            datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
+        )
 
     def test_memory_pressure_accepts_only_public_levels(self) -> None:
         accepted = {
