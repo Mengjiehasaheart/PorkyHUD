@@ -2388,6 +2388,26 @@ class ProcessEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             porkyhud.parse_agx_counters(conflicting)
 
+    def test_agx_parser_consumes_all_input_and_requires_usage_dictionaries(self) -> None:
+        self.assertEqual(
+            dict(porkyhud.parse_agx_counters(self.AGX_FIRST).counters_ns),
+            {42: 100000000},
+        )
+        malformed_usage = self.AGX_FIRST.replace(
+            '({"accumulatedGPUTime"=40000000},{"unknown"=7,"accumulatedGPUTime"=60000000})',
+            '("accumulatedGPUTime"=100000000)',
+        )
+        invalid = (
+            self.AGX_FIRST + "+-o AGXDeviceUserClient\n",
+            self.AGX_FIRST + "}\n",
+            self.AGX_FIRST + '"truncated" =\n',
+            self.AGX_FIRST + "arbitrary suffix\n",
+            malformed_usage,
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                porkyhud.parse_agx_counters(raw)
+
     def test_agx_creator_identity_preserves_spaced_labels_for_process_merge(self) -> None:
         parsed = porkyhud.parse_agx_counters(self.AGX_EMPTY_USAGE)
         self.assertEqual(parsed.identities[7], "Cisco Secure Client")

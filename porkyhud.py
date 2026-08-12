@@ -3384,30 +3384,56 @@ def _ioreg_brace_delta(raw: str) -> int:
     return delta
 
 
-def _balanced_agx_usage(raw: str) -> bool:
-    """Recognize one complete AppUsage container, including nested dictionaries."""
+def _parse_agx_usage(raw: str) -> int:
+    """Parse an empty usage list or a sequence of flat ioreg dictionaries."""
 
-    stack: list[str] = []
-    pairs = {")": "(", "}": "{"}
-    quoted = False
-    escaped = False
-    for character in raw:
-        if quoted:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                quoted = False
-            continue
-        if character == '"':
-            quoted = True
-        elif character in "({":
-            stack.append(character)
-        elif character in ")}":
-            if not stack or stack.pop() != pairs[character]:
-                return False
-    return not quoted and not escaped and not stack
+    if raw == "()":
+        return 0
+    if not raw.startswith("(") or not raw.endswith(")"):
+        raise ValueError("malformed AGX AppUsage container")
+    inner = raw[1:-1].strip()
+    objects = re.fullmatch(r"\{.*\}(?:\s*,\s*\{.*\})*", inner)
+    if objects is None:
+        raise ValueError("AGX AppUsage must contain dictionaries")
+    bodies = re.split(r"\}\s*,\s*\{", inner[1:-1])
+    field = re.compile(
+        r'\s*"((?:[^"\\]|\\.)*)"\s*=\s*'
+        r'(-?\d+|"(?:[^"\\]|\\.)*")'
+    )
+    total = 0
+    for body in bodies:
+        position = 0
+        counters: list[int] = []
+        keys: set[str] = set()
+        while position < len(body):
+            match = field.match(body, position)
+            if match is None:
+                raise ValueError("malformed AGX AppUsage dictionary")
+            key, value = match.groups()
+            if key in keys:
+                raise ValueError("duplicate AGX AppUsage property")
+            keys.add(key)
+            if key == "accumulatedGPUTime":
+                if not re.fullmatch(r"-?\d+", value):
+                    raise ValueError("malformed AGX counter")
+                counter = int(value)
+                if counter < 0:
+                    raise ValueError("negative AGX counter")
+                counters.append(counter)
+            position = match.end()
+            while position < len(body) and body[position].isspace():
+                position += 1
+            if position == len(body):
+                break
+            if body[position] != ",":
+                raise ValueError("malformed AGX AppUsage dictionary")
+            position += 1
+            if not body[position:].strip():
+                raise ValueError("malformed AGX AppUsage dictionary")
+        if body.strip() and len(counters) != 1:
+            raise ValueError("AGX AppUsage dictionary requires one counter")
+        total += sum(counters)
+    return total
 
 
 def parse_elapsed_seconds(raw: str) -> Optional[int]:
@@ -3511,6 +3537,8 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
             re.match(r"^\+-o\s+AGXDeviceUserClient\s+<class\s+AGXDeviceUserClient(?:,|>)", stripped)
         )
         if current is None:
+            if not stripped:
+                continue
             if any(
                 property_name in line
                 for property_name in (
@@ -3529,6 +3557,9 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
             elif is_header:
                 saw_client = True
                 expecting_outer = True
+                continue
+            else:
+                raise ValueError("unexpected content outside AGX client")
             continue
         if is_header:
             raise ValueError("nested AGX object")
@@ -3550,18 +3581,7 @@ def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
             if match is None:
                 raise ValueError("malformed AGX AppUsage")
             usage = match.group(1)
-            if not _balanced_agx_usage(usage):
-                raise ValueError("malformed AGX AppUsage structure")
-            counter_tokens = re.findall(r'"accumulatedGPUTime"\s*=\s*(-?\d+)', usage)
-            if usage != "()" and not counter_tokens:
-                raise ValueError("nonempty AGX AppUsage lacks counters")
-            residue = re.sub(r'"accumulatedGPUTime"\s*=\s*-?\d+', "", usage)
-            if "accumulatedGPUTime" in residue:
-                raise ValueError("malformed AGX counter")
-            values = [int(token) for token in counter_tokens]
-            if any(value < 0 for value in values):
-                raise ValueError("negative AGX counter")
-            current["app_usage"] = sum(values)
+            current["app_usage"] = _parse_agx_usage(usage)
         elif "accumulatedGPUTime" in line:
             raise ValueError("orphan AGX counter")
         outer_depth += _ioreg_brace_delta(line)
