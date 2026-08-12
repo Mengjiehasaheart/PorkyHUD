@@ -14,9 +14,11 @@ import ctypes
 import ctypes.util
 import json
 import locale
+import math
 import os
 import platform
 import re
+import selectors
 import shutil
 import signal
 import socket
@@ -29,8 +31,11 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from operator import attrgetter
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Sequence
+
+from porkyhud_core import AttemptOutcome, FailureCode
 
 
 REFRESH_SECONDS = 1.0
@@ -65,6 +70,10 @@ SENSITIVE_ARGUMENT_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?:--?|/)(?:api[-_]?key|access[-_]?token|auth(?:orization)?|password|passwd|secret|token)(?:=|\s+))"
     r"(?P<value>\"[^\"]*\"|'[^']*'|\S+)"
 )
+COMMAND_CATEGORY_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+COMMAND_READ_CHUNK_BYTES = 64 * 1024
+COMMAND_TERMINATE_GRACE_SECONDS = 0.2
+COMMAND_KILL_REAP_SECONDS = 0.5
 THEMES: list[dict[str, Any]] = [
     {
         "name": "Neon Grid",
@@ -350,6 +359,291 @@ def run_command(args: list[str], timeout: float = 2.0) -> str:
         ).strip()
     except Exception:
         return ""
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """A bounded, classified command execution result for effect adapters."""
+
+    category: str
+    stdout: str
+    stderr: str
+    returncode: Optional[int]
+    started_mono_s: float
+    completed_mono_s: float
+    completed_at_utc: datetime
+    outcome: AttemptOutcome
+    failure: Optional[FailureCode]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.category, str) or not COMMAND_CATEGORY_PATTERN.fullmatch(self.category):
+            raise ValueError("command category must be a stable safe identifier")
+        if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
+            raise TypeError("command output must be text")
+        if self.returncode is not None and (
+            isinstance(self.returncode, bool) or not isinstance(self.returncode, int)
+        ):
+            raise TypeError("command return code must be an integer or None")
+        if (
+            not isinstance(self.started_mono_s, (int, float))
+            or isinstance(self.started_mono_s, bool)
+            or not isinstance(self.completed_mono_s, (int, float))
+            or isinstance(self.completed_mono_s, bool)
+            or not math.isfinite(self.started_mono_s)
+            or not math.isfinite(self.completed_mono_s)
+            or self.completed_mono_s < self.started_mono_s
+        ):
+            raise ValueError("command timestamps must be finite and ordered")
+        if not isinstance(self.completed_at_utc, datetime) or self.completed_at_utc.tzinfo is None:
+            raise ValueError("command completion timestamp must be timezone-aware")
+        object.__setattr__(self, "completed_at_utc", self.completed_at_utc.astimezone(timezone.utc))
+        if not isinstance(self.outcome, AttemptOutcome):
+            raise TypeError("command outcome must be an AttemptOutcome")
+        if self.failure is not None and not isinstance(self.failure, FailureCode):
+            raise TypeError("command failure must be a FailureCode or None")
+        legal_failures = {
+            AttemptOutcome.SUCCESS: set(),
+            AttemptOutcome.MISSING_DEPENDENCY: {FailureCode.MISSING_EXECUTABLE},
+            AttemptOutcome.PERMISSION_DENIED: {FailureCode.PERMISSION_DENIED},
+            AttemptOutcome.TIMEOUT: {FailureCode.COMMAND_TIMEOUT, FailureCode.DEADLINE_EXCEEDED},
+            AttemptOutcome.COMMAND_ERROR: {
+                FailureCode.NONZERO_EXIT,
+                FailureCode.DECODE_ERROR,
+                FailureCode.OUTPUT_LIMIT,
+            },
+            AttemptOutcome.UNKNOWN_ERROR: {FailureCode.UNEXPECTED_EXCEPTION},
+        }
+        allowed = legal_failures.get(self.outcome)
+        if allowed is None or (
+            self.outcome is AttemptOutcome.SUCCESS and self.failure is not None
+        ) or (
+            self.outcome is not AttemptOutcome.SUCCESS and self.failure not in allowed
+        ):
+            raise ValueError("command outcome and failure are inconsistent")
+
+
+def _validate_structured_command(
+    args: Sequence[str], category: str, timeout_s: float, stdout_limit: int, stderr_limit: int
+) -> tuple[str, ...]:
+    if isinstance(args, (str, bytes)):
+        raise TypeError("command arguments must be a sequence of strings")
+    try:
+        normalized_args = tuple(args)
+    except TypeError as exc:
+        raise TypeError("command arguments must be a sequence of strings") from exc
+    if not normalized_args:
+        raise ValueError("command arguments must not be empty")
+    if any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in normalized_args):
+        raise ValueError("command arguments must be nonempty strings without NUL")
+    if not isinstance(category, str) or not COMMAND_CATEGORY_PATTERN.fullmatch(category):
+        raise ValueError("command category must be a stable safe identifier")
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+    ):
+        raise ValueError("command timeout must be finite and positive")
+    for limit in (stdout_limit, stderr_limit):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("command output limits must be positive integers")
+    return normalized_args
+
+
+def _command_result(
+    category: str,
+    stdout: str,
+    stderr: str,
+    returncode: Optional[int],
+    started_mono_s: float,
+    outcome: AttemptOutcome,
+    failure: Optional[FailureCode],
+) -> CommandResult:
+    completed_mono_s = time.monotonic()
+    return CommandResult(
+        category=category,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
+        started_mono_s=started_mono_s,
+        completed_mono_s=max(started_mono_s, completed_mono_s),
+        completed_at_utc=datetime.now(timezone.utc),
+        outcome=outcome,
+        failure=failure,
+    )
+
+
+def _close_command_streams(selector: selectors.BaseSelector, streams: Sequence[Any]) -> None:
+    for stream in streams:
+        if stream is None:
+            continue
+        try:
+            selector.unregister(stream)
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _wait_for_process(process: subprocess.Popen[bytes], deadline: float) -> None:
+    while process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            process.wait(timeout=min(remaining, 0.05))
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _terminate_and_reap_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop the dedicated session, including descendants that inherited its pipes."""
+
+    _signal_process_group(process, signal.SIGTERM)
+    _wait_for_process(process, time.monotonic() + COMMAND_TERMINATE_GRACE_SECONDS)
+    # The leader can exit while a descendant ignores SIGTERM and keeps a pipe open.
+    _signal_process_group(process, signal.SIGKILL)
+    _wait_for_process(process, time.monotonic() + COMMAND_KILL_REAP_SECONDS)
+
+
+def run_structured_command(
+    args: Sequence[str],
+    category: str,
+    timeout_s: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> CommandResult:
+    """Run a no-shell command with bounded output and private failure classification."""
+
+    normalized_args = _validate_structured_command(
+        args, category, timeout_s, stdout_limit, stderr_limit
+    )
+    started_mono_s = time.monotonic()
+    deadline = started_mono_s + timeout_s
+    process: Optional[subprocess.Popen[bytes]] = None
+    selector: selectors.BaseSelector = selectors.DefaultSelector()
+    streams: list[Any] = []
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    failure: Optional[FailureCode] = None
+    outcome: Optional[AttemptOutcome] = None
+
+    try:
+        process = subprocess.Popen(
+            normalized_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except FileNotFoundError:
+        selector.close()
+        return _command_result(
+            category, "", "", None, started_mono_s,
+            AttemptOutcome.MISSING_DEPENDENCY, FailureCode.MISSING_EXECUTABLE,
+        )
+    except PermissionError:
+        selector.close()
+        return _command_result(
+            category, "", "", None, started_mono_s,
+            AttemptOutcome.PERMISSION_DENIED, FailureCode.PERMISSION_DENIED,
+        )
+    except OSError:
+        selector.close()
+        return _command_result(
+            category, "", "", None, started_mono_s,
+            AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+        )
+
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            streams.append(stream)
+            selector.register(stream, selectors.EVENT_READ, name)
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                outcome = AttemptOutcome.TIMEOUT
+                failure = FailureCode.COMMAND_TIMEOUT
+                break
+            events = selector.select(remaining)
+            if not events:
+                continue
+            for key, _mask in events:
+                name = key.data
+                remaining_capacity = limits[name] - len(buffers[name])
+                data = os.read(key.fileobj.fileno(), min(COMMAND_READ_CHUNK_BYTES, remaining_capacity + 1))
+                if not data:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                if len(data) > remaining_capacity:
+                    outcome = AttemptOutcome.COMMAND_ERROR
+                    failure = FailureCode.OUTPUT_LIMIT
+                    break
+                buffers[name].extend(data)
+            if failure is not None:
+                break
+
+        if failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                outcome = AttemptOutcome.TIMEOUT
+                failure = FailureCode.COMMAND_TIMEOUT
+            else:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    outcome = AttemptOutcome.TIMEOUT
+                    failure = FailureCode.COMMAND_TIMEOUT
+        if failure is not None:
+            _terminate_and_reap_process_group(process)
+            return _command_result(
+                category, "", "",
+                process.returncode,
+                started_mono_s,
+                outcome or AttemptOutcome.UNKNOWN_ERROR,
+                failure,
+            )
+
+        try:
+            stdout = bytes(buffers["stdout"]).decode("utf-8", "strict")
+            stderr = bytes(buffers["stderr"]).decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return _command_result(
+                category, "", "", process.returncode, started_mono_s,
+                AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
+            )
+        if process.returncode != 0:
+            return _command_result(
+                category, stdout, stderr, process.returncode, started_mono_s,
+                AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
+            )
+        return _command_result(
+            category, stdout, stderr, process.returncode, started_mono_s,
+            AttemptOutcome.SUCCESS, None,
+        )
+    except Exception:
+        _terminate_and_reap_process_group(process)
+        return _command_result(
+            category, "", "", process.returncode, started_mono_s,
+            AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+        )
+    finally:
+        _close_command_streams(selector, streams)
+        selector.close()
 
 
 def sysctl_value(name: str) -> str:

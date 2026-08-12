@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
+import tempfile
+import time
 import unittest
 from dataclasses import replace
+from datetime import timedelta
 from unittest import mock
 
 import porkyhud
+import porkyhud_core as core
 
 
 class FakeScreen:
@@ -216,6 +221,172 @@ utun0 1380 Link x 1 0 300 1 0 400 0
 """
         with mock.patch.object(porkyhud, "run_command", return_value=netstat):
             self.assertEqual(porkyhud.network_bytes(), (1300, 2400))
+
+
+class StructuredCommandTests(unittest.TestCase):
+    def run_fixture(
+        self,
+        code: str,
+        timeout_s: float = 1.0,
+        stdout_limit: int = 1024,
+        stderr_limit: int = 1024,
+    ) -> object:
+        return porkyhud.run_structured_command(
+            [sys.executable, "-c", code],
+            category="fixture",
+            timeout_s=timeout_s,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+        )
+
+    def assert_command_error(self, result: object, failure: core.FailureCode) -> None:
+        self.assertEqual(result.outcome, core.AttemptOutcome.COMMAND_ERROR)
+        self.assertEqual(result.failure, failure)
+
+    def test_success_is_bounded_classified_and_uses_c_locale(self) -> None:
+        original_locale = os.environ.get("LC_ALL")
+        result = self.run_fixture(
+            "import os; print(os.environ.get('LC_ALL')); print('ok')"
+        )
+        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+        self.assertEqual(result.stdout, "C\nok\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.failure)
+        self.assertEqual(os.environ.get("LC_ALL"), original_locale)
+        self.assertLessEqual(result.started_mono_s, result.completed_mono_s)
+        self.assertIsNotNone(result.completed_at_utc.tzinfo)
+        self.assertEqual(result.completed_at_utc.utcoffset(), timedelta(0))
+
+    def test_missing_executable_is_classified_without_echoing_arguments(self) -> None:
+        secret = "never-display-this-argument"
+        result = porkyhud.run_structured_command(
+            ["/definitely/not/a/porkyhud-command", secret],
+            category="fixture",
+            timeout_s=1.0,
+            stdout_limit=1024,
+            stderr_limit=1024,
+        )
+        self.assertEqual(result.outcome, core.AttemptOutcome.MISSING_DEPENDENCY)
+        self.assertEqual(result.failure, core.FailureCode.MISSING_EXECUTABLE)
+        self.assertEqual(result.returncode, None)
+        self.assertNotIn(secret, repr(result))
+
+    def test_nonzero_exit_preserves_bounded_streams_but_is_not_success(self) -> None:
+        result = self.run_fixture(
+            "import sys; print('out'); print('err', file=sys.stderr); raise SystemExit(7)"
+        )
+        self.assert_command_error(result, core.FailureCode.NONZERO_EXIT)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "out\n")
+        self.assertEqual(result.stderr, "err\n")
+
+    def test_exact_stream_caps_succeed_and_first_extra_byte_invalidates_output(self) -> None:
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream, size="exact"):
+                target = "sys.stdout.buffer" if stream == "stdout" else "sys.stderr.buffer"
+                result = self.run_fixture(
+                    "import sys; %s.write(b'x' * 8)" % target,
+                    stdout_limit=8,
+                    stderr_limit=8,
+                )
+                self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+                self.assertEqual(getattr(result, stream), "x" * 8)
+            with self.subTest(stream=stream, size="crossing"):
+                target = "sys.stdout.buffer" if stream == "stdout" else "sys.stderr.buffer"
+                result = self.run_fixture(
+                    "import sys; %s.write(b'x' * 9)" % target,
+                    stdout_limit=8,
+                    stderr_limit=8,
+                )
+                self.assert_command_error(result, core.FailureCode.OUTPUT_LIMIT)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
+
+    def test_simultaneous_stdout_and_stderr_are_drained_without_deadlock(self) -> None:
+        result = self.run_fixture(
+            "import sys; sys.stdout.buffer.write(b'o' * 65536); "
+            "sys.stderr.buffer.write(b'e' * 65536)",
+            timeout_s=2.0,
+            stdout_limit=65536,
+            stderr_limit=65536,
+        )
+        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+        self.assertEqual(result.stdout, "o" * 65536)
+        self.assertEqual(result.stderr, "e" * 65536)
+
+    def test_utf8_is_decoded_strictly_across_write_boundaries(self) -> None:
+        valid = self.run_fixture(
+            "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
+            "time.sleep(0.03); sys.stdout.buffer.write(b'\\x82\\xac')"
+        )
+        self.assertEqual(valid.outcome, core.AttemptOutcome.SUCCESS)
+        self.assertEqual(valid.stdout, "€")
+        invalid = self.run_fixture(
+            "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
+            "time.sleep(0.03); sys.stdout.buffer.write(b'X')"
+        )
+        self.assert_command_error(invalid, core.FailureCode.DECODE_ERROR)
+        self.assertEqual(invalid.stdout, "")
+        self.assertEqual(invalid.stderr, "")
+
+    def test_timeout_terminates_a_child_ignoring_sigterm(self) -> None:
+        started = time.monotonic()
+        result = self.run_fixture(
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            timeout_s=0.15,
+        )
+        self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+        self.assertEqual(result.failure, core.FailureCode.COMMAND_TIMEOUT)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_timeout_terminates_descendant_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = os.path.join(directory, "grandchild.pid")
+            child_code = "import time; time.sleep(60)"
+            code = (
+                "import pathlib, subprocess, sys, time; "
+                "child = subprocess.Popen([sys.executable, '-c', %r]); "
+                "pathlib.Path(%r).write_text(str(child.pid)); time.sleep(60)"
+            ) % (child_code, pid_path)
+            result = self.run_fixture(code, timeout_s=0.2)
+            self.assertEqual(result.outcome, core.AttemptOutcome.TIMEOUT)
+            self.assertTrue(os.path.exists(pid_path))
+            with open(pid_path, encoding="utf-8") as pid_file:
+                grandchild_pid = int(pid_file.read())
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    os.kill(grandchild_pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("timed-out descendant remained alive")
+                time.sleep(0.02)
+
+    def test_rejects_invalid_structured_command_inputs(self) -> None:
+        invalid_calls = (
+            ([], "fixture", 1.0, 1, 1),
+            ([""], "fixture", 1.0, 1, 1),
+            ([b"bytes"], "fixture", 1.0, 1, 1),
+            (["has" + chr(0) + "nul"], "fixture", 1.0, 1, 1),
+            ([sys.executable], "unsafe category", 1.0, 1, 1),
+            ([sys.executable], "fixture", 0.0, 1, 1),
+            ([sys.executable], "fixture", float("inf"), 1, 1),
+            ([sys.executable], "fixture", True, 1, 1),
+            ([sys.executable], "fixture", 1.0, True, 1),
+            ([sys.executable], "fixture", 1.0, 1, False),
+        )
+        for args, category, timeout_s, stdout_limit, stderr_limit in invalid_calls:
+            with self.subTest(args=args, category=category, timeout_s=timeout_s):
+                with self.assertRaises((TypeError, ValueError)):
+                    porkyhud.run_structured_command(
+                        args,
+                        category=category,
+                        timeout_s=timeout_s,
+                        stdout_limit=stdout_limit,
+                        stderr_limit=stderr_limit,
+                    )
 
 
 class CommandPrivacyTests(unittest.TestCase):
