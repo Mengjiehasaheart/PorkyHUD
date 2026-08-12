@@ -454,6 +454,71 @@ class ContributorTests(unittest.TestCase):
         history = reduce_process_history(ProcessHistory(), source)
         self.assertIs(reduce_process_history(history, source), history)
 
+    def test_same_revision_success_must_match_the_consumed_current_table(self):
+        first = (ProcessFact(42, "Xcode", 30.0, 100),)
+        second = (ProcessFact(42, "Xcode", 36.0, 102),)
+        altered = (ProcessFact(42, "Other", 36.0, 102),)
+        source = self.process_source(first, 1.0)
+        one_sample_history = reduce_process_history(ProcessHistory(), source)
+        two_sample_history, two_sample_source = self.history_for(first, second)
+        for history, completed_source in (
+            (one_sample_history, source),
+            (two_sample_history, two_sample_source),
+        ):
+            with self.subTest(history=history):
+                forged = replace(
+                    completed_source,
+                    last_valid=replace(completed_source.last_valid, value=altered),
+                )
+                with self.assertRaises(ValueError):
+                    reduce_process_history(history, forged)
+
+    def test_empty_source_allows_only_revision_zero_or_initial_active_revision_one(self):
+        empty = new_source(SourceId.PROCESS_TABLE, 1.0, 7.5)
+        active, _ = start_attempt(empty, 1.0)
+        history = ProcessHistory()
+        self.assertIs(reduce_process_history(history, empty), history)
+        self.assertIs(reduce_process_history(history, active), history)
+        self.assertEqual(
+            select_cpu_contributor(history, active, 1.0).state,
+            ContributorState.UNAVAILABLE,
+        )
+        impossible = replace(active, revision=2, active_revision=2)
+        with self.assertRaises(ValueError):
+            reduce_process_history(history, impossible)
+        with self.assertRaises(ValueError):
+            select_cpu_contributor(history, impossible, 1.0)
+
+    def test_process_source_rejects_raw_enum_strings(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        source = self.process_source(rows, 1.0)
+        cases = (
+            replace(
+                source,
+                last_attempt=replace(
+                    source.last_attempt,
+                    outcome=AttemptOutcome.TIMEOUT,
+                    failure="command_timeout",
+                ),
+                last_valid=None,
+            ),
+            replace(
+                source,
+                last_attempt=replace(
+                    source.last_attempt,
+                    outcome="timeout",
+                    failure=FailureCode.COMMAND_TIMEOUT,
+                ),
+                last_valid=None,
+            ),
+        )
+        for forged in cases:
+            with self.subTest(forged=forged):
+                with self.assertRaises(ValueError):
+                    reduce_process_history(ProcessHistory(), forged)
+                with self.assertRaises(ValueError):
+                    select_cpu_contributor(ProcessHistory(), forged, 1.0)
+
     def test_history_attempt_revision_cannot_recede(self):
         rows = (ProcessFact(42, "Xcode", 30.0, 100),)
         source = self.process_source(rows, 1.0)

@@ -505,6 +505,13 @@ def reduce_process_history(
     if attempt.revision == history.last_attempt_revision:
         if attempt.outcome is not AttemptOutcome.SUCCESS and history.current_revision:
             return ProcessHistory(last_attempt_revision=attempt.revision)
+        if attempt.outcome is AttemptOutcome.SUCCESS:
+            sample = _validated_process_success(source, attempt)
+            if (
+                history.current_revision != attempt.revision
+                or history.current != sample.value
+            ):
+                raise ValueError("duplicate success does not match consumed process history")
         return history
     if attempt.revision < history.last_attempt_revision:
         raise ValueError("process attempt revision cannot recede")
@@ -631,6 +638,8 @@ def _process_attempt(
             raise ValueError("source cannot retain a sample without an attempt")
         if source.active_revision is None and source.revision != 0:
             raise ValueError("inactive source cannot have an uncompleted revision")
+        if source.active_revision is not None and source.revision != 1:
+            raise ValueError("initial active source must have revision one")
         return None
     _validate_process_attempt(attempt)
     if now_mono_s is not None and now_mono_s < attempt.completed_mono_s:
@@ -699,8 +708,10 @@ def _validate_process_attempt(attempt: CollectionAttempt) -> None:
         or attempt.completed_at_utc.tzinfo is not timezone.utc
     ):
         raise ValueError("process attempt completion timestamp must be timezone-aware")
-    if not isinstance(attempt.outcome, AttemptOutcome):
+    if type(attempt.outcome) is not AttemptOutcome:
         raise ValueError("process attempt outcome must be an AttemptOutcome")
+    if attempt.failure is not None and type(attempt.failure) is not FailureCode:
+        raise ValueError("process attempt failure must be a FailureCode or None")
     if attempt.outcome is AttemptOutcome.SUCCESS:
         if attempt.failure is not None:
             raise ValueError("successful process attempt cannot have a failure code")
