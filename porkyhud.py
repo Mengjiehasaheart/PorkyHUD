@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, Generic, Mapping, Optional, Sequence, TypeVar
+from typing import Any, Callable, Generic, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from porkyhud_core import (
     AttemptOutcome,
@@ -46,6 +46,7 @@ from porkyhud_core import (
     CpuUsage,
     DiskCapacity,
     EvidenceRole,
+    EvidenceState,
     FailureCode,
     HealthAssessment,
     HealthFacts,
@@ -139,18 +140,26 @@ COMMAND_TERMINATE_GRACE_SECONDS = 0.2
 COMMAND_CLEANUP_SECONDS = 1.0
 COMMAND_CLEANUP_RETRY_SECONDS = 0.01
 T = TypeVar("T")
+PRIMARY = 1
+INFO = 2
+NOMINAL = 3
+WATCH = 4
+CRITICAL = 5
+STRUCTURE = 6
+SECONDARY = 7
+BRAND = 8
 THEMES: list[dict[str, Any]] = [
     {
         "name": "Neon Grid",
         "colors": {
             1: 231,
             2: 51,
-            3: 220,
-            4: 196,
-            5: 39,
-            6: 46,
-            7: 201,
-            8: 45,
+            3: 46,
+            4: 220,
+            5: 196,
+            6: 39,
+            7: 45,
+            8: 201,
             9: 171,
             10: 214,
         },
@@ -159,13 +168,13 @@ THEMES: list[dict[str, Any]] = [
         "name": "Catppuccin",
         "colors": {
             1: 189,
-            2: 119,
-            3: 229,
-            4: 203,
-            5: 111,
-            6: 153,
-            7: 183,
-            8: 110,
+            2: 110,
+            3: 119,
+            4: 229,
+            5: 203,
+            6: 111,
+            7: 153,
+            8: 183,
             9: 147,
             10: 215,
         },
@@ -174,13 +183,13 @@ THEMES: list[dict[str, Any]] = [
         "name": "Solar Circuit",
         "colors": {
             1: 255,
-            2: 82,
-            3: 226,
-            4: 202,
-            5: 33,
-            6: 118,
-            7: 208,
-            8: 87,
+            2: 87,
+            3: 82,
+            4: 226,
+            5: 202,
+            6: 33,
+            7: 87,
+            8: 165,
             9: 165,
             10: 220,
         },
@@ -189,13 +198,13 @@ THEMES: list[dict[str, Any]] = [
         "name": "Graphite",
         "colors": {
             1: 252,
-            2: 250,
-            3: 222,
-            4: 203,
-            5: 245,
-            6: 110,
-            7: 248,
-            8: 152,
+            2: 110,
+            3: 152,
+            4: 222,
+            5: 203,
+            6: 245,
+            7: 250,
+            8: 183,
             9: 183,
             10: 216,
         },
@@ -4954,8 +4963,9 @@ def safe_add(screen: curses.window, y: int, x: int, text: str, attr: int = 0) ->
     height, width = screen.getmaxyx()
     if y < 0 or y >= height or x < 0 or x >= width - 1:
         return
+    safe_text = truncate_display_cells(str(text), max(0, width - x - 1))
     try:
-        screen.addnstr(y, x, text, max(0, width - x - 1), attr)
+        screen.addnstr(y, x, safe_text, len(safe_text), attr)
     except curses.error:
         pass
 
@@ -5189,12 +5199,419 @@ def source_state_from_result(
     )
 
 
+def display_mode_name(mode: str) -> str:
+    """Return the stable decision-header label for one backing mode ID."""
+
+    names = {
+        "balanced": "1 OVERVIEW",
+        "compact": "1 OVERVIEW",
+        "compute": "2 COMPUTE",
+        "thermals": "3 THERMALS",
+        "io": "4 I/O",
+        "processes": "5 PROCESSES",
+        "cinema": "6 CINEMA",
+    }
+    try:
+        return names[mode]
+    except (KeyError, TypeError):
+        raise ValueError("unknown display mode")
+
+
+def semantic_text(text: str, unicode_enabled: bool) -> str:
+    """Project semantic copy to Unicode or a deterministic ASCII fallback."""
+
+    if not isinstance(text, str) or type(unicode_enabled) is not bool:
+        raise ValueError("semantic text requires a string and Boolean capability")
+    if unicode_enabled:
+        return text
+    for before, after in (
+        (" · ", " | "), ("≥", ">="), ("≤", "<="), ("×", "x"),
+        ("–", "-"), ("—", "-"),
+    ):
+        text = text.replace(before, after)
+    text = "".join(
+        character for character in unicodedata.normalize("NFKD", text)
+        if (unicodedata.category(character) not in {"Cc", "Cf"}
+            and not unicodedata.combining(character))
+    )
+    return text.encode("ascii", "replace").decode("ascii")
+
+
+def _finite_nonnegative(value: float, name: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError("%s must be finite and nonnegative" % name)
+    return float(value)
+
+
+def _projection_width(width: int) -> int:
+    if type(width) is not int or width < 76:
+        raise ValueError("decision presentation requires at least 76 columns")
+    return width - 1
+
+
+def _fits_semantic_projections(text: str, budget: int) -> bool:
+    """Require a complete candidate to fit in both Unicode and ASCII modes."""
+
+    return all(
+        display_cell_width(semantic_text(text, unicode_enabled)) <= budget
+        for unicode_enabled in (True, False)
+    )
+
+
+def _frame_elapsed(frame: HealthFrame, now_mono_s: float) -> float:
+    if not isinstance(frame, HealthFrame):
+        raise ValueError("frame must be a HealthFrame")
+    now = _finite_nonnegative(now_mono_s, "now_mono_s")
+    elapsed = now - frame.captured_mono_s
+    if elapsed < 0:
+        raise ValueError("now_mono_s cannot precede frame capture")
+    return elapsed
+
+
+def format_evidence_age(age_s: float) -> str:
+    """Floor an evidence age to the stable, once-per-second display tiers."""
+
+    seconds = int(math.floor(_finite_nonnegative(age_s, "age_s")))
+    if seconds < 1:
+        return "<1s"
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        minutes, remaining = divmod(seconds, 60)
+        return "%dm %02ds" % (minutes, remaining)
+    if seconds < 86400:
+        hours, remaining = divmod(seconds, 3600)
+        return "%dh %02dm" % (hours, remaining // 60)
+    days, remaining = divmod(seconds, 86400)
+    return "%dd %02dh" % (days, remaining // 3600)
+
+
+def source_view_text(view: SourceView, elapsed_s: float = 0.0) -> str:
+    """Render a complete source status without exposing a retained value as live."""
+
+    if not isinstance(view, SourceView) or not isinstance(view.status, SourceViewStatus):
+        raise ValueError("view must be a SourceView")
+    elapsed = _finite_nonnegative(elapsed_s, "elapsed_s")
+    age = None
+    if view.age_s is not None:
+        age = _finite_nonnegative(view.age_s, "view.age_s") + elapsed
+    if view.status is SourceViewStatus.LOCKED:
+        if view.source_id is not SourceId.SENSOR_POWERMETRICS:
+            raise ValueError("LOCKED is reserved for powermetrics")
+        text = "LOCKED · u: temporary unlock"
+    elif view.status is SourceViewStatus.STALE:
+        text = "STALE" if age is None else "STALE · %s" % format_evidence_age(age)
+    elif view.status is SourceViewStatus.ERROR:
+        text = (
+            "ERROR · no valid sample" if age is None
+            else "ERROR · last good %s ago" % format_evidence_age(age)
+        )
+    else:
+        text = view.status.value
+    if view.refreshing and view.status is not SourceViewStatus.LIVE:
+        text += " · checking"
+    return text
+
+
+_CORE_SOURCE_LABELS: Mapping[SourceId, str] = MappingProxyType({
+    SourceId.CPU_USAGE: "CPU",
+    SourceId.MEMORY_PRESSURE: "MEM",
+    SourceId.THERMAL_OS: "THERM",
+    SourceId.DISK_CAPACITY: "DISK",
+})
+
+
+def _trigger_suffix(frame: HealthFrame, now_mono_s: float) -> str:
+    if frame.decisive_triggered_mono_s is None:
+        return ""
+    age = _finite_nonnegative(
+        now_mono_s - frame.decisive_triggered_mono_s, "trigger age",
+    )
+    return " · triggered %s ago." % format_evidence_age(age)
+
+
+def compact_reason(frame: HealthFrame, width: int, now_mono_s: float) -> str:
+    """Return a complete decision reason that fits without semantic ellipsis."""
+
+    budget = _projection_width(width)
+    _frame_elapsed(frame, now_mono_s)
+    assessment = frame.assessment
+    reason = assessment.reason
+    recovering = frame.decisive_triggered_mono_s is not None
+    recovery_copy = {
+        "macOS memory pressure is now normal; recovery confirmation is in progress.":
+            "Memory pressure normal · confirming recovery",
+        "macOS memory pressure has eased from critical to elevated; recovery confirmation is in progress.":
+            "Memory eased to elevated · confirming recovery",
+        "macOS warnings are now clear; thermal recovery confirmation is in progress.":
+            "macOS warnings clear · confirming thermal recovery",
+        "CPU use has eased; recovery confirmation is in progress.":
+            "CPU use eased · confirming recovery",
+        "Storage headroom has improved; recovery confirmation is in progress.":
+            "Storage headroom improved · confirming recovery",
+    }
+    trigger_suffix = _trigger_suffix(frame, now_mono_s)
+    preserve_snapshot_reason = bool(
+        frame.origin is FrameOrigin.SNAPSHOT
+        and reason == "CPU trend requires live monitoring."
+    )
+    if width < 90 and not preserve_snapshot_reason:
+        if recovering:
+            reason = recovery_copy.get(reason, reason.rstrip("."))
+        elif assessment.severity is HealthSeverity.NORMAL:
+            reason = "No active CPU, memory, thermal, or storage pressure."
+        elif assessment.active_rules:
+            rule = assessment.active_rules[0]
+            if rule is RuleId.MEMORY_WATCH:
+                reason = "macOS memory pressure is elevated."
+            elif rule is RuleId.MEMORY_CRITICAL:
+                reason = "macOS memory pressure is critical."
+            elif rule is RuleId.THERMAL_WATCH:
+                reason = "macOS thermal/performance warning is active."
+            elif rule is RuleId.CPU_WATCH:
+                reason = "CPU averaged ≥90% for 15s."
+            elif rule is RuleId.STORAGE_WATCH:
+                disk = frame.disk_capacity
+                if disk is None:
+                    reason = "Storage headroom is low."
+                else:
+                    reason = "Storage low · %s free on %s." % (
+                        human_bytes(disk.free_bytes).strip(), disk.volume_name,
+                    )
+        elif assessment.blockers:
+            source_id = assessment.blockers[0]
+            label = _CORE_SOURCE_LABELS[source_id]
+            state = source_view_text(
+                frame.source_views[source_id],
+                now_mono_s - frame.captured_mono_s,
+            )
+            reason = "Health incomplete · %s %s." % (label, state)
+    elif recovering and not _fits_semantic_projections(
+            reason + trigger_suffix, budget):
+        reason = recovery_copy.get(reason, reason.rstrip("."))
+    elif assessment.contributor_name and RuleId.CPU_WATCH in assessment.active_rules:
+        addition = " · %s is the leading recent CPU process." % assessment.contributor_name
+        if _fits_semantic_projections(reason + addition + trigger_suffix, budget):
+            reason += addition
+    if assessment.evidence_state is EvidenceState.DEGRADED and width >= 90:
+        addition = " Other core evidence is incomplete."
+        if _fits_semantic_projections(reason + addition + trigger_suffix, budget):
+            reason += addition
+    reason += trigger_suffix
+    if not _fits_semantic_projections(reason, budget):
+        if assessment.active_rules and assessment.active_rules[0] is RuleId.STORAGE_WATCH:
+            reason = "Storage headroom is low." + _trigger_suffix(frame, now_mono_s)
+        if not _fits_semantic_projections(reason, budget):
+            raise ValueError("complete decision reason does not fit the supported width")
+    return reason
+
+
+def _is_bootstrap_checking(frame: HealthFrame) -> bool:
+    return bool(
+        frame.origin is FrameOrigin.LIVE
+        and frame.assessment.severity is HealthSeverity.UNKNOWN
+        and frame.assessment.evidence_state is EvidenceState.INCOMPLETE
+        and frame.assessment.blockers
+        and all(
+            source_id in _CORE_SOURCE_LABELS
+            and frame.source_views[source_id].status is SourceViewStatus.CHECKING
+            for source_id in frame.assessment.blockers
+        )
+    )
+
+
+def _is_cpu_baseline(frame: HealthFrame) -> bool:
+    return bool(
+        frame.origin is FrameOrigin.LIVE
+        and frame.assessment.severity is HealthSeverity.UNKNOWN
+        and frame.assessment.evidence_state is EvidenceState.INCOMPLETE
+        and frame.assessment.blockers == (SourceId.CPU_USAGE,)
+        and frame.assessment.cpu_coverage_s < 15.0
+        and all(
+            frame.source_views[source_id].status is SourceViewStatus.LIVE
+            and frame.source_views[source_id].decision_ready
+            for source_id in _CORE_SOURCE_LABELS
+        )
+    )
+
+
+def decision_header_lines(
+    frame: HealthFrame, mode: str, width: int, now_mono_s: float,
+) -> Tuple[str, str]:
+    """Construct the two decision rows without clocks, I/O, curses, or mutation."""
+
+    budget = _projection_width(width)
+    elapsed = _frame_elapsed(frame, now_mono_s)
+    prefix = "PorkyHUD · %s · " % display_mode_name(mode)
+    if frame.assessment.severity in (HealthSeverity.WATCH, HealthSeverity.CRITICAL):
+        state = "%s · %s" % (
+            frame.assessment.severity.value.upper(),
+            frame.assessment.evidence_state.value.upper(),
+        )
+    elif frame.assessment.severity is HealthSeverity.NORMAL:
+        state = "NORMAL · %s" % frame.assessment.evidence_state.value.upper()
+    elif _is_cpu_baseline(frame):
+        coverage = min(15, max(0, int(math.floor(frame.assessment.cpu_coverage_s))))
+        state = "CHECKING CPU baseline %d/15s" % coverage
+    elif _is_bootstrap_checking(frame):
+        ready = sum(
+            frame.source_views[source_id].status is SourceViewStatus.LIVE
+            and frame.source_views[source_id].decision_ready
+            for source_id in _CORE_SOURCE_LABELS
+        )
+        state = "CHECKING %d/4 core sources" % ready
+    else:
+        state = "UNKNOWN · %s" % frame.assessment.evidence_state.value.upper()
+    if (frame.assessment.evidence_age_s is not None
+            and frame.assessment.severity is not HealthSeverity.UNKNOWN):
+        state += " · evidence %s" % format_evidence_age(
+            frame.assessment.evidence_age_s + elapsed,
+        )
+    first = prefix + state
+    if _is_cpu_baseline(frame):
+        second = "Building the 15-second CPU baseline."
+    elif _is_bootstrap_checking(frame):
+        second = "Waiting for core evidence."
+    else:
+        second = compact_reason(frame, width, now_mono_s)
+    if (not _fits_semantic_projections(first, budget)
+            or not _fits_semantic_projections(second, budget)):
+        raise ValueError("complete decision header does not fit the supported width")
+    return first, second
+
+
+def _live_ribbon_value(frame: HealthFrame, source_id: SourceId) -> str:
+    if source_id is SourceId.CPU_USAGE:
+        return "LIVE" if frame.cpu_percent is None else "%d%%" % round(frame.cpu_percent)
+    if source_id is SourceId.MEMORY_PRESSURE:
+        if frame.memory_pressure is None:
+            return "LIVE"
+        return {
+            MemoryPressureLevel.NORMAL: "NORMAL",
+            MemoryPressureLevel.WARN: "ELEVATED",
+            MemoryPressureLevel.CRITICAL: "CRITICAL",
+        }[frame.memory_pressure.level]
+    if source_id is SourceId.THERMAL_OS:
+        if frame.thermal is None:
+            return "LIVE"
+        thermal = frame.thermal
+        if thermal.thermal_warning_level or thermal.performance_warning_level:
+            return "WARN T%d/P%d" % (
+                thermal.thermal_warning_level, thermal.performance_warning_level,
+            )
+        return "CLEAR"
+    if frame.disk_capacity is None:
+        return "LIVE"
+    percent = 100.0 * frame.disk_capacity.free_bytes / frame.disk_capacity.total_bytes
+    return "%d%% FREE" % round(percent)
+
+
+def _ribbon_role(
+    frame: HealthFrame, source_id: SourceId, view: SourceView,
+) -> int:
+    if view.status is not SourceViewStatus.LIVE:
+        if view.status in (
+            SourceViewStatus.NOT_APPLICABLE,
+            SourceViewStatus.NOT_EXPOSED,
+            SourceViewStatus.UNSUPPORTED,
+        ):
+            return SECONDARY
+        return PRIMARY
+    if source_id is SourceId.MEMORY_PRESSURE and frame.memory_pressure is not None:
+        if frame.memory_pressure.level is MemoryPressureLevel.CRITICAL:
+            return CRITICAL
+        if frame.memory_pressure.level is MemoryPressureLevel.WARN:
+            return WATCH
+    if (source_id is SourceId.THERMAL_OS and frame.thermal is not None
+            and (frame.thermal.thermal_warning_level
+                 or frame.thermal.performance_warning_level)):
+        return WATCH
+    if (source_id is SourceId.CPU_USAGE
+            and RuleId.CPU_WATCH in frame.assessment.active_rules):
+        return WATCH
+    if (source_id is SourceId.DISK_CAPACITY
+            and RuleId.STORAGE_WATCH in frame.assessment.active_rules):
+        return WATCH
+    return NOMINAL
+
+
+def _evidence_ribbon_projection(
+    frame: HealthFrame, width: int, now_mono_s: float,
+) -> Tuple[Tuple[Tuple[str, int], ...], str]:
+    budget = _projection_width(width)
+    elapsed = _frame_elapsed(frame, now_mono_s)
+    detailed = []
+    compact = []
+    for source_id, label in _CORE_SOURCE_LABELS.items():
+        view = frame.source_views[source_id]
+        role = _ribbon_role(frame, source_id, view)
+        if view.status is SourceViewStatus.LIVE:
+            value = _live_ribbon_value(frame, source_id)
+            detailed.append(("%s %s" % (label, value), role))
+            compact.append((label, value, False, role))
+        else:
+            detailed.append(("%s %s" % (label, source_view_text(view, elapsed)), role))
+            compact.append((label, view.status.value, True, role))
+    line = " · ".join(text for text, _role in detailed)
+    if _fits_semantic_projections(line, budget):
+        return tuple(detailed), " · "
+    groups = []
+    index = 0
+    while index < len(compact):
+        label, value, groupable, role = compact[index]
+        labels = [label]
+        following = index + 1
+        while (groupable and following < len(compact)
+               and compact[following][1:] == (value, True, role)):
+            labels.append(compact[following][0])
+            following += 1
+        groups.append(("%s %s" % ("/".join(labels), value), role))
+        index = following
+    line = " / ".join(text for text, _role in groups)
+    if _fits_semantic_projections(line, budget):
+        return tuple(groups), " / "
+    line = "/".join(text for text, _role in groups)
+    if _fits_semantic_projections(line, budget):
+        return tuple(groups), "/"
+    references = []
+    first_label_by_status = {}
+    for label, value, groupable, role in compact:
+        if groupable and value in first_label_by_status:
+            text = "%s=%s" % (label, first_label_by_status[value])
+        else:
+            text = "%s %s" % (label, value)
+            if groupable:
+                first_label_by_status[value] = label
+        references.append((text, role))
+    line = "/".join(text for text, _role in references)
+    if _fits_semantic_projections(line, budget):
+        return tuple(references), "/"
+    raise ValueError("complete evidence ribbon does not fit the supported width")
+
+
+def evidence_ribbon_lines(
+    frame: HealthFrame, width: int, now_mono_s: float,
+) -> Tuple[str, ...]:
+    """Construct the fixed-order core ribbon, compacting status detail as needed."""
+
+    segments, separator = _evidence_ribbon_projection(frame, width, now_mono_s)
+    return (separator.join(text for text, _role in segments),)
+
+
 def read_attr(level: str) -> int:
-    if level == "hot":
-        return color_pair(4) | curses.A_BOLD
-    if level == "watch":
-        return color_pair(3) | curses.A_BOLD
-    return color_pair(7)
+    """Map a semantic conclusion to the same color role in every theme."""
+
+    if level in ("normal", "good", "nominal"):
+        pair = NOMINAL
+    elif level == "watch":
+        pair = WATCH
+    elif level in ("critical", "hot"):
+        pair = CRITICAL
+    elif level in ("unknown", "checking", "incomplete", "delayed"):
+        pair = PRIMARY
+    else:
+        raise ValueError("unknown semantic level")
+    return color_pair(pair) | curses.A_BOLD
 
 
 def display_core_usage(per_core: list[float], static: dict[str, Any]) -> tuple[list[float], list[str]]:
@@ -5378,8 +5795,8 @@ def pig_mascot_lines(phase: int) -> list[str]:
 
 
 def draw_header(screen: curses.window, width: int, phase: int, static: dict[str, Any], config: HudConfig) -> int:
-    screen.erase()
-    now_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    """Draw legacy branding without frame lifecycle effects; reserved for Cinema."""
+
     height, _screen_width = screen.getmaxyx()
     if width >= 118 and height >= 34 and config.layout_name != "compact":
         title_lines = [
@@ -5398,7 +5815,6 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
         for idx, line in enumerate(mascot_lines):
             attr = color_pair(3) | curses.A_BOLD if idx in (2, 3) else color_pair(7)
             safe_add(screen, idx, pig_x, line, attr)
-        safe_add(screen, 1, max(58, width - len(now_text) - 3), now_text, color_pair(6) | curses.A_BOLD)
         rig = f"{static.get('chip', 'Mac')} / {static.get('model', '')}".strip()
         safe_add(screen, 3, max(58, width - len(rig) - 3), rig[: max(0, width - 62)], color_pair(1))
         meta = f"{COPYRIGHT_TEXT}  |  {config.theme_name} / {config.layout_name}"
@@ -5414,7 +5830,6 @@ def draw_header(screen: curses.window, width: int, phase: int, static: dict[str,
 
     title = " P O R K Y H U D "
     safe_add(screen, 0, 1, title, color_pair(2) | curses.A_BOLD)
-    safe_add(screen, 0, max(1, width - len(now_text) - 2), now_text, color_pair(6) | curses.A_BOLD)
     meta = f"{COPYRIGHT_TEXT} | {config.theme_name} / {config.layout_name}"
     safe_add(screen, 1, max(1, width - len(meta) - 2), meta[: max(0, width - 3)], color_pair(7))
     divider = list("-" * (width - 2))
@@ -6029,11 +6444,66 @@ def init_colors(theme_index: int = 0) -> None:
 
 
 def draw_small_screen(screen: curses.window, height: int, width: int) -> None:
-    screen.erase()
-    safe_add(screen, 1, 2, "PorkyHUD needs a larger terminal.", color_pair(3) | curses.A_BOLD)
-    safe_add(screen, 3, 2, f"Current: {width}x{height}. Resize to at least 76x22.", color_pair(1))
-    safe_add(screen, 5, 2, "Press q to quit.", color_pair(1))
-    screen.refresh()
+    unicode_enabled = unicode_ok()
+    safe_add(screen, 1, 2, "PorkyHUD needs a larger terminal.", read_attr("watch"))
+    safe_add(
+        screen, 3, 2,
+        semantic_text(
+            "Current: %d×%d. Resize to at least 76×22." % (width, height),
+            unicode_enabled,
+        ),
+        color_pair(PRIMARY),
+    )
+    safe_add(screen, 5, 2, "Press q to quit.", color_pair(PRIMARY))
+
+
+def draw_decision_header(
+    screen: curses.window, frame: HealthFrame, config: HudConfig,
+    now_mono_s: float,
+) -> int:
+    """Draw rows zero and one without owning erase or refresh."""
+
+    _height, width = screen.getmaxyx()
+    lines = decision_header_lines(
+        frame, config.layout_name, width, now_mono_s,
+    )
+    unicode_enabled = unicode_ok()
+    level = frame.assessment.severity.value
+    if _is_bootstrap_checking(frame) or _is_cpu_baseline(frame):
+        level = "checking"
+    projected = tuple(semantic_text(line, unicode_enabled) for line in lines)
+    if any(display_cell_width(line) > width - 1 for line in projected):
+        raise ValueError("projected decision header exceeds the viewport")
+    safe_add(screen, 0, 0, projected[0], read_attr(level))
+    safe_add(screen, 1, 0, projected[1], color_pair(PRIMARY))
+    return 2
+
+
+def draw_evidence_ribbon(
+    screen: curses.window, y: int, frame: HealthFrame, now_mono_s: float,
+) -> int:
+    """Draw the one-row core evidence ribbon without erase or refresh."""
+
+    if type(y) is not int or y < 0:
+        raise ValueError("ribbon row must be a nonnegative int")
+    _height, width = screen.getmaxyx()
+    unicode_enabled = unicode_ok()
+    segments, separator = _evidence_ribbon_projection(frame, width, now_mono_s)
+    projected_separator = semantic_text(separator, unicode_enabled)
+    projected = tuple(
+        (semantic_text(text, unicode_enabled), role)
+        for text, role in segments
+    )
+    line = projected_separator.join(text for text, _role in projected)
+    if display_cell_width(line) > width - 1:
+        raise ValueError("projected evidence ribbon exceeds the viewport")
+    x = 0
+    for index, (text, role) in enumerate(projected):
+        suffix = projected_separator if index + 1 < len(projected) else ""
+        segment = text + suffix
+        safe_add(screen, y, x, segment, color_pair(role) | curses.A_BOLD)
+        x += display_cell_width(segment)
+    return y + 1
 
 
 def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
@@ -6042,9 +6512,22 @@ def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
     del config
     height, width = screen.getmaxyx()
     screen.erase()
-    safe_add(screen, 0, 1, "PorkyHUD · CHECKING", color_pair(1) | curses.A_BOLD)
-    if height > 2:
-        safe_add(screen, 2, 1, "Establishing independent system evidence…"[: max(0, width - 2)], color_pair(6))
+    if height < 22 or width < 76:
+        draw_small_screen(screen, height, width)
+        return 3
+    _projection_width(width)
+    unicode_enabled = unicode_ok()
+    lines = (
+        "PorkyHUD · 1 OVERVIEW · CHECKING 0/4 core sources",
+        "Waiting for core evidence.",
+        "CPU CHECKING · MEM CHECKING · THERM CHECKING · DISK CHECKING",
+    )
+    projected = tuple(semantic_text(line, unicode_enabled) for line in lines)
+    if any(display_cell_width(line) > width - 1 for line in projected):
+        raise ValueError("initial shell does not fit the supported viewport")
+    safe_add(screen, 0, 0, projected[0], read_attr("checking"))
+    safe_add(screen, 1, 0, projected[1], color_pair(PRIMARY))
+    safe_add(screen, 2, 0, projected[2], color_pair(INFO) | curses.A_BOLD)
     return 3
 
 
@@ -6275,7 +6758,9 @@ def _hud_impl(
             continue
         last_render = now
         if height < 22 or width < 76:
+            screen.erase()
             draw_small_screen(screen, height, width)
+            screen.refresh()
             time.sleep(0.03)
             continue
 
@@ -6285,8 +6770,10 @@ def _hud_impl(
             phase = int(now * 16)
         else:
             phase = int(now * 3)
-        header_h = draw_header(screen, width, phase, static, config)
-        footer_lines = 2 if height >= 24 else 1
+        screen.erase()
+        header_h = draw_decision_header(screen, frame, config, now)
+        header_h = draw_evidence_ribbon(screen, header_h, frame, now)
+        footer_lines = 1
         body_height = height - header_h - footer_lines
         uptime_seconds = uptime_at_start + int(max(0.0, now - uptime_clock_start))
         try:
@@ -6377,8 +6864,6 @@ def _hud_impl(
         if config.show_help:
             draw_help_overlay(screen, config, sensor)
 
-        if footer_lines == 2:
-            safe_add(screen, height - 2, 1, frame.assessment.reason[: width - 2], color_pair(1))
         status = shortcut_status(width)
         if config.message and now < config.message_until:
             suffix = status if width >= 100 else "h help  q quit"

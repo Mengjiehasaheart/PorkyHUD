@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import os
 import signal
 import socket
@@ -91,7 +92,7 @@ class DiskUsageFixture:
 
 
 class FakeScreen:
-    """Minimal curses-like character buffer for deterministic rendering tests."""
+    """Display-cell-aware curses double with observable terminal side effects."""
 
     def __init__(self, height: int, width: int, fill: str = " ",
                  keys: list[int] | None = None, on_refresh=None) -> None:
@@ -101,37 +102,68 @@ class FakeScreen:
         self.background: tuple[str, int] | None = None
         self.keys = list(keys or [])
         self.on_refresh = on_refresh
+        self.writes: list[tuple[int, int, str, int, int]] = []
+        self.attributes = [[0 for _ in range(width)] for _ in range(height)]
+        self.erase_count = 0
+        self.refresh_count = 0
+        self.nodelay_enabled: bool | None = None
+        self.keypad_enabled: bool | None = None
 
     def getmaxyx(self) -> tuple[int, int]:
         return self.height, self.width
 
     def addnstr(self, y: int, x: int, text: str, limit: int, _attr: int = 0) -> None:
-        for offset, character in enumerate(str(text)[: max(0, limit)]):
-            column = x + offset
-            if 0 <= y < self.height and 0 <= column < self.width:
-                self.cells[y][column] = character
+        rendered = str(text)[: max(0, limit)]
+        self.writes.append((y, x, rendered, limit, _attr))
+        column = x
+        for character in rendered:
+            category = porkyhud.unicodedata.category(character)
+            if category in {"Cc", "Cf"}:
+                continue
+            if porkyhud.unicodedata.combining(character):
+                if 0 <= y < self.height and x < column:
+                    self.cells[y][column - 1] += character
+                continue
+            cell_width = (
+                2 if porkyhud.unicodedata.east_asian_width(character) in {"F", "W"}
+                else 1
+            )
+            if not (0 <= y < self.height) or column < 0 or column + cell_width > self.width:
+                break
+            self.cells[y][column] = character
+            self.attributes[y][column] = _attr
+            if cell_width == 2:
+                self.cells[y][column + 1] = ""
+                self.attributes[y][column + 1] = _attr
+            column += cell_width
 
     def bkgd(self, character: str, attr: int) -> None:
         self.background = (character, attr)
 
     def erase(self) -> None:
+        self.erase_count += 1
         self.cells = [[" " for _ in range(self.width)] for _ in range(self.height)]
+        self.attributes = [[0 for _ in range(self.width)] for _ in range(self.height)]
 
     def nodelay(self, _enabled: bool) -> None:
-        pass
+        self.nodelay_enabled = _enabled
 
     def keypad(self, _enabled: bool) -> None:
-        pass
+        self.keypad_enabled = _enabled
 
     def getch(self) -> int:
         return self.keys.pop(0) if self.keys else -1
 
     def refresh(self) -> None:
+        self.refresh_count += 1
         if self.on_refresh is not None:
             self.on_refresh()
 
     def row(self, y: int) -> str:
         return "".join(self.cells[y])
+
+    def text(self) -> str:
+        return "\n".join(self.row(y) for y in range(self.height))
 
 
 def make_battery(**changes: object) -> porkyhud.BatteryInfo:
@@ -166,6 +198,134 @@ def settled_sensor() -> porkyhud.SensorInfo:
         privileged_locked=False,
         raw_hint="test sensors",
     )
+
+
+def make_health_frame_for_test(severity: str = "normal") -> porkyhud.HealthFrame:
+    """Build literal, immutable decision-presentation fixtures at capture t=20."""
+    core_ids = (core.SourceId.CPU_USAGE, core.SourceId.MEMORY_PRESSURE,
+                core.SourceId.THERMAL_OS, core.SourceId.DISK_CAPACITY)
+    views = {
+        source_id: core.SourceView(source_id, core.SourceViewStatus.LIVE, 1.0,
+                                   False, True, 1, None)
+        for source_id in core_ids
+    }
+    for source_id in (core.SourceId.PROCESS_TABLE, core.SourceId.PROCESS_GPU):
+        views[source_id] = core.SourceView(source_id, core.SourceViewStatus.CHECKING,
+                                           None, False, False, None, None)
+    evidence = tuple(
+        core.EvidenceRef(source_id, 1, core.EvidenceRole.CURRENT)
+        for source_id in core_ids
+    )
+    assessment = core.HealthAssessment(
+        core.HealthSeverity.NORMAL, core.EvidenceState.LIVE,
+        "Fresh core evidence shows no active CPU, memory, thermal, or storage pressure.",
+        evidence, (), None, 1.0, (), 15.0,
+    )
+    cpu_percent: float | None = 10.0
+    memory: core.MemoryPressure | None = core.MemoryPressure(core.MemoryPressureLevel.NORMAL)
+    thermal: core.OsThermalState | None = core.OsThermalState(0, 0)
+    disk: core.DiskCapacity | None = core.DiskCapacity(
+        "disk-1", "Data", "/System/Volumes/Data", 100 * 1024 ** 3, 50 * 1024 ** 3,
+    )
+    origin, triggered = porkyhud.FrameOrigin.LIVE, None
+    active_cases = {
+        "memory_watch": (core.HealthSeverity.WATCH, core.RuleId.MEMORY_WATCH,
+                         "macOS reports elevated memory pressure."),
+        "memory_critical": (core.HealthSeverity.CRITICAL, core.RuleId.MEMORY_CRITICAL,
+                            "macOS reports critical memory pressure."),
+        "thermal_watch": (core.HealthSeverity.WATCH, core.RuleId.THERMAL_WATCH,
+                          "macOS reports an active thermal or performance warning."),
+        "cpu_watch": (core.HealthSeverity.WATCH, core.RuleId.CPU_WATCH,
+                      "CPU capacity has averaged at least 90% for 15 seconds."),
+        "storage_watch": (core.HealthSeverity.WATCH, core.RuleId.STORAGE_WATCH,
+                          "Storage headroom is low: 8.0 GiB remains on Data."),
+    }
+    recovery_cases = {
+        "memory_recovery": (core.RuleId.MEMORY_WATCH,
+                            "macOS memory pressure is now normal; recovery confirmation is in progress."),
+        "memory_critical_recovery": (core.RuleId.MEMORY_CRITICAL,
+                                     "macOS memory pressure has eased from critical to elevated; recovery confirmation is in progress."),
+        "thermal_recovery": (core.RuleId.THERMAL_WATCH,
+                             "macOS warnings are now clear; thermal recovery confirmation is in progress."),
+        "cpu_recovery": (core.RuleId.CPU_WATCH,
+                         "CPU use has eased; recovery confirmation is in progress."),
+        "storage_recovery": (core.RuleId.STORAGE_WATCH,
+                             "Storage headroom has improved; recovery confirmation is in progress."),
+    }
+    rule_sources = {
+        core.RuleId.MEMORY_WATCH: core.SourceId.MEMORY_PRESSURE,
+        core.RuleId.MEMORY_CRITICAL: core.SourceId.MEMORY_PRESSURE,
+        core.RuleId.THERMAL_WATCH: core.SourceId.THERMAL_OS,
+        core.RuleId.CPU_WATCH: core.SourceId.CPU_USAGE,
+        core.RuleId.STORAGE_WATCH: core.SourceId.DISK_CAPACITY,
+    }
+    if severity in active_cases:
+        health_severity, rule, reason = active_cases[severity]
+        source_id = rule_sources[rule]
+        assessment = core.HealthAssessment(
+            health_severity, core.EvidenceState.LIVE, reason,
+            (core.EvidenceRef(source_id, 1, core.EvidenceRole.CURRENT),),
+            (rule,), None, 1.0, (), 15.0,
+        )
+        memory = ({"memory_watch": core.MemoryPressure(core.MemoryPressureLevel.WARN),
+                   "memory_critical": core.MemoryPressure(core.MemoryPressureLevel.CRITICAL)}
+                  .get(severity, memory))
+        thermal = core.OsThermalState(1, 0) if severity == "thermal_watch" else thermal
+        cpu_percent = 95.0 if severity == "cpu_watch" else cpu_percent
+        disk = replace(disk, free_bytes=8 * 1024 ** 3) if severity == "storage_watch" else disk
+    elif severity in recovery_cases:
+        rule, reason = recovery_cases[severity]
+        source_id = rule_sources[rule]
+        refs = tuple(core.EvidenceRef(source_id, 1, role)
+                     for role in (core.EvidenceRole.CURRENT, core.EvidenceRole.TRIGGER))
+        assessment = core.HealthAssessment(
+            core.HealthSeverity.CRITICAL if rule is core.RuleId.MEMORY_CRITICAL
+            else core.HealthSeverity.WATCH, core.EvidenceState.LIVE, reason, refs,
+            (rule,), None, 1.0, (), 15.0,
+        )
+        triggered = 2.0
+        memory = (core.MemoryPressure(core.MemoryPressureLevel.WARN)
+                  if severity == "memory_critical_recovery" else memory)
+        cpu_percent = 60.0 if severity == "cpu_recovery" else cpu_percent
+        disk = (replace(disk, free_bytes=30 * 1024 ** 3)
+                if severity == "storage_recovery" else disk)
+    elif severity in {"checking", "cpu_baseline", "snapshot", "incomplete", "delayed"}:
+        blockers, coverage = core_ids, 0.0
+        reason = "No recommendation is available from incomplete evidence."
+        if severity == "checking":
+            for source_id in core_ids:
+                views[source_id] = core.SourceView(source_id, core.SourceViewStatus.CHECKING,
+                                                   None, False, False, None, None)
+            cpu_percent = memory = thermal = disk = None
+        elif severity in {"cpu_baseline", "snapshot"}:
+            blockers, coverage = (core.SourceId.CPU_USAGE,), 7.0
+            reason = "CPU trend requires live monitoring."
+            origin = (porkyhud.FrameOrigin.SNAPSHOT if severity == "snapshot"
+                      else porkyhud.FrameOrigin.LIVE)
+        elif severity == "incomplete":
+            blockers = (core.SourceId.MEMORY_PRESSURE,)
+            views[core.SourceId.MEMORY_PRESSURE] = core.SourceView(
+                core.SourceId.MEMORY_PRESSURE, core.SourceViewStatus.MISSING,
+                None, False, False, None, core.FailureCode.MISSING_EXECUTABLE)
+            memory = None
+        else:
+            blockers = (core.SourceId.CPU_USAGE,)
+            views[core.SourceId.CPU_USAGE] = core.SourceView(
+                core.SourceId.CPU_USAGE, core.SourceViewStatus.STALE,
+                18.0, False, False, 1, None)
+            cpu_percent = None
+        assessment = core.HealthAssessment(
+            core.HealthSeverity.UNKNOWN,
+            core.EvidenceState.DELAYED if severity == "delayed"
+            else core.EvidenceState.INCOMPLETE,
+            reason, (), (), None, None, blockers, coverage,
+        )
+    elif severity != "normal":
+        raise ValueError("unknown test severity")
+
+    return porkyhud.HealthFrame(assessment, views, cpu_percent, memory, thermal, disk,
+                                core.CpuContributor(core.ContributorState.NO_CLEAR_LEADER),
+                                origin, 20.0, triggered)
 
 
 class FormatterAndParserTests(unittest.TestCase):
@@ -2340,12 +2500,15 @@ class LiveOrchestrationTests(unittest.TestCase):
         self.assertEqual(runner.call_args_list[0].args[0], runner.call_args_list[1].args[0])
 
     def test_draw_functions_do_not_call_collectors_or_policy_reducer(self) -> None:
-        screen = FakeScreen(24, 80)
+        shell = FakeScreen(24, 80)
+        resize = FakeScreen(10, 60)
         with mock.patch.object(porkyhud, "run_command", side_effect=AssertionError), \
                 mock.patch.object(porkyhud, "run_structured_command", side_effect=AssertionError), \
                 mock.patch.object(porkyhud, "reduce_health", side_effect=AssertionError):
-            porkyhud.draw_initial_shell(screen, porkyhud.HudConfig())
-            porkyhud.draw_small_screen(screen, 24, 80)
+            porkyhud.draw_initial_shell(shell, porkyhud.HudConfig())
+            porkyhud.draw_small_screen(resize, 10, 60)
+        self.assertEqual((shell.erase_count, shell.refresh_count), (1, 0))
+        self.assertEqual((resize.erase_count, resize.refresh_count), (0, 0))
 
     def test_construction_rolls_back_created_pollers(self) -> None:
         created = []
@@ -3720,6 +3883,579 @@ class SourcePollerTests(unittest.TestCase):
 
 
 class LayoutAndRenderingTests(unittest.TestCase):
+    def test_decision_projection_primitives_are_exact_and_validate_inputs(self) -> None:
+        self.assertEqual(
+            porkyhud.semantic_text(
+                "CPU averaged ≥90% for 15s. · 118×34 – evidence ≤2s", False,
+            ),
+            "CPU averaged >=90% for 15s. | 118x34 - evidence <=2s",
+        )
+        self.assertEqual(
+            porkyhud.semantic_text("Données 📁", False), "Donnees ?",
+        )
+        names = {"balanced": "1 OVERVIEW", "compact": "1 OVERVIEW",
+                 "compute": "2 COMPUTE", "thermals": "3 THERMALS", "io": "4 I/O",
+                 "processes": "5 PROCESSES", "cinema": "6 CINEMA"}
+        self.assertEqual({mode: porkyhud.display_mode_name(mode) for mode in names}, names)
+        with self.assertRaises(ValueError):
+            porkyhud.display_mode_name("unknown")
+
+        ages = (
+            (0.0, "<1s"), (0.999, "<1s"), (18.9, "18s"),
+            (125.9, "2m 05s"), (3_720.9, "1h 02m"),
+            (183_600.9, "2d 03h"),
+        )
+        for age, expected in ages:
+            with self.subTest(age=age):
+                self.assertEqual(porkyhud.format_evidence_age(age), expected)
+        with self.assertRaises(ValueError):
+            porkyhud.format_evidence_age(float("inf"))
+
+    def test_compact_reasons_cover_policy_recovery_and_blocked_states(self) -> None:
+        reasons = {
+            "normal": "No active CPU, memory, thermal, or storage pressure.",
+            "memory_watch": "macOS memory pressure is elevated.",
+            "memory_critical": "macOS memory pressure is critical.",
+            "thermal_watch": "macOS thermal/performance warning is active.",
+            "cpu_watch": "CPU averaged ≥90% for 15s.",
+            "storage_watch": "Storage low · 8.0GB free on Data.",
+            "incomplete": "Health incomplete · MEM MISSING.",
+            "delayed": "Health incomplete · CPU STALE · 18s.",
+            "memory_recovery": (
+                "Memory pressure normal · confirming recovery · triggered 18s ago."
+            ),
+            "memory_critical_recovery": (
+                "Memory eased to elevated · confirming recovery · triggered 18s ago."
+            ),
+            "thermal_recovery": (
+                "macOS warnings clear · confirming thermal recovery · triggered 18s ago."
+            ),
+            "cpu_recovery": (
+                "CPU use eased · confirming recovery · triggered 18s ago."
+            ),
+            "storage_recovery": (
+                "Storage headroom improved · confirming recovery · triggered 18s ago."
+            ),
+        }
+        for case, expected in reasons.items():
+            with self.subTest(case=case):
+                self.assertEqual(
+                    porkyhud.compact_reason(
+                        make_health_frame_for_test(case), 80, 20.0,
+                    ),
+                    expected,
+                )
+
+        frame = make_health_frame_for_test("cpu_watch")
+        assessment = replace(frame.assessment, contributor_name="Xcode")
+        frame = replace(frame, assessment=assessment)
+        self.assertEqual(
+            porkyhud.compact_reason(frame, 120, 20.0),
+            "CPU capacity has averaged at least 90% for 15 seconds. · "
+            "Xcode is the leading recent CPU process.",
+        )
+
+        storage = make_health_frame_for_test("storage_watch")
+        disk = replace(storage.disk_capacity, volume_name="数据" * 80)
+        assessment = replace(
+            storage.assessment,
+            reason="Storage headroom is low: 8.0 GiB remains on %s." % disk.volume_name,
+        )
+        storage = replace(storage, assessment=assessment, disk_capacity=disk)
+        complete = porkyhud.compact_reason(storage, 76, 20.0)
+        self.assertEqual(complete, "Storage headroom is low.")
+        self.assertLessEqual(porkyhud.display_cell_width(complete), 75)
+
+    def test_recovery_reasons_choose_only_complete_copies_at_every_width(self) -> None:
+        recovery_copy = {
+            "memory_recovery": "Memory pressure normal · confirming recovery",
+            "memory_critical_recovery": "Memory eased to elevated · confirming recovery",
+            "thermal_recovery": "macOS warnings clear · confirming thermal recovery",
+            "cpu_recovery": "CPU use eased · confirming recovery",
+            "storage_recovery": "Storage headroom improved · confirming recovery",
+        }
+        suffix = " · triggered 18s ago."
+        for case, compact in recovery_copy.items():
+            frame = make_health_frame_for_test(case)
+            exact = frame.assessment.reason + suffix
+            compact = compact + suffix
+            for width in (76, 80, 90, 117, 118, 132):
+                expected = (
+                    exact if width >= 90
+                    and porkyhud.display_cell_width(exact) <= width - 1
+                    else compact
+                )
+                with self.subTest(case=case, width=width):
+                    actual = porkyhud.compact_reason(frame, width, 20.0)
+                    self.assertEqual(actual, expected)
+                    self.assertTrue(actual.endswith(suffix))
+                    self.assertLessEqual(
+                        porkyhud.display_cell_width(actual), width - 1,
+                    )
+
+    def test_reason_fit_is_safe_before_unicode_or_ascii_projection(self) -> None:
+        volume_name = "≥" * 23
+        storage = make_health_frame_for_test("storage_watch")
+        disk = replace(storage.disk_capacity, volume_name=volume_name)
+        assessment = replace(
+            storage.assessment,
+            reason="Storage headroom is low: 8.0 GiB remains on %s." % volume_name,
+        )
+        storage = replace(storage, assessment=assessment, disk_capacity=disk)
+
+        cpu = make_health_frame_for_test("cpu_watch")
+        base_reason = cpu.assessment.reason
+        identity_overhead = porkyhud.display_cell_width(
+            base_reason + " ·  is the leading recent CPU process.",
+        )
+        cases = [(storage, 90, "Storage headroom is low.")]
+        for width in (100, 117, 118, 132):
+            contributor = "≥" * (width - 1 - identity_overhead)
+            candidate = replace(
+                cpu,
+                assessment=replace(cpu.assessment, contributor_name=contributor),
+            )
+            cases.append((candidate, width, base_reason))
+
+        for frame, width, expected in cases:
+            with self.subTest(width=width):
+                reason = porkyhud.compact_reason(frame, width, 20.0)
+                self.assertEqual(reason, expected)
+                for unicode_enabled in (True, False):
+                    projected = porkyhud.semantic_text(reason, unicode_enabled)
+                    self.assertLessEqual(
+                        porkyhud.display_cell_width(projected), width - 1,
+                    )
+                    screen = FakeScreen(22, width)
+                    with mock.patch.object(
+                        porkyhud, "unicode_ok", return_value=unicode_enabled,
+                    ):
+                        porkyhud.draw_decision_header(
+                            screen, frame, porkyhud.HudConfig(), 20.0,
+                        )
+
+    def test_header_truth_table_distinguishes_bootstrap_baseline_and_snapshot(self) -> None:
+        frame = make_health_frame_for_test()
+        self.assertEqual(
+            porkyhud.decision_header_lines(frame, "balanced", 80, 21.0),
+            (
+                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · evidence 2s",
+                "No active CPU, memory, thermal, or storage pressure.",
+            ),
+        )
+
+        checking = make_health_frame_for_test("checking")
+        core_ids = (
+            core.SourceId.CPU_USAGE,
+            core.SourceId.MEMORY_PRESSURE,
+            core.SourceId.THERMAL_OS,
+            core.SourceId.DISK_CAPACITY,
+        )
+        for ready_count in range(4):
+            views = dict(checking.source_views)
+            for source_id in core_ids[:ready_count]:
+                views[source_id] = core.SourceView(
+                    source_id, core.SourceViewStatus.LIVE,
+                    1.0, False, True, 1, None,
+                )
+            assessment = replace(checking.assessment, blockers=core_ids[ready_count:])
+            candidate = replace(checking, assessment=assessment, source_views=views)
+            with self.subTest(ready_count=ready_count):
+                self.assertEqual(
+                    porkyhud.decision_header_lines(
+                        candidate, "balanced", 80, 20.0,
+                    ),
+                    (
+                        "PorkyHUD · 1 OVERVIEW · CHECKING %d/4 core sources"
+                        % ready_count,
+                        "Waiting for core evidence.",
+                    ),
+                )
+
+        baseline = make_health_frame_for_test("cpu_baseline")
+        for coverage, shown in ((0.0, 0), (7.999, 7), (14.999, 14)):
+            assessment = replace(baseline.assessment, cpu_coverage_s=coverage)
+            with self.subTest(coverage=coverage):
+                self.assertEqual(
+                    porkyhud.decision_header_lines(
+                        replace(baseline, assessment=assessment),
+                        "balanced", 80, 20.0,
+                    ),
+                    (
+                        "PorkyHUD · 1 OVERVIEW · CHECKING CPU baseline %d/15s"
+                        % shown,
+                        "Building the 15-second CPU baseline.",
+                    ),
+                )
+
+        snapshot = make_health_frame_for_test("snapshot")
+        snapshot_lines = porkyhud.decision_header_lines(
+            snapshot, "balanced", 80, 20.0,
+        )
+        self.assertEqual(
+            snapshot_lines,
+            (
+                "PorkyHUD · 1 OVERVIEW · UNKNOWN · INCOMPLETE",
+                "CPU trend requires live monitoring.",
+            ),
+        )
+        self.assertNotIn("CHECKING", " ".join(snapshot_lines))
+
+        failed = make_health_frame_for_test("delayed")
+        failed_lines = porkyhud.decision_header_lines(
+            failed, "balanced", 80, 20.0,
+        )
+        self.assertIn("UNKNOWN · DELAYED", failed_lines[0])
+        self.assertNotIn("CHECKING", " ".join(failed_lines))
+        for invalid_now in (19.999, float("inf"), float("nan"), True):
+            with self.subTest(invalid_now=invalid_now), self.assertRaises(ValueError):
+                porkyhud.decision_header_lines(frame, "balanced", 80, invalid_now)
+
+    def test_source_view_text_covers_every_status_and_retry_detail(self) -> None:
+        cases = (
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.CHECKING, None, False, "CHECKING"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.LIVE, 1.0, False, "LIVE"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.STALE, 18.0, False, "STALE · 18s"),
+            (core.SourceId.SENSOR_POWERMETRICS, core.SourceViewStatus.LOCKED, None, False, "LOCKED · u: temporary unlock"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.PERMISSION_DENIED, None, False, "PERMISSION DENIED"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.MISSING, None, False, "MISSING"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.UNSUPPORTED, None, False, "UNSUPPORTED"),
+            (core.SourceId.BATTERY, core.SourceViewStatus.NOT_APPLICABLE, None, False, "NOT APPLICABLE"),
+            (core.SourceId.SENSOR_SMC, core.SourceViewStatus.NOT_EXPOSED, None, False, "NOT EXPOSED"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.ERROR, 18.0, False, "ERROR · last good 18s ago"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.ERROR, None, False, "ERROR · no valid sample"),
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.ERROR, None, True, "ERROR · no valid sample · checking"),
+        )
+        for source_id, status, age, refreshing, expected in cases:
+            view = core.SourceView(
+                source_id, status, age, refreshing, status is core.SourceViewStatus.LIVE,
+                1 if age is not None else None, None,
+            )
+            with self.subTest(status=status, age=age, refreshing=refreshing):
+                self.assertEqual(porkyhud.source_view_text(view, 0.2), expected)
+
+        invalid_locked = core.SourceView(
+            core.SourceId.CPU_USAGE, core.SourceViewStatus.LOCKED,
+            None, False, False, None, core.FailureCode.PERMISSION_DENIED,
+        )
+        with self.assertRaises(ValueError):
+            porkyhud.source_view_text(invalid_locked)
+        with self.assertRaises(ValueError):
+            porkyhud.source_view_text(invalid_locked, -0.1)
+
+    def test_header_and_ribbon_own_rows_zero_through_two_at_every_viewport(self) -> None:
+        frame = make_health_frame_for_test()
+        for height, width in ((22, 76), (24, 80), (33, 117), (34, 118), (42, 132)):
+            for unicode_enabled in (False, True):
+                screen = FakeScreen(height, width)
+                config = porkyhud.HudConfig()
+                with self.subTest(height=height, width=width, unicode=unicode_enabled), \
+                        mock.patch.object(porkyhud, "unicode_ok", return_value=unicode_enabled), \
+                        mock.patch.object(porkyhud, "color_pair", return_value=0):
+                    next_y = porkyhud.draw_decision_header(
+                        screen, frame, config, 20.0,
+                    )
+                    next_y = porkyhud.draw_evidence_ribbon(
+                        screen, next_y, frame, 20.0,
+                    )
+                self.assertEqual(next_y, 3)
+                rendered = screen.text()
+                for token in ("CPU", "MEM", "THERM", "DISK"):
+                    self.assertIn(token, rendered)
+                self.assertTrue(screen.row(0).startswith("PorkyHUD"))
+                for row in range(3):
+                    self.assertLessEqual(
+                        porkyhud.display_cell_width(screen.row(row)), width,
+                    )
+
+        checking = make_health_frame_for_test("checking")
+        views = dict(checking.source_views)
+        for source_id in (
+            core.SourceId.CPU_USAGE, core.SourceId.MEMORY_PRESSURE,
+            core.SourceId.THERMAL_OS, core.SourceId.DISK_CAPACITY,
+        ):
+            views[source_id] = core.SourceView(
+                source_id, core.SourceViewStatus.ERROR, 18.0,
+                False, False, 1, core.FailureCode.NONZERO_EXIT,
+            )
+        failed = replace(
+            checking,
+            assessment=replace(
+                checking.assessment, evidence_state=core.EvidenceState.DELAYED,
+            ),
+            source_views=views,
+        )
+        self.assertEqual(
+            porkyhud.evidence_ribbon_lines(failed, 76, 20.0),
+            ("CPU/MEM/THERM/DISK ERROR",),
+        )
+
+        mixed_views = dict(checking.source_views)
+        for source_id, status in (
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.PERMISSION_DENIED),
+            (core.SourceId.MEMORY_PRESSURE, core.SourceViewStatus.MISSING),
+            (core.SourceId.THERMAL_OS, core.SourceViewStatus.UNSUPPORTED),
+            (core.SourceId.DISK_CAPACITY, core.SourceViewStatus.NOT_APPLICABLE),
+        ):
+            mixed_views[source_id] = core.SourceView(
+                source_id, status, None, False, False, None, None,
+            )
+        mixed = replace(checking, source_views=mixed_views)
+        self.assertEqual(
+            porkyhud.evidence_ribbon_lines(mixed, 76, 20.0),
+            ("CPU PERMISSION DENIED/MEM MISSING/THERM UNSUPPORTED/DISK NOT APPLICABLE",),
+        )
+
+        repeated_views = dict(checking.source_views)
+        for source_id, status in (
+            (core.SourceId.CPU_USAGE, core.SourceViewStatus.CHECKING),
+            (core.SourceId.MEMORY_PRESSURE, core.SourceViewStatus.PERMISSION_DENIED),
+            (core.SourceId.THERMAL_OS, core.SourceViewStatus.NOT_APPLICABLE),
+            (core.SourceId.DISK_CAPACITY, core.SourceViewStatus.PERMISSION_DENIED),
+        ):
+            repeated_views[source_id] = core.SourceView(
+                source_id, status, None, False, False, None, None,
+            )
+        repeated = replace(checking, source_views=repeated_views)
+        self.assertEqual(
+            porkyhud.evidence_ribbon_lines(repeated, 76, 20.0),
+            ("CPU CHECKING/MEM PERMISSION DENIED/THERM NOT APPLICABLE/DISK=MEM",),
+        )
+        screen = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "color_pair", side_effect=lambda value: value << 20):
+            porkyhud.draw_evidence_ribbon(screen, 2, repeated, 20.0)
+        self.assertEqual(screen.writes[-1][2], "DISK=MEM")
+        self.assertEqual(
+            screen.writes[-1][4],
+            (porkyhud.PRIMARY << 20) | porkyhud.curses.A_BOLD,
+        )
+
+    def test_width_76_ribbon_covers_every_core_exception_cartesian_product(self) -> None:
+        frame = make_health_frame_for_test("checking")
+        core_ids = (
+            core.SourceId.CPU_USAGE,
+            core.SourceId.MEMORY_PRESSURE,
+            core.SourceId.THERMAL_OS,
+            core.SourceId.DISK_CAPACITY,
+        )
+        statuses = (
+            core.SourceViewStatus.CHECKING,
+            core.SourceViewStatus.STALE,
+            core.SourceViewStatus.PERMISSION_DENIED,
+            core.SourceViewStatus.MISSING,
+            core.SourceViewStatus.UNSUPPORTED,
+            core.SourceViewStatus.NOT_APPLICABLE,
+            core.SourceViewStatus.NOT_EXPOSED,
+            core.SourceViewStatus.ERROR,
+        )
+        for combination in itertools.product(statuses, repeat=4):
+            views = dict(frame.source_views)
+            for source_id, status in zip(core_ids, combination):
+                retained = status in (
+                    core.SourceViewStatus.STALE, core.SourceViewStatus.ERROR,
+                )
+                views[source_id] = core.SourceView(
+                    source_id, status, 18.0 if retained else None,
+                    False, False, 1 if retained else None, None,
+                )
+            line = porkyhud.evidence_ribbon_lines(
+                replace(frame, source_views=views), 76, 20.0,
+            )[0]
+            positions = tuple(line.find(label) for label in ("CPU", "MEM", "THERM", "DISK"))
+            with self.subTest(combination=combination):
+                self.assertEqual(positions, tuple(sorted(positions)))
+                self.assertNotIn(-1, positions)
+                for status in set(combination):
+                    self.assertIn(status.value, line)
+                for unicode_enabled in (True, False):
+                    projected = porkyhud.semantic_text(line, unicode_enabled)
+                    self.assertLessEqual(porkyhud.display_cell_width(projected), 75)
+
+    def test_initial_shell_ascii_no_color_and_display_cells_preserve_meaning(self) -> None:
+        screen = FakeScreen(22, 76)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=True), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0):
+            self.assertEqual(
+                porkyhud.draw_initial_shell(screen, porkyhud.HudConfig()), 3,
+            )
+        self.assertEqual(
+            tuple(screen.row(row).rstrip() for row in range(3)),
+            (
+                "PorkyHUD · 1 OVERVIEW · CHECKING 0/4 core sources",
+                "Waiting for core evidence.",
+                "CPU CHECKING · MEM CHECKING · THERM CHECKING · DISK CHECKING",
+            ),
+        )
+
+        ascii_screen = FakeScreen(22, 76)
+        storage = make_health_frame_for_test("storage_watch")
+        disk = replace(storage.disk_capacity, volume_name="Données 📁")
+        assessment = replace(
+            storage.assessment,
+            reason="Storage headroom is low: 8.0 GiB remains on Données 📁.",
+        )
+        storage = replace(storage, assessment=assessment, disk_capacity=disk)
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}), \
+                mock.patch.object(porkyhud, "unicode_ok", return_value=False):
+            y = porkyhud.draw_decision_header(
+                ascii_screen, storage, porkyhud.HudConfig(), 20.0,
+            )
+            porkyhud.draw_evidence_ribbon(ascii_screen, y, storage, 20.0)
+        rendered = ascii_screen.text()
+        self.assertIn("WATCH", rendered)
+        self.assertIn("LIVE", rendered)
+        self.assertTrue(all(ord(character) < 128 for character in rendered))
+
+        cells = FakeScreen(3, 10)
+        porkyhud.safe_add(cells, 0, 0, "A界B")
+        porkyhud.safe_add(cells, 1, 0, "e\u0301x")
+        porkyhud.safe_add(cells, 2, 0, "123456789界")
+        self.assertEqual(cells.cells[0][1:4], ["界", "", "B"])
+        self.assertEqual(cells.cells[1][0], "é")
+        self.assertEqual(cells.row(2), "123456789 ")
+
+    def test_semantic_roles_are_stable_and_header_attributes_match_severity(self) -> None:
+        self.assertEqual(
+            (
+                porkyhud.PRIMARY, porkyhud.INFO, porkyhud.NOMINAL,
+                porkyhud.WATCH, porkyhud.CRITICAL, porkyhud.STRUCTURE,
+                porkyhud.SECONDARY, porkyhud.BRAND,
+            ),
+            tuple(range(1, 9)),
+        )
+        expected_theme_roles = {
+            "Neon Grid": (231, 51, 46, 220, 196, 39, 45, 201),
+            "Catppuccin": (189, 110, 119, 229, 203, 111, 153, 183),
+            "Solar Circuit": (255, 87, 82, 226, 202, 33, 87, 165),
+            "Graphite": (252, 110, 152, 222, 203, 245, 250, 183),
+        }
+        self.assertEqual(
+            {
+                theme["name"]: tuple(
+                    theme["colors"][role] for role in range(1, 9)
+                )
+                for theme in porkyhud.THEMES
+            },
+            expected_theme_roles,
+        )
+        with mock.patch.object(porkyhud, "color_pair", side_effect=lambda pair: pair << 20):
+            for level, pair in (("normal", porkyhud.NOMINAL), ("watch", porkyhud.WATCH),
+                                ("critical", porkyhud.CRITICAL), ("checking", porkyhud.PRIMARY)):
+                self.assertEqual(porkyhud.read_attr(level),
+                                 (pair << 20) | porkyhud.curses.A_BOLD)
+            with self.assertRaises(ValueError):
+                porkyhud.read_attr("decorative-warning")
+
+        expected_roles = {
+            "normal": porkyhud.NOMINAL,
+            "memory_watch": porkyhud.WATCH,
+            "memory_critical": porkyhud.CRITICAL,
+            "checking": porkyhud.PRIMARY,
+        }
+        for case, pair in expected_roles.items():
+            screen = FakeScreen(22, 80)
+            with self.subTest(case=case), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", side_effect=lambda value: value << 20):
+                porkyhud.draw_decision_header(
+                    screen, make_health_frame_for_test(case),
+                    porkyhud.HudConfig(), 20.0,
+                )
+            self.assertEqual(
+                screen.writes[0][4], (pair << 20) | porkyhud.curses.A_BOLD,
+            )
+
+    def test_ribbon_segments_use_semantic_attributes_without_changing_text(self) -> None:
+        screen = FakeScreen(22, 80)
+        frame = make_health_frame_for_test("memory_critical")
+        views = dict(frame.source_views)
+        views[core.SourceId.THERMAL_OS] = core.SourceView(
+            core.SourceId.THERMAL_OS, core.SourceViewStatus.STALE,
+            18.0, False, False, 1, None,
+        )
+        frame = replace(frame, source_views=views, thermal=None)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=True), \
+                mock.patch.object(porkyhud, "color_pair", side_effect=lambda value: value << 20):
+            porkyhud.draw_evidence_ribbon(screen, 2, frame, 20.0)
+        self.assertEqual(screen.row(2).rstrip(),
+                         "CPU 10% · MEM CRITICAL · THERM STALE · 18s · DISK 50% FREE")
+        attrs = [write[4] for write in screen.writes]
+        self.assertEqual(
+            attrs,
+            [
+                (porkyhud.NOMINAL << 20) | porkyhud.curses.A_BOLD,
+                (porkyhud.CRITICAL << 20) | porkyhud.curses.A_BOLD,
+                (porkyhud.PRIMARY << 20) | porkyhud.curses.A_BOLD,
+                (porkyhud.NOMINAL << 20) | porkyhud.curses.A_BOLD,
+            ],
+        )
+
+    def test_decision_drawers_are_pure_and_leave_frame_lifecycle_to_hud(self) -> None:
+        frame = make_health_frame_for_test()
+        screen = FakeScreen(22, 80)
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0), \
+                mock.patch.object(porkyhud, "run_command", side_effect=AssertionError), \
+                mock.patch.object(porkyhud, "run_structured_command", side_effect=AssertionError), \
+                mock.patch.object(porkyhud, "collect_static_info", side_effect=AssertionError), \
+                mock.patch.object(porkyhud, "reduce_health", side_effect=AssertionError), \
+                mock.patch.object(porkyhud.time, "monotonic", side_effect=AssertionError), \
+                mock.patch.object(porkyhud.time, "time", side_effect=AssertionError):
+            self.assertEqual(
+                porkyhud.decision_header_lines(frame, "balanced", 80, 20.0)[0],
+                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · evidence 1s",
+            )
+            porkyhud.evidence_ribbon_lines(frame, 80, 20.0)
+            next_y = porkyhud.draw_decision_header(
+                screen, frame, porkyhud.HudConfig(), 20.0,
+            )
+            porkyhud.draw_evidence_ribbon(screen, next_y, frame, 20.0)
+        self.assertEqual(screen.erase_count, 0)
+        self.assertEqual(screen.refresh_count, 0)
+
+    def test_hud_places_real_decision_header_and_ribbon_before_legacy_body(self) -> None:
+        frame = make_health_frame_for_test()
+        coordinator = mock.Mock()
+        coordinator.source_generation.return_value = 0
+        coordinator.tick.return_value = frame
+        coordinator.per_core.return_value = (10.0,)
+        coordinator.process_rows.return_value = ()
+        poller = mock.Mock()
+        poller.tick.return_value = None
+        poller.snapshot.return_value = (None, 0.0, "")
+        screen = FakeScreen(24, 80, keys=[-1, ord("q")])
+        with mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator), \
+                mock.patch.object(porkyhud, "AsyncPoller", return_value=poller), \
+                mock.patch.object(porkyhud, "_start_static_discovery", return_value=poller), \
+                mock.patch.object(porkyhud, "init_colors"), \
+                mock.patch.object(porkyhud, "apply_dark_screen"), \
+                mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                mock.patch.object(porkyhud, "color_pair", return_value=0), \
+                mock.patch.object(porkyhud.time, "monotonic", return_value=21.0), \
+                mock.patch.object(porkyhud.time, "sleep"):
+            porkyhud.hud(screen)
+        coordinator.close.assert_called_once_with()
+        self.assertTrue(screen.row(0).startswith(
+            "PorkyHUD | 1 OVERVIEW | NORMAL | LIVE | evidence 2s"
+        ))
+        self.assertIn("No active CPU", screen.row(1))
+        self.assertIn("CPU 10%", screen.row(2))
+        self.assertIn("MEM NORMAL", screen.row(2))
+        self.assertIn("THERM CLEAR", screen.row(2))
+        self.assertIn("DISK 50% FREE", screen.row(2))
+        self.assertNotIn("Fresh core evidence", screen.row(22))
+        self.assertIn("+", screen.row(22))
+        self.assertIn("h help", screen.row(23))
+
+    def test_pure_frame_projection_10k_mean_is_under_five_milliseconds(self) -> None:
+        frame = make_health_frame_for_test()
+        started = time.perf_counter()
+        for _ in range(10_000):
+            porkyhud.decision_header_lines(frame, "balanced", 80, 20.0)
+            porkyhud.evidence_ribbon_lines(frame, 80, 20.0)
+        elapsed = time.perf_counter() - started
+        self.assertLessEqual(elapsed / 10_000, 0.005)
+
     def test_narrow_cpu_lane_fallback_is_total_and_shows_100_percent(self) -> None:
         with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
             tiny = porkyhud.cpu_lane_text("P0", 0, 100.0, 8, 0)
@@ -3744,11 +4480,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
 
     def test_short_wide_terminal_uses_the_non_overlapping_compact_header(self) -> None:
         screen = FakeScreen(22, 118)
-        with mock.patch.object(porkyhud, "color_pair", return_value=0), mock.patch.object(
-            porkyhud.time,
-            "strftime",
-            return_value="2026-07-11 10:15:00",
-        ):
+        with mock.patch.object(porkyhud, "color_pair", return_value=0):
             height = porkyhud.draw_header(
                 screen,
                 118,
@@ -3761,6 +4493,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertIn("P O R K Y H U D", rendered)
         self.assertIn("Copyright (c) DMS", rendered)
         self.assertNotIn(".-oo-.", rendered)
+        self.assertEqual((screen.erase_count, screen.refresh_count), (0, 0))
 
     def test_layout_height_and_render_interval_invariants(self) -> None:
         specs = [(7, 0), (7, 0), (8, 1), (7, 3)]
