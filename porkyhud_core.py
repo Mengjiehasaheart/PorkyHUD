@@ -1267,7 +1267,7 @@ def reduce_cpu_latch(
     recovery = cpu_window_summary(window, 10.0)
     if recovery is not None and recovery.mean_percent <= 70.0:
         return _clear_latch(latch.rule_id, attempt.revision)
-    if sample.value.percent >= 90.0:
+    if entry is None and sample.value.percent >= 90.0:
         # A reset or failed read may leave only a short high-CPU sample.  It
         # cannot establish a new sustained entry, but it also is not evidence
         # that use has eased.  Keep the existing watch without recovery copy.
@@ -1949,6 +1949,8 @@ def _validate_cpu_state_consistency(
     sample = _rule_success(source, attempt, CpuUsage)
     if not state.cpu_window.samples or state.cpu_window.samples[-1] != sample:
         raise ValueError("CPU window must retain the matching latest sample")
+    if not is_decision_ready(source, now_mono_s):
+        return
     _validate_current_latch_value(state.cpu_latch, sample.value, state.cpu_window)
 
 
@@ -1967,8 +1969,8 @@ def _validate_latch_state_consistency(
     if latch.last_processed_revision != attempt.revision:
         return
     if attempt.outcome is not AttemptOutcome.SUCCESS:
-        if latch.phase is LatchPhase.RECOVERING:
-            raise ValueError("failed source cannot leave a recovery latch current")
+        return
+    if not is_decision_ready(source, now_mono_s):
         return
     _validate_current_latch_value(latch, _rule_success(source, attempt, value_type).value,
                                   None)
@@ -1979,6 +1981,18 @@ def _validate_current_latch_value(
 ) -> None:
     """Check only conclusions that the current successful value excludes."""
     if latch.phase is LatchPhase.CLEAR:
+        if (latch.rule_id is RuleId.MEMORY_CRITICAL
+                and value.level is not MemoryPressureLevel.NORMAL):
+            raise ValueError("clear critical-memory latch contradicts current evidence")
+        if latch.rule_id is RuleId.MEMORY_WATCH and value.level is not MemoryPressureLevel.NORMAL:
+            raise ValueError("clear memory-watch latch contradicts current evidence")
+        if latch.rule_id is RuleId.THERMAL_WATCH and (
+                value.thermal_warning_level > 0 or value.performance_warning_level > 0):
+            raise ValueError("clear thermal latch contradicts current evidence")
+        if latch.rule_id is RuleId.STORAGE_WATCH and _storage_low(value):
+            raise ValueError("clear storage latch contradicts current evidence")
+        if latch.rule_id is RuleId.CPU_WATCH and _cpu_entry_active(window):
+            raise ValueError("clear CPU latch contradicts current window")
         return
     if latch.rule_id is RuleId.MEMORY_CRITICAL:
         if latch.phase is LatchPhase.ACTIVE and value.level is not MemoryPressureLevel.CRITICAL:
@@ -2005,8 +2019,16 @@ def _validate_current_latch_value(
         summary = cpu_window_summary(window, 15.0)
         if latch.phase is LatchPhase.ACTIVE and summary is not None and summary.mean_percent < 90.0:
             raise ValueError("CPU watch latch contradicts current window")
-        if latch.phase is LatchPhase.RECOVERING and value.percent >= 90.0:
+        if (latch.phase is LatchPhase.RECOVERING
+                and (summary is None or summary.mean_percent >= 90.0)):
             raise ValueError("CPU recovery contradicts current high usage")
+
+
+def _cpu_entry_active(window: Optional[CpuWindow]) -> bool:
+    if window is None:
+        return False
+    summary = cpu_window_summary(window, 15.0)
+    return summary is not None and summary.mean_percent >= 90.0
 
 
 def _validate_process_state_consistency(
