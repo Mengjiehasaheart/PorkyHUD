@@ -43,4 +43,4 @@ Issues = "https://github.com/Mengjiehasaheart/PorkyHUD/issues"
 porkyhud = "porkyhud:main"
 
 [tool.setuptools]
-py-modules = ["porkyhud"]
+py-modules = ["porkyhud", "porkyhud_core"]

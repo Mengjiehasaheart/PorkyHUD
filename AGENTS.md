@@ -12,7 +12,7 @@ This file is the canonical maintainer and agent navigation layer for PorkyHUD. U
 4. Check all callers and output surfaces when a shared model, collector, command, or schema changes.
 5. Run the focused tests during development, then run the complete validation set before claiming completion.
 
-PorkyHUD currently has one production module. The areas below are conceptual boundaries, not separate packages. Preserve their dependency direction until there is a justified, tested module extraction.
+PorkyHUD currently has an effects module (`porkyhud.py`) and a pure policy module (`porkyhud_core.py`). The remaining areas below are conceptual boundaries, not separate packages. Preserve their dependency direction until there is a justified, tested module extraction.
 
 ## Canonical sources of truth
 
@@ -39,9 +39,11 @@ Keep this table exhaustive. Add, move, or remove a row in the same commit as the
 | `README.md` | User-facing installation, controls, sensor access, privacy, and metric semantics | User-visible behavior, requirements, CLI workflows, or support changes |
 | `docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md` | Phase 1 design and acceptance proposal for the decision-cockpit foundation; not current behavior until implementation lands | Scope, architecture, UX, compatibility, performance, or acceptance changes to this milestone |
 | `docs/superpowers/plans/2026-08-11-porkyhud-trusted-decision-cockpit.md` | Test-first Phase 1 implementation sequence and fixed cross-task interfaces; not current behavior until implementation lands | Task boundaries, interface names, validation sequence, or approved Phase 1 execution changes |
-| `porkyhud.py` | Entire application: models, macOS adapters, collectors, policy, rendering, snapshots, and CLI | Focused tests plus every affected user or agent contract |
+| `porkyhud.py` | macOS effects: adapters, collectors, runtime dashboard, rendering, snapshots, and CLI | Focused tests plus every affected user or agent contract |
+| `porkyhud_core.py` | Pure immutable source-state models, reducers, freshness, eligibility, and source views | Source contract tests and every consumer of telemetry evidence |
 | `PorkyHUD.command` | Double-click and shell launcher, terminal setup/restoration, source-versus-installed dispatch | Launcher, palette, executable discovery, or launch guidance changes |
 | `pyproject.toml` | Setuptools build and package metadata | Version, Python support, packaging, entry point, dependency, or project URL changes |
+| `tests/test_core.py` | Behavioral contract tests for pure immutable telemetry source state | Every `porkyhud_core.py` behavior change |
 | `tests/test_porkyhud.py` | Unit and contract tests for current application behavior | Every production behavior change |
 | `tests/__init__.py` | Test package and `unittest` discovery marker | Test layout changes |
 | `.github/workflows/ci.yml` | macOS build and validation matrix | Supported Python versions or validation contract changes |
@@ -58,14 +60,21 @@ The intended direction is:
 ```text
 entry points and presentation
         ↓
-orchestration and policy
+effects orchestration
         ↓
-collectors and shared models
+pure policy and shared models
         ↓
 macOS commands and native adapters
 ```
 
-Rendering may consume models and formatter helpers. Collectors must not depend on curses or panel geometry. Native and subprocess adapters must not decide layout. Snapshot and future integration adapters should consume collector results without driving the interactive HUD.
+`porkyhud_core.py` may depend only on the standard-library pure-model allowlist (`dataclasses`, `datetime`, `enum`, `math`, and `typing`) and must not import `porkyhud.py`, clocks, I/O, or platform APIs. Rendering may consume models and formatter helpers. Collectors must not depend on curses or panel geometry. Native and subprocess adapters must not decide layout. Snapshot and future integration adapters should consume collector results without driving the interactive HUD.
+
+### `area:source-state`
+
+- Owns immutable telemetry source state, attempts, successful samples, freshness, decision eligibility, and status views.
+- Start at `porkyhud_core.py::new_source`, `porkyhud_core.py::start_attempt`, `porkyhud_core.py::complete_success`, `porkyhud_core.py::complete_failure`, `porkyhud_core.py::is_decision_ready`, and `porkyhud_core.py::source_view`.
+- Primary tests: `tests/test_core.py::SourceStateTests`.
+- A failed refresh retains `last_valid` for display but immediately makes the source decision-ineligible; freshness is inclusive at `age <= stale_after_s`.
 
 ### `area:configuration-models`
 
@@ -208,7 +217,7 @@ main --setup-sensors
 Run focused tests while editing, then run the same core checks as CI:
 
 ```bash
-python3 -m py_compile porkyhud.py
+python3 -m py_compile porkyhud.py porkyhud_core.py
 python3 -m unittest discover -v
 zsh -n PorkyHUD.command
 python3 -m pip wheel --no-deps --wheel-dir dist .

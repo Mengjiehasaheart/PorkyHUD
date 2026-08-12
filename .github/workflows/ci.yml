@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile
-        run: python -m py_compile porkyhud.py
+        run: python -m py_compile porkyhud.py porkyhud_core.py
       - name: Test
         run: python -m unittest discover -v
       - name: Validate launcher
