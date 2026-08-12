@@ -29,6 +29,66 @@ class OffsetTimezone(tzinfo):
         return None
 
 
+class DiskStatFixture:
+    """Complete statvfs fixture with one optional faulting metadata field."""
+
+    def __init__(
+        self,
+        *,
+        f_flag: int = 0,
+        f_fsid: int = 1,
+        faulting_field: str | None = None,
+        fault: BaseException | None = None,
+    ) -> None:
+        self._f_flag = f_flag
+        self._f_fsid = f_fsid
+        self.faulting_field = faulting_field
+        self.fault = fault
+
+    @property
+    def f_flag(self) -> int:
+        if self.faulting_field == "f_flag" and self.fault is not None:
+            raise self.fault
+        return self._f_flag
+
+    @property
+    def f_fsid(self) -> int:
+        if self.faulting_field == "f_fsid" and self.fault is not None:
+            raise self.fault
+        return self._f_fsid
+
+
+class DiskUsageFixture:
+    """Complete disk_usage fixture with one optional faulting result field."""
+
+    def __init__(
+        self,
+        *,
+        total: int = 100,
+        used: int = 25,
+        free: int = 75,
+        faulting_field: str | None = None,
+        fault: BaseException | None = None,
+    ) -> None:
+        self._total = total
+        self.used = used
+        self._free = free
+        self.faulting_field = faulting_field
+        self.fault = fault
+
+    @property
+    def total(self) -> int:
+        if self.faulting_field == "total" and self.fault is not None:
+            raise self.fault
+        return self._total
+
+    @property
+    def free(self) -> int:
+        if self.faulting_field == "free" and self.fault is not None:
+            raise self.fault
+        return self._free
+
+
 class FakeScreen:
     """Minimal curses-like character buffer for deterministic rendering tests."""
 
@@ -1438,6 +1498,112 @@ class DecisionAdapterTests(unittest.TestCase):
             result.value,
             core.DiskCapacity("fsid:22", "Root", "/", 400, 300),
         )
+
+    def test_disk_capacity_retries_root_after_data_metadata_failure(self) -> None:
+        root = DiskStatFixture(f_fsid=22)
+        usage = DiskUsageFixture(total=400, used=100, free=300)
+        for field in ("f_flag", "f_fsid"):
+            with self.subTest(field=field), mock.patch.object(
+                porkyhud.os,
+                "statvfs",
+                side_effect=[
+                    DiskStatFixture(
+                        faulting_field=field,
+                        fault=RuntimeError("broken Data metadata"),
+                    ),
+                    root,
+                ],
+            ), mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
+                try:
+                    result = porkyhud.collect_disk_capacity()
+                except Exception as exc:
+                    self.fail("Data metadata failure escaped instead of trying Root: %s" % exc)
+                self.assertEqual(
+                    result.value,
+                    core.DiskCapacity("fsid:22", "Root", "/", 400, 300),
+                )
+
+    def test_disk_capacity_contains_the_full_candidate_inspection_boundary(self) -> None:
+        valid_stat = DiskStatFixture(f_fsid=7)
+        valid_usage = DiskUsageFixture()
+        scenarios = (
+            (
+                "f_flag metadata",
+                DiskStatFixture(faulting_field="f_flag", fault=RuntimeError("bad flags")),
+                valid_usage,
+            ),
+            (
+                "f_fsid metadata",
+                DiskStatFixture(faulting_field="f_fsid", fault=RuntimeError("bad fsid")),
+                valid_usage,
+            ),
+            (
+                "usage total",
+                valid_stat,
+                DiskUsageFixture(faulting_field="total", fault=RuntimeError("bad total")),
+            ),
+            (
+                "usage free",
+                valid_stat,
+                DiskUsageFixture(faulting_field="free", fault=RuntimeError("bad free")),
+            ),
+            (
+                "capacity validation",
+                valid_stat,
+                DiskUsageFixture(total=0, used=0, free=0),
+            ),
+            (
+                "late missing metadata",
+                DiskStatFixture(
+                    faulting_field="f_fsid",
+                    fault=FileNotFoundError("metadata vanished"),
+                ),
+                valid_usage,
+            ),
+            (
+                "late missing usage",
+                valid_stat,
+                DiskUsageFixture(
+                    faulting_field="total",
+                    fault=FileNotFoundError("usage vanished"),
+                ),
+            ),
+        )
+        for name, filesystem, usage in scenarios:
+            with self.subTest(name=name), mock.patch.object(
+                porkyhud.os, "statvfs", side_effect=[filesystem, filesystem],
+            ), mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
+                try:
+                    result = porkyhud.collect_disk_capacity()
+                except Exception as exc:
+                    self.fail("candidate inspection failure escaped: %s" % exc)
+                self.assertEqual(
+                    (result.outcome, result.failure),
+                    (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION),
+                )
+
+    def test_disk_capacity_candidate_boundary_propagates_process_control(self) -> None:
+        interruption = KeyboardInterrupt("stop disk metadata inspection")
+        with mock.patch.object(
+            porkyhud.os,
+            "statvfs",
+            return_value=DiskStatFixture(faulting_field="f_flag", fault=interruption),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                porkyhud.collect_disk_capacity()
+        self.assertIs(raised.exception, interruption)
+
+        termination = SystemExit("stop disk capacity construction")
+        with mock.patch.object(
+            porkyhud.os, "statvfs", return_value=DiskStatFixture(),
+        ), mock.patch.object(
+            porkyhud.shutil, "disk_usage", return_value=DiskUsageFixture(),
+        ), mock.patch.object(
+            porkyhud, "DiskCapacity", side_effect=termination,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                porkyhud.collect_disk_capacity()
+        self.assertIs(raised.exception, termination)
 
     def test_cpu_usage_uses_counter_read_window_and_resets_on_bad_counters(self) -> None:
         sampler = object.__new__(porkyhud.MacCpuSampler)

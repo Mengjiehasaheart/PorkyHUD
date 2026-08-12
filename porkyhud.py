@@ -618,17 +618,22 @@ def collect_disk_capacity() -> AdapterResult[DiskCapacity]:
         except Exception:
             inspection_failed = True
             continue
-        if filesystem.f_flag & os.ST_RDONLY:
-            continue
         try:
+            if filesystem.f_flag & os.ST_RDONLY:
+                continue
             usage = shutil.disk_usage(mount_point)
+            capacity = DiskCapacity(
+                "fsid:%s" % filesystem.f_fsid,
+                volume_name,
+                mount_point,
+                usage.total,
+                usage.free,
+            )
         except Exception:
             inspection_failed = True
             continue
         return AdapterResult(
-            DiskCapacity(
-                "fsid:%s" % filesystem.f_fsid, volume_name, mount_point, usage.total, usage.free,
-            ),
+            capacity,
             started_mono_s, time.monotonic(), utc_now(), AttemptOutcome.SUCCESS, None,
         )
     completed_mono_s = time.monotonic()
