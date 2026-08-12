@@ -125,7 +125,7 @@ Inside the dashboard, `u` performs only a temporary sudo credential refresh; it 
 ## Compatibility and evidence
 
 - Target: Apple Silicon on macOS, with Python 3.9 through 3.14 tested in CI.
-- Physically verified release record: host validation is pending; this implementation does not claim a device-specific record.
+- Current-host release-candidate record: deterministic hard gates, startup hard gates, snapshot/RSS/launch targets, timeout cleanup, a 30-minute no-growth soak, and the raw-PTY interaction matrix passed on one Mac17,6 / Apple M5 Max running macOS 26.6. Instrumented live CPU averaged 63.473% of one core and missed the scoped <=2% target. Physical Terminal.app visual/profile contrast, other terminal emulators, privileged sensors, and broad device coverage remain unverified.
 - Fixture-validated, hardware-unverified: deterministic tests cover the changed memory-pressure, thermal, CPU-window, disk, process-attribution, responsive-layout, terminal, battery-present, and affirmed batteryless boundaries.
 - Best effort: untested Apple Silicon devices and earlier macOS releases.
 - Outside verified support: Intel Macs remain unverified until Intel-specific fixtures and physical evidence exist.

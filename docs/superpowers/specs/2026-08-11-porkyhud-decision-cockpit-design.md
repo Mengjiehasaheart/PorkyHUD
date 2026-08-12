@@ -1,6 +1,6 @@
 # PorkyHUD Trusted Decision Cockpit — Phase 1 Design
 
-Status: implementation complete; host validation pending
+Status: release-candidate validated for deterministic, current-host performance, and raw-PTY scope; Terminal.app visual qualification unavailable
 
 Date: 2026-08-11
 
@@ -743,7 +743,206 @@ The implementation surfaces and reproducible repository contracts are complete:
 - CI declares Python 3.9 through 3.14, compiles both modules, all three tools, and repository-tool tests, runs warnings-as-errors discovery and documentation validation, checks launcher/help/version, and verifies the fresh wheel includes both production modules while excluding tools and tests
 - the tracked 36-frame, 12 fps, 960-pixel-wide demo is generated only from fixed synthetic values, visibly labels every frame `ILLUSTRATIVE DEMO · SYNTHETIC DATA`, and uses bounded Chrome/Chromium and ffmpeg development subprocesses without weakening the browser sandbox
 
-This record contains no Task 15 startup, snapshot, resource, soak, contrast, terminal, physical-device, or release-performance result. Passing deterministic or mocked tests is not physical validation. Task 15 alone records those measurements, misses, unavailable checks, and review closures before the status can advance.
+At Task 14 acceptance, the deterministic implementation record above contained no Task 15 startup, snapshot, resource, soak, contrast, terminal, physical-device, or release-performance result. Passing deterministic or mocked tests was not treated as physical validation. The following Task 15 record is the sole authority for those measurements, misses, unavailable checks, and review closures.
+
+### Task 15 release-candidate validation record
+
+#### Authority, time, and artifact hygiene
+
+- Frozen code SHA: `750387f5726140208a312d627ca5788cceeed25c`.
+- Record commit: the commit containing this record. A commit cannot contain its own hash; the final hash is reported externally.
+- Authoritative activity window: 2026-08-12 18:51:54.251809 through 19:30:20.175355 UTC (`America/Chicago` host time zone).
+- The tree was clean before every authoritative batch and after the final process audit. Measurements from `51b0e201b1f7b9ca20da71e7cdd1deca59613071` were invalidated after the Cinema resize defect was found; its live run was interrupted and cleaned, and no soak was started from that SHA.
+- Measurement workspaces used mode `0700` and `umask 077`. Raw PTY bytes, process listings, launch/thread identity logs, timeout identities, and telemetry payloads existed only in auto-removed private temporary workspaces. Retained ignored artifacts are sanitized JSON with mode `0600`; they contain no identities, host paths, raw process text, screenshots, or telemetry payloads and are not repository truth.
+- `/etc/sudoers.d/porkyhud` was absent before and after by metadata-only existence checks. Its contents were never read, and no sensor setup, status, removal, sudo credential refresh, or `u` action was performed. No tag, push, publish, Homebrew edit, or release mutation was performed.
+
+#### Recorded environment
+
+| Field | Recorded value |
+| --- | --- |
+| Host | Mac17,6; Apple M5 Max; arm64 |
+| Memory / logical CPUs | 68,719,476,736 bytes (64 GiB) / 18 |
+| Operating system | macOS 26.6, build 25G72 |
+| Primary Python | Homebrew Python 3.14.6 at `$HOME/.homebrew/bin/python3` |
+| Compatibility Python | Xcode Python 3.9.6 at `/usr/bin/python3` |
+| Terminal.app | 2.15, Basic profile; identified but not physically automated |
+| Alternate interaction surface | Raw macOS PTY, explicitly not an alternate terminal emulator |
+| Measurement terminal | `TERM=xterm-256color`, `80x24`, `NO_COLOR=1`, motion off |
+| Controller locale | `C.UTF-8`; a separate true US-ASCII locale covered ASCII projection |
+| Power / sleep | AC remained stable for every batch; no wall/monotonic discontinuity crossed the rejection threshold |
+
+Batch authority was captured rather than inferred:
+
+| Batch | UTC window | Load start -> end | Wall/monotonic drift | Guard result |
+| --- | --- | ---: | ---: | --- |
+| environment | 18:51:54.251809-18:51:54.344398 | n/a | n/a | clean frozen SHA |
+| excluded startup smoke | 18:52:15.160336-18:52:16.551828 | 5.869 -> 5.959 | 0.000010 s | AC stable |
+| startup 20 | 18:52:16.614378-18:52:53.094588 | 5.959 -> 6.013 | 0.000262 s | AC stable |
+| snapshot 20 | 18:53:16.871802-18:53:40.222285 | 4.885 -> 4.485 | 0.000167 s | AC stable |
+| pure projections | 18:53:40.261259-18:53:41.236369 | n/a | n/a | deterministic |
+| forced timeout | 18:53:41.289796-18:53:43.316251 | n/a | n/a | process group absent |
+| five-minute live | 18:54:00.963069-18:59:31.161054 | 5.178 -> 4.435 | 0.002379 s | AC stable; zero gaps |
+| 30-minute soak | 18:59:49.955804-19:30:20.175355 | 3.950 -> 3.889 | 0.021336 s | AC stable; zero gaps |
+
+#### Independent review and defect closure
+
+The two required read-only reviews and the focused resize re-review closed with no remaining Critical, Important, or Minor findings on the accepted candidate:
+
+| Review | Validated defect and proving boundary | Resolution / re-review |
+| --- | --- | --- |
+| Specification, truth, privacy, and UX | Still-triggering memory, thermal, storage, and CPU revisions replaced the original `TriggerEvidence`; a `MEMORY_CRITICAL` to `MEMORY_WATCH` transition then needed a new watch trigger rather than retaining the critical one | `51b0e201...` preserves same-rule entry evidence, creates cross-rule evidence at the transition, and corrects the internal PID/provenance documentation. Table-driven reducer tests pass on current Python and 3.9; reviewer PASS. |
+| Architecture, effects/core boundary, and lifecycle | The timeout harness fabricated a timeout label, thread event projection assumed append order, and real child-to-grandchild cleanup could classify the result after probing before leader reap | `51b0e201...` drives the real structured command timeout, requires exact `TIMEOUT` / `COMMAND_TIMEOUT`, orders concurrent events deterministically, treats signal `EPERM` as unconfirmed, re-probes after reap, and proves private output plus both descendants absent. Reviewer PASS. |
+| Resize transaction | A physical PTY could resize after the loop's size snapshot and make Cinema rendering raise `body geometry must fit the viewport` | `750387f...` binds one logical geometry to each attempt, reacquires after collection, and retries at most three uncommitted frames before refresh. Exhaustive draw-stage injection and churn tests pass; independent 30-run raw-PTY review passed 30/30 with no repeated collection or mixed committed frame. |
+
+The resize review independently ran 45/45 layout tests and 390/390 full tests under Python 3.14.6 and 3.9.6, plus compile, documentation, launcher, and diff gates. All 30 rapid `118x34` to `117x33` PTY runs exited cleanly: 27 observed the explicit Cinema-to-Overview return and three resized before selection and received the honest rejection.
+
+#### Final deterministic, repository, and package gates
+
+After the evidence-only documentation edit, the complete local matrix ran under six actual interpreters rather than treating the CI declaration as execution evidence:
+
+| Python | Warnings-as-errors discovery | Compile | Documentation / CLI | Wheel install and outside-checkout import |
+| --- | --- | --- | --- | --- |
+| 3.9.6 | 390/390 PASS | PASS | PASS | PASS |
+| 3.10.17 | 390/390 PASS | PASS | PASS | PASS |
+| 3.11.12 | 390/390 PASS | PASS | PASS | PASS |
+| 3.12.10 | 390/390 PASS | PASS | PASS | PASS |
+| 3.13.13 | 390/390 PASS | PASS | PASS | PASS |
+| 3.14.6 | 390/390 PASS | PASS | PASS | PASS |
+
+Compilation covered `porkyhud.py`, `porkyhud_core.py`, all three tracked tools, and `tests/test_repository_tools.py`. Each interpreter also ran the documentation validator, `--help`, and exact `PorkyHUD 0.1.2` version check. `zsh -n PorkyHUD.command`, real JSON parsing, the text snapshot smoke, and `git diff --check` passed.
+
+The first current-Python post-commit rerun had one release-gate miss: the UTF-8 split-write integration test inherited a one-second end-to-end process deadline and returned the runner's exact typed `TIMEOUT` once under full-suite load. The decode invariant is independent of that deadline; 300 focused executions at the original budget had zero failures and a maximum below 71 ms, while cleanup faults would have produced private `UNKNOWN`. The valid and invalid split-write cases now use the same two-second test-only budget, with no production timeout change. Independent review accepted the bounded fix; structured-command tests, a focused 11-run repetition, and the full six-interpreter 390-test matrix then passed. If the case ever exhausts two seconds, the next action is timestamp instrumentation, not another budget increase.
+
+Every interpreter built into its own empty private wheel directory. Each wheel's only non-`dist-info` members were `porkyhud.py` and `porkyhud_core.py`; tools, tests, assets, and source-tree residue were absent. Each wheel installed into a fresh target and imported both modules from a different working directory. Pre-existing ignored build products were identified as stale, removed only after an exact dry run, and never used as release evidence.
+
+Repository validation found the same 19 paths in Git and the exhaustive `AGENTS.md` map, with zero map, Python-anchor, local-link, or semantic-control errors. The tracked demo SHA-256 is `7e5a2d1a941daf55e5a902101f30ad50ac4b0f589620e29d8f06c5ead26571ed`; it is GIF89a, `960x600`, 36 frames at 12 fps. Original-detail inspection of first, middle, and last frames found the visible `ILLUSTRATIVE DEMO · SYNTHETIC DATA` marker, `NORMAL`, `m sort`, generic fixed values, and no clipping or private material.
+
+#### Startup hard gates
+
+The harness disclosed one excluded smoke (`81.714 ms` shell, `1251.893 ms` point evidence), then performed 20 independent launches with a 500 ms gap and five-second deadline. A shell marker required `CHECKING 0/4 core sources`, `Waiting for core evidence.`, and CPU/MEM/THERM/DISK `CHECKING`. The evidence marker required numeric CPU, a typed memory state, and a typed thermal state. Every run found both markers, exited cleanly after `q`, and left no recorded child.
+
+Exact run-order samples (`run: shell_ms / evidence_ms`) were:
+
+```text
+01:  84.334 / 1255.715    02: 102.193 / 1257.676
+03:  96.974 / 1242.033    04: 104.534 / 1268.633
+05: 103.426 / 1265.798    06: 100.340 / 1334.133
+07:  90.177 / 1328.540    08: 103.228 / 1264.899
+09:  97.898 / 1257.175    10: 101.874 / 1317.853
+11:  88.210 / 1257.350    12: 101.360 / 1337.401
+13:  91.043 / 1318.104    14: 104.794 / 1257.195
+15: 102.496 / 1339.401    16: 105.657 / 1324.904
+17:  88.102 / 1313.989    18:  88.077 / 1317.991
+19: 108.019 / 1260.641    20:  92.858 / 1274.792
+```
+
+| Marker | Minimum | Median | Mean | Nearest-rank p95 | Maximum | Gate |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| initial shell | 84.334 ms | 100.850 ms | 97.780 ms | 105.657 ms | 108.019 ms | <=250 ms: PASS |
+| first point evidence | 1242.033 ms | 1271.713 ms | 1289.711 ms | 1337.401 ms | 1339.401 ms | <=3000 ms: PASS |
+
+There were no missing markers, crashes, cleanup failures, or discarded measured runs. The maxima are reported separately and are not misrepresented as p95 thresholds.
+
+#### Snapshot and pure projection evidence
+
+Twenty independent `--json` commands used the same timed invocation for elapsed time, command maximum RSS, schema validation, redaction validation, and cleanup. RSS is the macOS `/usr/bin/time -l` command maximum, not an invented descendant-tree value.
+
+Exact run-order samples (`run: elapsed_ms / RSS_bytes`) were:
+
+```text
+01: 1144.085 / 60473344    02: 1129.722 / 60260352
+03: 1133.303 / 60325888    04: 1130.738 / 60424192
+05: 1136.374 / 60014592    06: 1144.418 / 60915712
+07: 1162.073 / 59834368    08: 1203.939 / 59916288
+09: 1132.099 / 63684608    10: 1194.632 / 59899904
+11: 1168.341 / 60702720    12: 1249.894 / 60096512
+13: 1139.777 / 59834368    14: 1138.999 / 60063744
+15: 1154.155 / 59998208    16: 1134.426 / 59932672
+17: 1234.056 / 60342272    18: 1129.490 / 59883520
+19: 1259.065 / 60915712    20: 1128.989 / 60030976
+```
+
+| Measurement | Minimum | Median | Mean | Nearest-rank p95 | Maximum | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| snapshot wall time | 1128.989 ms | 1141.931 ms | 1162.429 ms | 1249.894 ms | 1259.065 ms | scoped <=3 s target: PASS |
+| command maximum RSS | 59,834,368 B | 60,080,128 B | 60,377,497.6 B | 60,915,712 B | 63,684,608 B | recorded; maximum below 64 MiB |
+
+Run 19 had the maximum wall time. Run 9 had the maximum RSS. Both are retained, and no snapshot sample, schema result, privacy result, or cleanup was missing.
+
+After 1,000 excluded warmups, GC remained enabled for 10,000 individually timed operations of each pure surface:
+
+| Projection | Minimum | Median | Mean | p95 | Maximum | Hard gate |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| threaded Task 5 policy reduction | 0.025875 ms | 0.028313 ms | 0.029182 ms | 0.031083 ms | 0.279000 ms | mean and p95 <1 ms: PASS |
+| Task 12 header plus ribbon | 0.043208 ms | 0.047833 ms | 0.048560 ms | 0.052417 ms | 0.204250 ms | mean and p95 <5 ms: PASS |
+
+The maxima are retained as observed outliers; neither is substituted for the specified mean/p95 gate.
+
+#### Live resources, launch rate, soak, and timeout cleanup
+
+The five-minute live batch used a 30-second warmup followed by 300 one-second samples, with zero gaps. CPU and RSS recursively summed the instrumented root plus descendants. The resident `live-wrapper.py` monkeypatched launch/thread recorders and called `porkyhud.main()` in-process, so recorder overhead is included in the root result; the measurement driver and PTY-drain thread were outside the measured tree.
+
+| Five-minute live measurement | Minimum | Median | Mean | p95 | Maximum | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| CPU, percent of one core | 56.5 | 63.65 | **63.473** | 67.6 | 71.2 | scoped <=2% target: **MISS** |
+| RSS | 35,487,744 B | 41,369,600 B | 39,622,246.4 B | 45,875,200 B | 48,136,192 B | scoped p95 <=64 MiB: PASS |
+| concurrent descendants | 0 | 0 | 0.250 | 1 | 2 | bounded |
+| OS threads | 7 | 7 | 7.357 | 8 | 9 | recorded |
+
+The five exact half-open launch bins were `[231, 228, 227, 229, 228]`, totaling 1,143 launches with a maximum of 231/minute; the <=240/minute scoped target passed. `q` produced a clean exit and cleanup with zero recorded survivors. The 63.473% CPU result is a material, explicitly retained host-target miss. It was not rerun, averaged away, or promoted to a universal result.
+
+The soak used another 30-second warmup followed by 1,800 seconds and 360 five-second samples, again with zero gaps. `q` exited cleanly, cleanup completed, and no recorded identity survived.
+
+| 30-minute soak measurement | Minimum | Median | Mean | p95 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU, percent of one core | 56.1 | 63.25 | 63.217 | 67.6 | 79.7 |
+| RSS | 33,734,656 B | 35,323,904 B | 37,026,656.7 B | 42,909,696 B | 50,561,024 B |
+| concurrent descendants | 0 | 0 | 0.264 | 1 | 2 |
+| OS threads | 7 | 7 | 7.325 | 8 | 9 |
+
+The exact 30 launch bins were `[230, 228, 228, 228, 228, 229, 221, 228, 229, 226, 229, 228, 228, 222, 228, 228, 230, 229, 226, 229, 229, 223, 228, 230, 232, 229, 232, 229, 221, 232]`, totaling 6,837 and peaking at 232/minute. First-window to final-window thread results were:
+
+- OS threads: maximum `9 -> 9`, p95 `8 -> 8`.
+- Python threads: maximum `10 -> 9`, p95 `8 -> 8`.
+- Prefix maxima: `AsyncPoller 1 -> 1`, `SourcePoller 6 -> 6`, `PorkyHUD-command 2 -> 2`, `Other 0 -> 0`.
+
+The no-growth soak gate passed. This is evidence for the observed 30-minute window plus deterministic lifecycle tests, not a claim of indefinite leak freedom.
+
+The separate nonprivileged Python child-to-grandchild probe drove the real structured command past its deadline. It returned exact typed outcome `timeout` and failure `command_timeout` in 1966.752 ms, reaped the direct child, proved the grandchild absent, classified cleanup as `process_group_terminated`, and exposed no private stdout, stderr, or argv.
+
+#### Manual interaction, terminal protocol, and visual evidence
+
+The raw macOS PTY matrix passed at `76x22`, `80x24`, `117x33`, `118x34`, and `132x42`. At minimum size, direct modes 1-5 had distinct bodies, key 6 gave an honest Cinema rejection, and cycling stayed within supported modes. Help/Escape, Home/End, `q`, Cinema selection, the `118x34` to `117x33` Overview return, resize-back/reselection, and the `132x42` Cinema/help path all completed cleanly.
+
+All four themes cycled at `80x24` under forced palette and `NO_COLOR`. Forced mode emitted OSC 10/11/12 and reset 110/111/112 on exit; `NO_COLOR` emitted none. A true US-ASCII locale kept semantic output ASCII. `TERM=xterm`, `xterm-16color`, and `xterm-256color` rendered, cycled, and exited; these are protocol paths, not emulator visual proof. `q`, Escape, SIGINT, and SIGTERM produced exit codes `0`, `0`, `0`, and `143`, respectively, with no residual process group and palette restoration. The launcher started and closed under forced-palette and `NO_COLOR`; forced mode reset the palette and `NO_COLOR` emitted no palette OSC.
+
+Physical current-host runtime observation covered only `CHECKING -> UNKNOWN -> NORMAL` over 18 seconds. Loading, stale, incomplete, degraded, error, and recovery presentation states are covered by deterministic synthetic tests, not claimed as physically induced states.
+
+Terminal.app 2.15 with the Basic profile was identified, but the available computer-use authority explicitly prohibited controlling Terminal.app. No AppleScript bypass was used. Consequently, physical Terminal.app viewport/theme screenshots, visual palette fidelity, and profile-sampled RGB swatches are unavailable, and this record does **not** say that Terminal.app passed. No alternate terminal emulator was exercised; the alternate surface was a raw PTY.
+
+Forced-palette contrast below is calculated from the shipped xterm-256 role RGB values against the configured background `#05070d`. It is source/protocol-derived, not sampled from Terminal.app pixels or its profile:
+
+| Theme | Primary | Info | Nominal | Watch | Critical | Structure | Secondary | Brand |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Neon Grid | #ffffff 20.141:1 | #00ffff 16.063:1 | #00ff00 14.678:1 | #ffd700 14.360:1 | #ff0000 5.037:1 | #00afff 8.225:1 | #00d7ff 11.667:1 | #ff00ff 6.422:1 |
+| Catppuccin | #d7d7ff 14.438:1 | #87afd7 8.769:1 | #87ff5f 15.824:1 | #ffffaf 19.350:1 | #ff5f5f 6.766:1 | #87afff 9.213:1 | #afd7ff 13.415:1 | #d7afff 10.996:1 |
+| Solar Circuit | #eeeeee 17.359:1 | #5fffff 16.529:1 | #5fff00 15.145:1 | #ffff00 18.756:1 | #ff5f00 6.607:1 | #0087ff 5.668:1 | #5fffff 16.529:1 | #d700ff 5.115:1 |
+| Graphite | #d0d0d0 13.058:1 | #87afd7 8.769:1 | #afd7d7 12.971:1 | #ffd787 14.695:1 | #ff5f5f 6.766:1 | #8a8a8a 5.834:1 | #bcbcbc 10.605:1 | #d7afff 10.996:1 |
+
+The minimum text-role ratio is 5.037:1, the minimum meaningful-structure ratio is 5.668:1, and the minimum decorative brand ratio is 5.115:1. These source values exceed the 4.5:1 text and 3:1 structure thresholds, but they do not establish physical Terminal.app profile contrast. Under `NO_COLOR`, only complete text/shape semantics and absence of hue-only meaning were verified; contrast belongs to the user's terminal.
+
+#### Misses, unavailable checks, and untested scope
+
+- Instrumented live CPU averaged 63.473% of one core and missed the scoped <=2% target; recorder overhead is included. This is the sole measured target miss.
+- The startup maxima, snapshot run-9 RSS maximum, pure-operation maxima, soak CPU maximum, and the one post-commit test-budget miss are reported above. There were no missing measurement markers, samples, schemas, redaction checks, gaps, cleanup results, or surviving recorded identities.
+- Physical Terminal.app viewport/theme/profile-swatch qualification was unavailable. Palette restoration is proven at the OSC protocol boundary, not by sampling the restored profile. No actual alternate emulator was tested, and the 8/16/256 paths are not emulator visual proof.
+- No privileged sensor behavior, sudoers mutation, credential refresh, sleep/wake transition, Homebrew installation, tag, publish, or release workflow was exercised.
+- Other Mac generations, fanless/one-fan/multi-fan systems, Ultra or multi-die systems, desktops versus battery systems and UPS configurations, partial SMC exposure, varied `powermetrics` grammars, earlier macOS versions, and Intel Macs remain physically unverified. Fixture coverage is not physical hardware proof.
+- The local release matrix records the interpreters actually run. CI declares Python 3.9 through 3.14; that declaration is not substituted for local execution evidence.
+
+#### Scoped release conclusion
+
+The frozen code satisfies both non-waivable startup gates, both deterministic pure-operation gates, the snapshot/RSS/launch-rate scoped targets, exact typed timeout cleanup, the 30-minute no-growth gate, and the raw-PTY interaction/protocol matrix. The current-host live CPU target missed and remains visible. The evidence does not establish physical Terminal.app visual/profile contrast, other-emulator behavior, privileged-sensor behavior, or broad Mac compatibility. Within those explicit boundaries, the result is a release-candidate validated for deterministic correctness, the recorded host measurements, and raw-PTY interaction.
 
 Phase 1 is complete when a user can launch PorkyHUD at `76×22` and understand:
 

@@ -38,7 +38,7 @@ Keep this table exhaustive. Add, move, or remove a row in the same commit as the
 | --- | --- | --- |
 | `AGENTS.md` | Agent routing, architecture, invariants, and maintenance contract | Any boundary, file ownership, runtime flow, validation, or documentation-policy change |
 | `README.md` | User-facing installation, controls, sensor access, privacy, and metric semantics | User-visible behavior, requirements, CLI workflows, or support changes |
-| `docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md` | Implemented Phase 1 design, acceptance contract, and pending host-validation record | Scope, architecture, UX, compatibility, performance, acceptance, or recorded validation changes |
+| `docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md` | Implemented Phase 1 design, acceptance contract, and scoped release-candidate validation record | Scope, architecture, UX, compatibility, performance, acceptance, or recorded validation changes |
 | `docs/superpowers/plans/2026-08-11-porkyhud-trusted-decision-cockpit.md` | Test-first Phase 1 execution contract and fixed cross-task interfaces | Task boundaries, interface names, validation sequence, or approved execution changes |
 | `porkyhud.py` | macOS effects: adapters, collectors, runtime dashboard, rendering, snapshots, and CLI | Focused tests plus every affected user or agent contract |
 | `porkyhud_core.py` | Pure immutable source-state models, reducers, freshness, eligibility, and source views | Source contract tests and every consumer of telemetry evidence |

@@ -1222,7 +1222,8 @@ class StructuredCommandTests(unittest.TestCase):
     def test_utf8_is_decoded_strictly_across_write_boundaries(self) -> None:
         valid = self.run_fixture(
             "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
-            "time.sleep(0.03); sys.stdout.buffer.write(b'\\x82\\xac')"
+            "time.sleep(0.03); sys.stdout.buffer.write(b'\\x82\\xac')",
+            timeout_s=2.0,
         )
         self.assertEqual(valid.outcome, core.AttemptOutcome.SUCCESS)
         self.assertEqual(valid.stdout, "€")
@@ -1233,7 +1234,8 @@ class StructuredCommandTests(unittest.TestCase):
         ):
             invalid = self.run_fixture(
                 "import sys, time; sys.stdout.buffer.write(b'\\xe2'); sys.stdout.flush(); "
-                "time.sleep(0.03); sys.stdout.buffer.write(b'X')"
+                "time.sleep(0.03); sys.stdout.buffer.write(b'X')",
+                timeout_s=2.0,
             )
         self.assert_command_error(invalid, core.FailureCode.DECODE_ERROR)
         self.assertEqual(invalid.stdout, "")
