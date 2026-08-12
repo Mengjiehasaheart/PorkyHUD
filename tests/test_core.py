@@ -2254,6 +2254,60 @@ class HealthPolicyTests(unittest.TestCase):
         self.assertIs(duplicate, policy)
         self.assertEqual(repeated, assessment)
 
+    def test_incomplete_cpu_replay_uses_current_point_threshold_and_rejects_inverse_latches(self):
+        facts = self.ready_facts(cpu_percent=95.0)
+        entered, _ = reduce_health(initial_policy_state(), facts, 20.0)
+        failed_cpu = self.failed(facts.cpu, 21.0)
+        after_failure, _ = reduce_health(entered, HealthFacts(
+            failed_cpu, facts.memory, facts.thermal, facts.disk, facts.processes), 21.0)
+        for percent in (0.0, 70.0, 70.001, 80.0, 89.999):
+            with self.subTest(percent=percent):
+                retry = self.successful(SourceId.CPU_USAGE,
+                                        CpuUsage(percent, 21.0, 22.0), 22.0, failed_cpu)
+                current = HealthFacts(retry, facts.memory, facts.thermal,
+                                      facts.disk, facts.processes)
+                state, assessment = reduce_health(after_failure, current, 22.0)
+                self.assertEqual(assessment.reason,
+                                 "CPU use has eased; recovery confirmation is in progress.")
+                duplicate, repeated = reduce_health(state, current, 22.0)
+                self.assertIs(duplicate, state)
+                self.assertEqual(repeated, assessment)
+                inverse = replace(
+                    state,
+                    cpu_latch=replace(state.cpu_latch, phase=LatchPhase.ACTIVE),
+                )
+                with self.assertRaises(ValueError):
+                    reduce_health(inverse, current, 22.0)
+
+        retry_90 = self.successful(SourceId.CPU_USAGE,
+                                   CpuUsage(90.0, 21.0, 22.0), 22.0, failed_cpu)
+        current_90 = HealthFacts(retry_90, facts.memory, facts.thermal,
+                                 facts.disk, facts.processes)
+        active_state, active_assessment = reduce_health(after_failure, current_90, 22.0)
+        self.assertEqual(active_assessment.reason,
+                         "CPU capacity has averaged at least 90% for 15 seconds.")
+        duplicate, repeated = reduce_health(active_state, current_90, 22.0)
+        self.assertIs(duplicate, active_state)
+        self.assertEqual(repeated, active_assessment)
+        inverse = replace(
+            active_state,
+            cpu_latch=replace(active_state.cpu_latch, phase=LatchPhase.RECOVERING),
+        )
+        with self.assertRaises(ValueError):
+            reduce_health(inverse, current_90, 22.0)
+
+        retry_95 = self.successful(SourceId.CPU_USAGE,
+                                   CpuUsage(95.0, 21.0, 22.0), 22.0, failed_cpu)
+        current_95 = HealthFacts(retry_95, facts.memory, facts.thermal,
+                                 facts.disk, facts.processes)
+        active_state, _ = reduce_health(after_failure, current_95, 22.0)
+        inverse = replace(
+            active_state,
+            cpu_latch=replace(active_state.cpu_latch, phase=LatchPhase.RECOVERING),
+        )
+        with self.assertRaises(ValueError):
+            reduce_health(inverse, current_95, 22.0)
+
     def test_same_revision_clear_latches_reject_triggering_current_evidence(self):
         facts = self.ready_facts()
         clear_state, _ = reduce_health(initial_policy_state(), facts, 20.0)

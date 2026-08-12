@@ -2017,11 +2017,16 @@ def _validate_current_latch_value(
             raise ValueError("storage recovery contradicts current evidence")
     elif latch.rule_id is RuleId.CPU_WATCH and window is not None:
         summary = cpu_window_summary(window, 15.0)
-        if latch.phase is LatchPhase.ACTIVE and summary is not None and summary.mean_percent < 90.0:
-            raise ValueError("CPU watch latch contradicts current window")
-        if (latch.phase is LatchPhase.RECOVERING
-                and (summary is None or summary.mean_percent >= 90.0)):
-            raise ValueError("CPU recovery contradicts current high usage")
+        if summary is None:
+            if latch.phase is LatchPhase.ACTIVE and value.percent < 90.0:
+                raise ValueError("CPU watch latch contradicts incomplete current window")
+            if latch.phase is LatchPhase.RECOVERING and value.percent >= 90.0:
+                raise ValueError("CPU recovery contradicts incomplete current window")
+        else:
+            if latch.phase is LatchPhase.ACTIVE and summary.mean_percent < 90.0:
+                raise ValueError("CPU watch latch contradicts current window")
+            if latch.phase is LatchPhase.RECOVERING and summary.mean_percent >= 90.0:
+                raise ValueError("CPU recovery contradicts current window")
 
 
 def _cpu_entry_active(window: Optional[CpuWindow]) -> bool:
