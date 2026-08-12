@@ -29,13 +29,14 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
-from operator import attrgetter
-from typing import Any, Callable, Generic, Optional, Sequence, TypeVar
+from types import MappingProxyType
+from typing import Any, Callable, Generic, Mapping, Optional, Sequence, TypeVar
 
 from porkyhud_core import (
     AttemptOutcome,
@@ -45,6 +46,9 @@ from porkyhud_core import (
     MemoryPressure,
     MemoryPressureLevel,
     OsThermalState,
+    ProcessFact,
+    SourceId,
+    SourceState,
 )
 
 
@@ -177,10 +181,58 @@ class ProcessRow:
     pid: int
     cpu: float
     mem: float
-    gpu: float
+    gpu: float | None
     stat: str
     etime: str
     command: str
+
+
+@dataclass(frozen=True)
+class GpuCounterSnapshot:
+    """A complete AGX counter enumeration, isolated from mutable parser state."""
+
+    counters_ns: Mapping[int, int]
+    identities: Mapping[int, str]
+    complete: bool
+
+    def __post_init__(self) -> None:
+        counters = dict(self.counters_ns)
+        identities = dict(self.identities)
+        if not isinstance(self.complete, bool) or set(counters) != set(identities):
+            raise ValueError("GPU counter evidence must have matching identities")
+        for pid, counter in counters.items():
+            if type(pid) is not int or pid <= 0 or type(counter) is not int or counter < 0:
+                raise ValueError("GPU counter evidence must use positive PIDs and nonnegative counters")
+            if not isinstance(identities[pid], str) or not identities[pid]:
+                raise ValueError("GPU counter evidence requires non-empty identities")
+        object.__setattr__(self, "counters_ns", MappingProxyType(counters))
+        object.__setattr__(self, "identities", MappingProxyType(identities))
+
+
+@dataclass(frozen=True)
+class GpuProcessSample:
+    """Measured GPU attribution; missing map entries deliberately remain unknown."""
+
+    percentages: Mapping[int, float]
+    identities: Mapping[int, str]
+    complete: bool
+    baseline_ready: bool
+
+    def __post_init__(self) -> None:
+        percentages = dict(self.percentages)
+        identities = dict(self.identities)
+        if not isinstance(self.complete, bool) or not isinstance(self.baseline_ready, bool):
+            raise ValueError("GPU sample flags must be booleans")
+        if not set(percentages).issubset(identities):
+            raise ValueError("GPU percentages must have matching identities")
+        for pid, identity in identities.items():
+            if type(pid) is not int or pid <= 0 or not isinstance(identity, str) or not identity:
+                raise ValueError("GPU samples require positive PIDs and non-empty identities")
+        for pid, percentage in percentages.items():
+            if type(pid) is not int or pid <= 0 or not isinstance(percentage, (int, float)) or isinstance(percentage, bool) or not math.isfinite(percentage) or percentage < 0:
+                raise ValueError("GPU percentages must be finite and nonnegative")
+        object.__setattr__(self, "percentages", MappingProxyType(percentages))
+        object.__setattr__(self, "identities", MappingProxyType(identities))
 
 
 @dataclass
@@ -3250,118 +3302,326 @@ def collect_runtime_stats() -> RuntimeStats:
     )
 
 
-class GPUProcessSampler:
-    def __init__(self) -> None:
-        self.previous: dict[int, int] | None = None
-        self.previous_time = 0.0
+def _process_evidence_error(command: CommandResult, raw: str) -> AdapterResult[Any]:
+    """Convert a parser rejection without exposing command output or diagnostics."""
 
-    def sample(self, system_gpu_percent: float | None = None) -> dict[int, float]:
-        raw = run_command(["ioreg", "-r", "-c", "AGXDeviceUserClient", "-l"], timeout=2.0)
-        current: dict[int, int] = {}
-        if not raw:
-            return {}
-
-        current_pid: int | None = None
-        current_total = 0
-        saw_usage = False
-        for line in raw.splitlines():
-            creator = re.search(r'"IOUserClientCreator"\s*=\s*"pid\s+(\d+),', line)
-            if creator:
-                if current_pid is not None and current_total > 0:
-                    current[current_pid] = current.get(current_pid, 0) + current_total
-                current_pid = int(creator.group(1))
-                current_total = 0
-                saw_usage = False
-                continue
-            if current_pid is None:
-                continue
-            values = [int(value) for value in re.findall(r'"accumulatedGPUTime"\s*=\s*(\d+)', line)]
-            if values:
-                current_total += sum(values)
-                saw_usage = True
-            if saw_usage and ")" in line:
-                current[current_pid] = current.get(current_pid, 0) + current_total
-                current_pid = None
-                current_total = 0
-                saw_usage = False
-        if current_pid is not None and current_total > 0:
-            current[current_pid] = current.get(current_pid, 0) + current_total
-
-        now = time.monotonic()
-        if self.previous is None or self.previous_time <= 0:
-            self.previous = current
-            self.previous_time = now
-            return {}
-
-        elapsed = max(0.25, now - self.previous_time)
-        gpu_ms_per_sec: dict[int, float] = {}
-        total_ms = 0.0
-        for pid, value in current.items():
-            before = self.previous.get(pid)
-            if before is None or value < before:
-                continue
-            ms_per_sec = (value - before) / elapsed / 1_000_000.0
-            if ms_per_sec <= 0:
-                continue
-            gpu_ms_per_sec[pid] = ms_per_sec
-            total_ms += ms_per_sec
-
-        raw_total_percent = total_ms / 10.0
-        scale = 1.0
-        if raw_total_percent > 0.01 and system_gpu_percent and system_gpu_percent > 0.01:
-            scale = system_gpu_percent / raw_total_percent
-
-        self.previous = current
-        self.previous_time = now
-        return {pid: value * scale / 10.0 for pid, value in gpu_ms_per_sec.items()}
-
-
-def collect_process_rows(
-    gpu_sampler: GPUProcessSampler | None = None,
-    system_gpu_percent: float | None = None,
-) -> list[ProcessRow]:
-    raw = run_command(
-        ["ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
-        timeout=2.0,
+    return AdapterResult(
+        None,
+        command.started_mono_s,
+        command.completed_mono_s,
+        command.completed_at_utc,
+        AttemptOutcome.PARSE_ERROR,
+        FailureCode.EMPTY_OUTPUT if not raw.strip() else FailureCode.PARSER_REJECTED,
     )
-    gpu_by_pid = gpu_sampler.sample(system_gpu_percent) if gpu_sampler else {}
+
+
+def _normalized_process_text(text: str) -> str:
+    normalized: list[str] = []
+    for character in text:
+        category = unicodedata.category(character)
+        if category == "Cc":
+            normalized.append(" ")
+        elif category != "Cf":
+            normalized.append(character)
+    return " ".join("".join(normalized).split())
+
+
+def process_identity(command: str) -> str:
+    """Return a compact, comparison-safe process identity without arguments."""
+
+    normalized = _normalized_process_text(command)
+    app_match = re.search(r"/([^/]+)\.app(?:/|$)", normalized)
+    if app_match:
+        return app_match.group(1) or "a process"
+    executable = normalized.split(" ", 1)[0] if normalized else ""
+    return os.path.basename(executable) or executable or "a process"
+
+
+def parse_elapsed_seconds(raw: str) -> Optional[int]:
+    """Parse ps elapsed time only when it carries a complete unambiguous duration."""
+
+    match = re.fullmatch(r"(?:(\d+)-)?(\d+):(\d{2}):(\d{2})", raw)
+    if match:
+        days, hours, minutes, seconds = match.groups()
+        if int(minutes) < 60 and int(seconds) < 60:
+            return ((int(days or 0) * 24 + int(hours)) * 60 + int(minutes)) * 60 + int(seconds)
+        return None
+    match = re.fullmatch(r"(\d+):(\d{2})", raw)
+    if match and int(match.group(2)) < 60:
+        return int(match.group(1)) * 60 + int(match.group(2))
+    return None
+
+
+def parse_process_rows(raw: str) -> tuple[ProcessRow, ...]:
+    """Parse a ps table atomically: malformed rows invalidate the full sample."""
+
     rows: list[ProcessRow] = []
+    seen_pids: set[int] = set()
     for line in raw.splitlines():
-        parts = line.strip().split(None, 5)
-        if len(parts) < 6:
+        if not line.strip():
             continue
+        parts = line.strip().split(None, 5)
+        if len(parts) != 6:
+            raise ValueError("malformed process row")
         try:
             pid = int(parts[0])
-            rows.append(
-                ProcessRow(
-                    pid=pid,
-                    cpu=float(parts[1]),
-                    mem=float(parts[2]),
-                    gpu=gpu_by_pid.get(pid, 0.0),
-                    stat=parts[3],
-                    etime=parts[4],
-                    command=parts[5],
-                )
-            )
-        except ValueError:
+            cpu = float(parts[1])
+            memory = float(parts[2])
+        except ValueError as exc:
+            raise ValueError("invalid process numeric field") from exc
+        if pid <= 0 or pid in seen_pids or not math.isfinite(cpu) or not math.isfinite(memory) or cpu < 0 or memory < 0:
+            raise ValueError("invalid process table value")
+        seen_pids.add(pid)
+        rows.append(ProcessRow(pid, cpu, memory, None, parts[3], parts[4], parts[5]))
+    if not rows:
+        raise ValueError("empty process table")
+    return tuple(rows)
+
+
+def display_cell_width(text: str) -> int:
+    """Measure terminal cells conservatively without treating combining marks as columns."""
+
+    width = 0
+    for character in text:
+        if unicodedata.category(character) in {"Cc", "Cf"} or unicodedata.combining(character):
             continue
-    return rows
+        width += 2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1
+    return width
 
 
-def sort_process_rows(rows: list[ProcessRow], sort_mode: str) -> list[ProcessRow]:
-    attribute = {"GPU": "gpu", "MEM": "mem"}.get(sort_mode, "cpu")
-    return sorted(rows, key=attrgetter(attribute), reverse=True)
+def truncate_display_cells(text: str, limit: int) -> str:
+    """Truncate before a cell boundary while retaining marks attached to included glyphs."""
+
+    if limit <= 0:
+        return ""
+    output: list[str] = []
+    width = 0
+    for character in text:
+        if unicodedata.category(character) in {"Cc", "Cf"}:
+            continue
+        char_width = 0 if unicodedata.combining(character) else (2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1)
+        if char_width and width + char_width > limit:
+            break
+        output.append(character)
+        width += char_width
+    return "".join(output)
 
 
-def process_rows(
-    sort_mode: str,
-    gpu_sampler: GPUProcessSampler | None = None,
-    system_gpu_percent: float | None = None,
-) -> list[ProcessRow]:
-    return sort_process_rows(
-        collect_process_rows(gpu_sampler, system_gpu_percent),
-        sort_mode,
+def process_facts(rows: Sequence[ProcessRow]) -> tuple[ProcessFact, ...]:
+    """Expose only minimized, display-safe process facts to the pure core."""
+
+    return tuple(
+        ProcessFact(
+            row.pid,
+            truncate_display_cells(process_identity(row.command), 32),
+            row.cpu,
+            parse_elapsed_seconds(row.etime),
+        )
+        for row in rows
     )
+
+
+def parse_agx_counters(raw: str) -> GpuCounterSnapshot:
+    """Parse AGX user clients atomically; a valid prefix never becomes evidence."""
+
+    if not raw.strip():
+        raise ValueError("empty AGX output")
+    counters: dict[int, int] = {}
+    identities: dict[int, str] = {}
+    current: Optional[dict[str, Any]] = None
+    structure_depth = 0
+    saw_structure = False
+    for line in raw.splitlines():
+        opened = line.count("{")
+        closed = line.count("}")
+        if opened or closed:
+            saw_structure = True
+        structure_depth += opened - closed
+        if structure_depth < 0:
+            raise ValueError("unbalanced AGX structure")
+        is_agx = "AGXDeviceUserClient" in line
+        if current is None:
+            if "accumulatedGPUTime" in line:
+                raise ValueError("orphan AGX counter")
+            if is_agx:
+                if "{" not in line:
+                    raise ValueError("unterminated AGX object")
+                current = {"pid": None, "identity": None, "counter": None}
+            continue
+        if "AGXDeviceUserClient" in line and "{" in line:
+            raise ValueError("nested AGX object")
+        if "IOUserClientCreator" in line:
+            match = re.search(r'"IOUserClientCreator"\s*=\s*"pid\s+(\d+)\s*,\s*(.*?)"\s*$', line.strip())
+            if match is None or current["pid"] is not None:
+                raise ValueError("malformed AGX creator")
+            pid = int(match.group(1))
+            identity = process_identity(match.group(2))
+            if pid <= 0 or identity == "a process":
+                raise ValueError("invalid AGX creator")
+            current["pid"] = pid
+            current["identity"] = identity
+        if "accumulatedGPUTime" in line:
+            match = re.search(r'"accumulatedGPUTime"\s*=\s*(-?\d+)\s*$', line.strip())
+            if match is None or current["counter"] is not None:
+                raise ValueError("malformed AGX counter")
+            counter = int(match.group(1))
+            if counter < 0:
+                raise ValueError("negative AGX counter")
+            current["counter"] = counter
+        if "}" in line:
+            pid = current["pid"]
+            identity = current["identity"]
+            counter = current["counter"]
+            if pid is None or identity is None or counter is None:
+                raise ValueError("incomplete AGX object")
+            previous_identity = identities.get(pid)
+            if previous_identity is not None and previous_identity != identity:
+                raise ValueError("conflicting AGX identities")
+            identities[pid] = identity
+            counters[pid] = counters.get(pid, 0) + counter
+            current = None
+    if current is not None or not saw_structure or structure_depth != 0:
+        raise ValueError("unterminated AGX object")
+    return GpuCounterSnapshot(counters, identities, complete=True)
+
+
+class GPUProcessSampler:
+    """Derive per-process GPU percentages only from consecutive complete samples."""
+
+    def __init__(self) -> None:
+        self.previous: Optional[GpuCounterSnapshot] = None
+        self.previous_time: Optional[float] = None
+
+    def reset(self) -> None:
+        self.previous = None
+        self.previous_time = None
+
+    def update(
+        self,
+        snapshot: GpuCounterSnapshot,
+        completed_mono_s: float,
+        system_gpu_percent: Optional[float] = None,
+    ) -> GpuProcessSample:
+        if not isinstance(completed_mono_s, (int, float)) or isinstance(completed_mono_s, bool) or not math.isfinite(completed_mono_s) or not snapshot.complete:
+            self.reset()
+            return GpuProcessSample({}, snapshot.identities, snapshot.complete, False)
+        if self.previous is None or self.previous_time is None:
+            self.previous = snapshot
+            self.previous_time = float(completed_mono_s)
+            return GpuProcessSample({}, snapshot.identities, True, False)
+        elapsed = float(completed_mono_s) - self.previous_time
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            self.reset()
+            return GpuProcessSample({}, snapshot.identities, True, False)
+        for pid, counter in snapshot.counters_ns.items():
+            previous_counter = self.previous.counters_ns.get(pid)
+            if previous_counter is not None and self.previous.identities.get(pid) == snapshot.identities[pid] and counter < previous_counter:
+                self.reset()
+                return GpuProcessSample({}, snapshot.identities, True, False)
+        raw_percentages: dict[int, float] = {}
+        for pid, counter in snapshot.counters_ns.items():
+            previous_counter = self.previous.counters_ns.get(pid)
+            if previous_counter is None or self.previous.identities.get(pid) != snapshot.identities[pid]:
+                continue
+            raw_percentages[pid] = (counter - previous_counter) / elapsed / 10_000_000.0
+        total_percent = sum(raw_percentages.values())
+        scale = 1.0
+        if total_percent > 0 and isinstance(system_gpu_percent, (int, float)) and not isinstance(system_gpu_percent, bool) and math.isfinite(system_gpu_percent) and system_gpu_percent > 0:
+            scale = float(system_gpu_percent) / total_percent
+        self.previous = snapshot
+        self.previous_time = float(completed_mono_s)
+        return GpuProcessSample(
+            {pid: percent * scale for pid, percent in raw_percentages.items()},
+            snapshot.identities,
+            True,
+            True,
+        )
+
+
+def collect_process_rows() -> AdapterResult[tuple[ProcessRow, ...]]:
+    command = run_structured_command(
+        ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
+        category="process-table", timeout_s=2.0,
+        stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
+    )
+    if command.outcome is not AttemptOutcome.SUCCESS:
+        return AdapterResult(None, command.started_mono_s, command.completed_mono_s,
+                             command.completed_at_utc, command.outcome, command.failure)
+    try:
+        rows = parse_process_rows(command.stdout)
+    except ValueError:
+        return _process_evidence_error(command, command.stdout)
+    return AdapterResult(rows, command.started_mono_s, command.completed_mono_s,
+                         command.completed_at_utc, AttemptOutcome.SUCCESS, None)
+
+
+def collect_gpu_process_sample(
+    sampler: GPUProcessSampler,
+    system_gpu_percent: Optional[float],
+) -> AdapterResult[GpuProcessSample]:
+    command = run_structured_command(
+        ["/usr/sbin/ioreg", "-r", "-c", "AGXDeviceUserClient", "-l"],
+        category="process-gpu", timeout_s=2.0,
+        stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
+    )
+    if command.outcome is not AttemptOutcome.SUCCESS:
+        sampler.reset()
+        return AdapterResult(None, command.started_mono_s, command.completed_mono_s,
+                             command.completed_at_utc, command.outcome, command.failure)
+    try:
+        snapshot = parse_agx_counters(command.stdout)
+    except ValueError:
+        sampler.reset()
+        return _process_evidence_error(command, command.stdout)
+    sample = sampler.update(snapshot, command.completed_mono_s, system_gpu_percent)
+    return AdapterResult(sample, command.started_mono_s, command.completed_mono_s,
+                         command.completed_at_utc, AttemptOutcome.SUCCESS, None)
+
+
+def merge_gpu_process_rows(
+    rows: Sequence[ProcessRow],
+    gpu_state: SourceState[GpuProcessSample],
+    now_mono_s: float,
+) -> tuple[ProcessRow, ...]:
+    unknown = tuple(replace(row, gpu=None) for row in rows)
+    if (
+        gpu_state.source_id is not SourceId.PROCESS_GPU
+        or not isinstance(now_mono_s, (int, float))
+        or isinstance(now_mono_s, bool)
+        or not math.isfinite(now_mono_s)
+        or gpu_state.last_attempt is None
+        or gpu_state.last_attempt.outcome is not AttemptOutcome.SUCCESS
+        or gpu_state.last_valid is None
+        or gpu_state.last_valid.revision != gpu_state.last_attempt.revision
+    ):
+        return unknown
+    age = float(now_mono_s) - gpu_state.last_valid.completed_mono_s
+    if age < 0 or age > 15.0:
+        return unknown
+    sample = gpu_state.last_valid.value
+    if not sample.complete or not sample.baseline_ready:
+        return unknown
+    merged: list[ProcessRow] = []
+    for row in rows:
+        identity = sample.identities.get(row.pid)
+        if identity is None:
+            merged.append(replace(row, gpu=0.0))
+        elif process_identity(row.command) != identity:
+            merged.append(replace(row, gpu=None))
+        else:
+            merged.append(replace(row, gpu=sample.percentages.get(row.pid)))
+    return tuple(merged)
+
+
+def sort_process_rows(rows: Sequence[ProcessRow], sort_mode: str) -> list[ProcessRow]:
+    if sort_mode == "GPU":
+        return sorted(rows, key=lambda row: (row.gpu is None, -(row.gpu or 0.0)))
+    attribute = "mem" if sort_mode == "MEM" else "cpu"
+    return sorted(rows, key=lambda row: getattr(row, attribute), reverse=True)
+
+
+def process_rows(sort_mode: str) -> list[ProcessRow]:
+    return sort_process_rows(collect_process_rows().value or (), sort_mode)
 
 
 def color_for_percent(percent: float) -> int:
@@ -3555,7 +3815,8 @@ def system_read(
     )
     max_fan_pct = max((fan_percent(fan) for fan in sensor.fans), default=0.0)
     top_cpu = rows[0] if rows else None
-    top_gpu = max(rows, key=lambda row: row.gpu, default=None)
+    measured_gpu_rows = [row for row in rows if row.gpu is not None]
+    top_gpu = max(measured_gpu_rows, key=lambda row: row.gpu, default=None)
     net_bps = net_down + net_up
 
     settled_states = ("nominal", "pending", "checking", "unavailable")
@@ -3573,8 +3834,8 @@ def system_read(
         return (f"read: CPU is busy; {simple_process_name(top_cpu.command)} is the main pull.", "watch")
     if cpu_pct >= 72:
         return ("read: CPU is busy; something is working hard.", "watch")
-    if top_gpu and (sensor.gpu_active_percent or top_gpu.gpu) >= 45:
-        name = simple_process_name(top_gpu.command) if top_gpu.gpu >= 8 else "graphics work"
+    if top_gpu and (sensor.gpu_active_percent or top_gpu.gpu or 0.0) >= 45:
+        name = simple_process_name(top_gpu.command) if (top_gpu.gpu or 0.0) >= 8 else "graphics work"
         return (f"read: GPU is busy; {name} is driving it.", "watch")
     if max_fan_pct >= 75:
         return ("read: Fans are high; this is a sustained workload.", "watch")
@@ -4325,19 +4586,19 @@ def draw_process_panel(
         if compact:
             command_width = max(10, w - 34)
             line = (
-                f"{row.pid:>6} {row.cpu:6.1f} {row.mem:5.1f} {row.gpu:4.0f} "
+                f"{row.pid:>6} {row.cpu:6.1f} {row.mem:5.1f} {(f'{row.gpu:4.0f}' if row.gpu is not None else '--'):>4} "
                 f"{row.stat:<4.4} {visible_command(row.command, command_width)}"
             )
         else:
             command_width = max(8, w - 49)
             line = (
-                f"{row.pid:>6}  {row.cpu:6.1f} {row.mem:5.1f} {row.gpu:5.1f} "
+                f"{row.pid:>6}  {row.cpu:6.1f} {row.mem:5.1f} {(f'{row.gpu:5.1f}' if row.gpu is not None else '--'):>5} "
                 f"{row.stat:<5.5} {row.etime:>9.9}  {visible_command(row.command, command_width)}"
             )
         if sort_mode == "MEM":
             metric, critical, warning = row.mem, 10.0, 3.0
         elif sort_mode == "GPU":
-            metric, critical, warning = row.gpu, 80.0, 35.0
+            metric, critical, warning = row.gpu or 0.0, 80.0, 35.0
         else:
             metric, critical, warning = row.cpu, 80.0, 35.0
         attr = color_pair(1)
@@ -4461,7 +4722,6 @@ def hud(screen: curses.window) -> None:
     uptime_at_start = boot_seconds()
     uptime_clock_start = time.monotonic()
     cpu_sampler = MacCpuSampler()
-    gpu_sampler = GPUProcessSampler()
     per_core = cpu_sampler.sample()
     runtime_stats = collect_runtime_stats()
     runtime_poller = AsyncPoller(
@@ -4478,7 +4738,7 @@ def hud(screen: curses.window) -> None:
     process_source_rows: list[ProcessRow] = []
     process_poller = AsyncPoller(
         PROCESS_REFRESH_SECONDS,
-        lambda: collect_process_rows(gpu_sampler, sensor.gpu_active_percent),
+        lambda: list(collect_process_rows().value or ()),
         process_source_rows,
     )
     rows: list[ProcessRow] = []
@@ -4740,9 +5000,6 @@ def collect_snapshot() -> dict[str, Any]:
     cpu_sampler = MacCpuSampler()
     time.sleep(0.25)
     per_core = cpu_sampler.sample()
-    gpu_sampler = GPUProcessSampler()
-    gpu_sampler.sample()
-
     with ThreadPoolExecutor(max_workers=6, thread_name_prefix="porkyhud-snapshot") as pool:
         static_future = pool.submit(collect_static_info)
         memory_future = pool.submit(memory_stats)
@@ -4756,7 +5013,7 @@ def collect_snapshot() -> dict[str, Any]:
         sensor = sensor_future.result()
         disk = disk_future.result()
         activity = activity_future.result()
-    rows = process_rows("CPU", gpu_sampler, sensor.gpu_active_percent)[:12]
+    rows = process_rows("CPU")[:12]
     read_text, read_level = system_read(per_core, mem, disk, activity, battery, sensor, rows)
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -4814,7 +5071,9 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
     print(f"Disk: {human_bytes(disk['activity']['bytes_per_sec'])}/s, {disk['activity']['iops']:.0f} iops")
     print("Top processes:")
     for row in snapshot["processes"][:8]:
-        print(f"  {row['pid']:>6} CPU {row['cpu']:5.1f}% MEM {row['mem']:4.1f}% GPU {row['gpu']:4.1f}%  {visible_command(row['command'], 72)}")
+        gpu = row.get("gpu")
+        gpu_text = f"{gpu:4.1f}%" if gpu is not None else "  --"
+        print(f"  {row['pid']:>6} CPU {row['cpu']:5.1f}% MEM {row['mem']:4.1f}% GPU {gpu_text}  {visible_command(row['command'], 72)}")
 
 
 def main(argv: list[str] | None = None) -> int:

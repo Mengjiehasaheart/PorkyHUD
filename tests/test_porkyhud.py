@@ -2225,6 +2225,230 @@ class LayoutAndRenderingTests(unittest.TestCase):
             self.assertIn("TTY", porkyhud.terminal_ui_problem())
 
 
+class ProcessEvidenceTests(unittest.TestCase):
+    """Process and AGX evidence contracts keep absence distinct from unknown."""
+
+    PS_FIXTURE = (
+        "  42 80.0 2.0 R 00:10 /Applications/Xcode.app/Contents/MacOS/Xcode --token secret\n"
+        "   7  4.0 1.5 S 01:02 /usr/bin/worker --mode test\n"
+    )
+    AGX_FIRST = """
+ +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, registered, matched, active, busy 0 (1 ms), retain 8> {
+     \"IOUserClientCreator\" = \"pid 42, Xcode\"
+     \"accumulatedGPUTime\" = 100000000
+ }
+"""
+    AGX_SECOND = """
+ +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, registered, matched, active, busy 0 (1 ms), retain 8> {
+     \"IOUserClientCreator\" = \"pid 42, Xcode\"
+     \"accumulatedGPUTime\" = 200000000
+ }
+"""
+
+    def command_result(
+        self,
+        stdout: str,
+        outcome: core.AttemptOutcome = core.AttemptOutcome.SUCCESS,
+        failure: core.FailureCode | None = None,
+    ) -> porkyhud.CommandResult:
+        return porkyhud.CommandResult(
+            "fixture", stdout, "", 0 if outcome is core.AttemptOutcome.SUCCESS else None,
+            10.0, 10.2, datetime(2026, 8, 12, 12, tzinfo=timezone.utc), outcome, failure,
+        )
+
+    def successful_gpu_state(
+        self, value: object, completed: float = 10.0
+    ) -> core.SourceState[object]:
+        state = core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0)
+        state, revision = core.start_attempt(state, completed - 0.1)
+        return core.complete_success(
+            state, revision, value, completed, datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        )
+
+    def test_process_table_succeeds_without_agx_and_uses_its_own_structured_command(self) -> None:
+        with mock.patch.object(
+            porkyhud, "run_structured_command", return_value=self.command_result(self.PS_FIXTURE)
+        ) as command, mock.patch.object(porkyhud, "run_command", side_effect=AssertionError("legacy command")):
+            result = porkyhud.collect_process_rows()
+
+        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+        self.assertEqual([row.pid for row in result.value or ()], [42, 7])
+        self.assertTrue(all(row.gpu is None for row in result.value or ()))
+        command.assert_called_once_with(
+            ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
+            category="process-table", timeout_s=2.0,
+            stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
+        )
+
+    def test_process_parser_rejects_malformed_duplicate_and_invalid_rows_as_one_table(self) -> None:
+        invalid = (
+            "42 1 2 R 00:01 /bin/one\nnot enough\n",
+            "42 1 2 R 00:01 /bin/one\n42 1 2 S 00:02 /bin/two\n",
+            "0 1 2 R 00:01 /bin/one\n",
+            "4 NaN 2 R 00:01 /bin/one\n",
+            "4 1 -2 R 00:01 /bin/one\n",
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                porkyhud.parse_process_rows(raw)
+
+    def test_process_failures_and_empty_output_preserve_truthful_outcomes(self) -> None:
+        failed = self.command_result(
+            "", core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT
+        )
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=failed):
+            result = porkyhud.collect_process_rows()
+        self.assertEqual((result.outcome, result.failure), (failed.outcome, failed.failure))
+        self.assertEqual((result.started_mono_s, result.completed_mono_s), (10.0, 10.2))
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result("\n")):
+            empty = porkyhud.collect_process_rows()
+        self.assertEqual((empty.outcome, empty.failure), (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.EMPTY_OUTPUT))
+
+    def test_elapsed_identity_and_display_cells_are_conservative(self) -> None:
+        self.assertEqual(porkyhud.parse_elapsed_seconds("01:02"), 62)
+        self.assertEqual(porkyhud.parse_elapsed_seconds("01:02:03"), 3723)
+        self.assertEqual(porkyhud.parse_elapsed_seconds("2-01:02:03"), 176523)
+        self.assertIsNone(porkyhud.parse_elapsed_seconds("tomorrow"))
+        self.assertEqual(
+            porkyhud.process_identity(" /Applications/My App.app/Contents/MacOS/My App --secret yes"),
+            "My App",
+        )
+        self.assertEqual(porkyhud.process_identity("/usr/bin/wo\u200brker\n--flag"), "worker")
+        self.assertEqual(porkyhud.display_cell_width("e\u0301界"), 3)
+        self.assertEqual(porkyhud.truncate_display_cells("a" * 32 + "界", 32), "a" * 32)
+        self.assertEqual(porkyhud.truncate_display_cells("界" * 17, 32), "界" * 16)
+
+    def test_process_facts_remove_raw_arguments_and_cap_only_the_display_name(self) -> None:
+        command = "/Applications/Very Long\u200b Application.app/Contents/MacOS/Main --api-key leaked"
+        facts = porkyhud.process_facts((porkyhud.ProcessRow(3, 4.0, 1.0, None, "R", "bad", command),))
+        self.assertEqual(facts[0].name, "Very Long Application")
+        self.assertIsNone(facts[0].elapsed_seconds)
+        self.assertNotIn("leaked", facts[0].name)
+        self.assertLessEqual(porkyhud.display_cell_width(facts[0].name), 32)
+
+    def test_agx_parser_is_complete_immutable_and_all_or_nothing(self) -> None:
+        parsed = porkyhud.parse_agx_counters(self.AGX_FIRST)
+        self.assertTrue(parsed.complete)
+        self.assertEqual(dict(parsed.counters_ns), {42: 100000000})
+        with self.assertRaises(TypeError):
+            parsed.counters_ns[42] = 1  # type: ignore[index]
+        valid_empty = porkyhud.parse_agx_counters("+-o IORegistryEntry <class IORegistryEntry> {\n}\n")
+        self.assertTrue(valid_empty.complete)
+        self.assertEqual(dict(valid_empty.counters_ns), {})
+        for raw in (
+            "\n",
+            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 42, Xcode"\n',
+            '"accumulatedGPUTime" = 9\n',
+            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 0, Xcode"\n "accumulatedGPUTime" = 9\n }\n',
+            ' +-o AGXDeviceUserClient <class AGXDeviceUserClient> {\n "IOUserClientCreator" = "pid 42, Xcode"\n "accumulatedGPUTime" = -9\n }\n',
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                porkyhud.parse_agx_counters(raw)
+
+    def test_agx_parser_sums_matching_clients_and_rejects_identity_conflicts(self) -> None:
+        repeated = self.AGX_FIRST + self.AGX_SECOND.replace("200000000", "25")
+        parsed = porkyhud.parse_agx_counters(repeated)
+        self.assertEqual(dict(parsed.counters_ns), {42: 100000025})
+        conflicting = repeated.replace("Xcode", "Other", 1)
+        with self.assertRaises(ValueError):
+            porkyhud.parse_agx_counters(conflicting)
+
+    def test_gpu_sample_defensively_copies_mutable_input_maps(self) -> None:
+        percentages = {42: 1.0}
+        identities = {42: "Xcode"}
+        sample = porkyhud.GpuProcessSample(percentages, identities, True, True)
+        percentages[42] = 99.0
+        identities[42] = "Other"
+        self.assertEqual((sample.percentages[42], sample.identities[42]), (1.0, "Xcode"))
+
+    def test_gpu_collection_uses_its_own_structured_command_and_rejects_parser_failures(self) -> None:
+        sampler = porkyhud.GPUProcessSampler()
+        with mock.patch.object(
+            porkyhud, "run_structured_command", return_value=self.command_result(self.AGX_FIRST)
+        ) as command:
+            result = porkyhud.collect_gpu_process_sample(sampler, None)
+        self.assertEqual(result.outcome, core.AttemptOutcome.SUCCESS)
+        command.assert_called_once_with(
+            ["/usr/sbin/ioreg", "-r", "-c", "AGXDeviceUserClient", "-l"],
+            category="process-gpu", timeout_s=2.0,
+            stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
+        )
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result("unterminated")):
+            rejected = porkyhud.collect_gpu_process_sample(sampler, None)
+        self.assertEqual((rejected.outcome, rejected.failure),
+                         (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.PARSER_REJECTED))
+
+    def test_gpu_sampler_distinguishes_baseline_zero_reversal_and_calibration(self) -> None:
+        sampler = porkyhud.GPUProcessSampler()
+        first = sampler.update(porkyhud.parse_agx_counters(self.AGX_FIRST), 10.0)
+        self.assertFalse(first.baseline_ready)
+        second = sampler.update(porkyhud.parse_agx_counters(self.AGX_FIRST), 11.0)
+        self.assertTrue(second.baseline_ready)
+        self.assertEqual(second.percentages[42], 0.0)
+        third = sampler.update(porkyhud.parse_agx_counters(self.AGX_SECOND), 12.0, 50.0)
+        self.assertEqual(third.percentages[42], 50.0)
+        reversed_sample = sampler.update(porkyhud.parse_agx_counters(self.AGX_FIRST), 13.0)
+        self.assertFalse(reversed_sample.baseline_ready)
+
+    def test_gpu_collection_resets_after_failure_and_recovery_cannot_bridge(self) -> None:
+        sampler = porkyhud.GPUProcessSampler()
+        with mock.patch.object(porkyhud, "run_structured_command", side_effect=[
+            self.command_result(self.AGX_FIRST),
+            self.command_result("", core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT),
+            self.command_result(self.AGX_SECOND),
+        ]):
+            first = porkyhud.collect_gpu_process_sample(sampler, None)
+            failed = porkyhud.collect_gpu_process_sample(sampler, None)
+            recovered = porkyhud.collect_gpu_process_sample(sampler, None)
+        self.assertFalse((first.value or object()).baseline_ready)
+        self.assertEqual(failed.outcome, core.AttemptOutcome.TIMEOUT)
+        self.assertFalse((recovered.value or object()).baseline_ready)
+
+    def test_gpu_merge_requires_fresh_complete_identity_match(self) -> None:
+        rows = (porkyhud.ProcessRow(42, 80.0, 2.0, None, "R", "00:10", "/Applications/Xcode.app/Xcode"),)
+        gpu = porkyhud.GpuProcessSample({42: 37.5}, {42: "Xcode"}, complete=True, baseline_ready=True)
+        state = self.successful_gpu_state(gpu, completed=10.0)
+        merged = porkyhud.merge_gpu_process_rows(rows, state, 10.5)
+        self.assertEqual(merged[0].gpu, 37.5)
+        self.assertEqual(porkyhud.merge_gpu_process_rows(rows, state, 25.0)[0].gpu, 37.5)
+        self.assertIsNone(porkyhud.merge_gpu_process_rows(rows, state, 25.01)[0].gpu)
+        empty = porkyhud.GpuProcessSample({}, {}, complete=True, baseline_ready=True)
+        self.assertEqual(porkyhud.merge_gpu_process_rows(rows, self.successful_gpu_state(empty), 10.5)[0].gpu, 0.0)
+        partial = porkyhud.GpuProcessSample({}, {}, complete=False, baseline_ready=True)
+        self.assertIsNone(porkyhud.merge_gpu_process_rows(rows, self.successful_gpu_state(partial), 10.5)[0].gpu)
+        mismatch = porkyhud.GpuProcessSample({42: 3.0}, {42: "Other"}, complete=True, baseline_ready=True)
+        self.assertIsNone(porkyhud.merge_gpu_process_rows(rows, self.successful_gpu_state(mismatch), 10.5)[0].gpu)
+
+    def test_gpu_merge_rejects_latest_failure_and_gpu_sorting_keeps_unknown_last(self) -> None:
+        sample = porkyhud.GpuProcessSample({42: 0.0}, {42: "Xcode"}, complete=True, baseline_ready=True)
+        state = self.successful_gpu_state(sample)
+        active, revision = core.start_attempt(state, 11.0)
+        failed = core.complete_failure(active, revision, core.AttemptOutcome.TIMEOUT,
+                                       core.FailureCode.COMMAND_TIMEOUT, 11.1,
+                                       datetime(2026, 8, 12, 12, tzinfo=timezone.utc))
+        rows = [
+            porkyhud.ProcessRow(1, 1.0, 1.0, None, "S", "00:01", "/bin/unknown"),
+            porkyhud.ProcessRow(2, 1.0, 1.0, 0.0, "S", "00:01", "/bin/zero"),
+            porkyhud.ProcessRow(3, 1.0, 1.0, 5.0, "S", "00:01", "/bin/high"),
+        ]
+        self.assertTrue(all(row.gpu is None for row in porkyhud.merge_gpu_process_rows(rows, failed, 11.2)))
+        self.assertEqual([row.pid for row in porkyhud.sort_process_rows(rows, "GPU")], [3, 2, 1])
+
+    def test_renderer_and_text_snapshot_show_unknown_gpu_as_dashes(self) -> None:
+        screen = FakeScreen(10, 70)
+        rows = [porkyhud.ProcessRow(1, 2.0, 3.0, None, "S", "00:01", "/bin/task")]
+        with mock.patch.object(porkyhud, "color_pair", return_value=0):
+            porkyhud.draw_process_panel(screen, 1, 1, 8, 64, rows, 0, "GPU")
+        self.assertIn("--", "\n".join(screen.row(index) for index in range(1, 9)))
+        snapshot = {"system": {}, "cpu": {"average_percent": 0.0, "cores": []},
+                    "memory": {"used_bytes": 0, "total_bytes": 0, "used_percent": 0.0},
+                    "sensors": {}, "disk": {"activity": {"bytes_per_sec": 0, "iops": 0}},
+                    "processes": [{"pid": 1, "cpu": 2.0, "mem": 3.0, "gpu": None, "command": "/bin/task"}]}
+        with mock.patch("builtins.print") as output:
+            porkyhud.print_text_snapshot(snapshot)
+        self.assertIn("GPU   --", "\n".join(str(call.args[0]) for call in output.call_args_list))
+
+
 class RuntimeProcessAndSnapshotTests(unittest.TestCase):
     def test_signal_during_palette_setup_still_restores_terminal_colors(self) -> None:
         stdout = mock.Mock()
@@ -2310,23 +2534,15 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         raw = """
           10  12.5  1.2 R  00:01 /usr/bin/alpha --token hidden
           20   5.0  9.5 S  01:02 /usr/bin/beta --mode worker
-        invalid row
         """
-
-        class FakeGpuSampler:
-            def __init__(self) -> None:
-                self.samples: list[float | None] = []
-
-            def sample(self, system_gpu_percent: float | None = None) -> dict[int, float]:
-                self.samples.append(system_gpu_percent)
-                return {10: 3.0, 20: 70.0}
-
-        sampler = FakeGpuSampler()
-        with mock.patch.object(porkyhud, "run_command", return_value=raw):
-            rows = porkyhud.collect_process_rows(sampler, 42.0)
+        result = porkyhud.CommandResult(
+            "process-table", raw, "", 0, 10.0, 10.2,
+            datetime(2026, 8, 12, 12, tzinfo=timezone.utc), core.AttemptOutcome.SUCCESS, None,
+        )
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=result):
+            rows = list(porkyhud.collect_process_rows().value or ())
         self.assertEqual([row.pid for row in rows], [10, 20])
-        self.assertEqual([row.gpu for row in rows], [3.0, 70.0])
-        self.assertEqual(sampler.samples, [42.0])
+        self.assertEqual([row.gpu for row in rows], [None, None])
 
         original_order = [row.pid for row in rows]
         self.assertEqual(
@@ -2339,7 +2555,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(
             [row.pid for row in porkyhud.sort_process_rows(rows, "GPU")],
-            [20, 10],
+            [10, 20],
         )
         self.assertEqual([row.pid for row in rows], original_order)
 
@@ -2365,7 +2581,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             42,
             20.0,
             1.0,
-            2.0,
+            None,
             "R",
             "00:01",
             "/usr/bin/worker --api-key snapshot-secret --mode test",
@@ -2374,10 +2590,6 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         class FakeCpuSampler:
             def sample(self) -> list[float]:
                 return [25.0, 75.0]
-
-        class FakeGpuSampler:
-            def sample(self, _system_gpu_percent: float | None = None) -> dict[int, float]:
-                return {}
 
         with mock.patch.object(porkyhud, "collect_static_info", return_value=static), mock.patch.object(
             porkyhud,
@@ -2395,8 +2607,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             porkyhud,
             "disk_activity",
             return_value=activity,
-        ), mock.patch.object(porkyhud, "GPUProcessSampler", FakeGpuSampler), mock.patch.object(
-            porkyhud,
+        ), mock.patch.object(porkyhud,
             "process_rows",
             return_value=[process],
         ), mock.patch.object(porkyhud.time, "strftime", return_value="2026-01-01T00:00:00+0000"):
@@ -2414,8 +2625,9 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         command = snapshot["processes"][0]["command"]
         self.assertNotIn("snapshot-secret", command)
         self.assertIn("<redacted>", command)
+        self.assertIsNone(snapshot["processes"][0]["gpu"])
         self.assertFalse(snapshot["battery"]["present"])
-        json.dumps(snapshot)
+        self.assertIsNone(json.loads(json.dumps(snapshot))["processes"][0]["gpu"])
 
 
 if __name__ == "__main__":
