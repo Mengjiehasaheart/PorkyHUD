@@ -536,6 +536,8 @@ def run_structured_command(
     limits = {"stdout": stdout_limit, "stderr": stderr_limit}
     failure: Optional[FailureCode] = None
     outcome: Optional[AttemptOutcome] = None
+    result_payload: Optional[tuple[str, str, AttemptOutcome, Optional[FailureCode]]] = None
+    terminate_process_group = False
 
     try:
         process = subprocess.Popen(
@@ -609,41 +611,48 @@ def run_structured_command(
                     outcome = AttemptOutcome.TIMEOUT
                     failure = FailureCode.COMMAND_TIMEOUT
         if failure is not None:
-            _terminate_and_reap_process_group(process)
-            return _command_result(
-                category, "", "",
-                process.returncode,
-                started_mono_s,
-                outcome or AttemptOutcome.UNKNOWN_ERROR,
-                failure,
+            terminate_process_group = True
+            result_payload = (
+                "", "", outcome or AttemptOutcome.UNKNOWN_ERROR, failure,
             )
-
-        try:
-            stdout = bytes(buffers["stdout"]).decode("utf-8", "strict")
-            stderr = bytes(buffers["stderr"]).decode("utf-8", "strict")
-        except UnicodeDecodeError:
-            return _command_result(
-                category, "", "", process.returncode, started_mono_s,
-                AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
-            )
-        if process.returncode != 0:
-            return _command_result(
-                category, stdout, stderr, process.returncode, started_mono_s,
-                AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
-            )
-        return _command_result(
-            category, stdout, stderr, process.returncode, started_mono_s,
-            AttemptOutcome.SUCCESS, None,
-        )
+        else:
+            try:
+                stdout = bytes(buffers["stdout"]).decode("utf-8", "strict")
+                stderr = bytes(buffers["stderr"]).decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                terminate_process_group = True
+                result_payload = (
+                    "", "", AttemptOutcome.COMMAND_ERROR, FailureCode.DECODE_ERROR,
+                )
+            else:
+                if process.returncode != 0:
+                    result_payload = (
+                        stdout, stderr, AttemptOutcome.COMMAND_ERROR, FailureCode.NONZERO_EXIT,
+                    )
+                else:
+                    result_payload = (stdout, stderr, AttemptOutcome.SUCCESS, None)
     except Exception:
-        _terminate_and_reap_process_group(process)
-        return _command_result(
-            category, "", "", process.returncode, started_mono_s,
-            AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+        terminate_process_group = True
+        result_payload = (
+            "", "", AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
         )
+    except BaseException:
+        terminate_process_group = True
+        raise
     finally:
-        _close_command_streams(selector, streams)
-        selector.close()
+        try:
+            if terminate_process_group:
+                _terminate_and_reap_process_group(process)
+        finally:
+            _close_command_streams(selector, streams)
+            selector.close()
+
+    assert result_payload is not None
+    stdout, stderr, result_outcome, result_failure = result_payload
+    return _command_result(
+        category, stdout, stderr, process.returncode, started_mono_s,
+        result_outcome, result_failure,
+    )
 
 
 def sysctl_value(name: str) -> str:

@@ -243,6 +243,79 @@ class StructuredCommandTests(unittest.TestCase):
         self.assertEqual(result.outcome, core.AttemptOutcome.COMMAND_ERROR)
         self.assertEqual(result.failure, failure)
 
+    def descendant_fixture(self, directory: str, emit_invalid_utf8: bool) -> tuple[str, str, str]:
+        pid_path = os.path.join(directory, "pids")
+        heartbeat_path = os.path.join(directory, "heartbeat")
+        descendant_code = (
+            "import os, pathlib, signal, time\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "path = pathlib.Path(%r)\n"
+            "while True:\n"
+            "    path.write_text(str(time.monotonic()))\n"
+            "    time.sleep(0.01)\n"
+        ) % heartbeat_path
+        parent_code = (
+            "import os, pathlib, subprocess, sys, time\n"
+            "pids = pathlib.Path(%r)\n"
+            "pids.write_text(str(os.getpid()) + '\\n')\n"
+            "child = subprocess.Popen([sys.executable, '-c', %r])\n"
+            "pids.write_text(pids.read_text() + str(child.pid) + '\\n')\n"
+            "heartbeat = pathlib.Path(%r)\n"
+            "deadline = time.monotonic() + 1.0\n"
+            "while not heartbeat.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+        ) % (pid_path, descendant_code, heartbeat_path)
+        if emit_invalid_utf8:
+            parent_code += "sys.stdout.buffer.write(b'\\xff'); sys.stdout.flush()"
+        else:
+            parent_code += "time.sleep(60)"
+        return parent_code, pid_path, heartbeat_path
+
+    def wait_for_heartbeat(self, heartbeat_path: str) -> str:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if os.path.exists(heartbeat_path):
+                with open(heartbeat_path, encoding="utf-8") as heartbeat:
+                    return heartbeat.read()
+            time.sleep(0.01)
+        self.fail("descendant never became live")
+
+    def assert_heartbeat_stopped(self, heartbeat_path: str) -> None:
+        before = self.wait_for_heartbeat(heartbeat_path)
+        time.sleep(0.08)
+        with open(heartbeat_path, encoding="utf-8") as heartbeat:
+            self.assertEqual(heartbeat.read(), before)
+
+    def cleanup_recorded_process_group(self, pid_path: str) -> None:
+        if not os.path.exists(pid_path):
+            return
+        with open(pid_path, encoding="utf-8") as pids:
+            values = [int(value) for value in pids.read().splitlines() if value]
+        if values:
+            try:
+                os.killpg(values[0], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def assert_recorded_processes_are_gone(self, pid_path: str) -> None:
+        with open(pid_path, encoding="utf-8") as pids:
+            values = [int(value) for value in pids.read().splitlines() if value]
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            remaining = []
+            for pid in values:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                remaining.append(pid)
+            if not remaining:
+                return
+            time.sleep(0.02)
+        self.fail("recorded process remained after structured cleanup")
+
     def test_success_is_bounded_classified_and_uses_c_locale(self) -> None:
         original_locale = os.environ.get("LC_ALL")
         result = self.run_fixture(
@@ -329,6 +402,53 @@ class StructuredCommandTests(unittest.TestCase):
         self.assert_command_error(invalid, core.FailureCode.DECODE_ERROR)
         self.assertEqual(invalid.stdout, "")
         self.assertEqual(invalid.stderr, "")
+
+    def test_decode_failure_terminates_a_live_descendant_after_leader_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=True)
+            try:
+                result = self.run_fixture(code, timeout_s=1.0)
+                self.assert_command_error(result, core.FailureCode.DECODE_ERROR)
+                self.assert_heartbeat_stopped(heartbeat_path)
+            finally:
+                self.cleanup_recorded_process_group(pid_path)
+
+    def test_selector_interruption_reaps_group_and_reraises_original_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code, pid_path, heartbeat_path = self.descendant_fixture(directory, emit_invalid_utf8=False)
+            interruption = KeyboardInterrupt("fixture interruption")
+            real_selector = porkyhud.selectors.DefaultSelector
+
+            class InterruptingSelector:
+                def __init__(self) -> None:
+                    self._selector = real_selector()
+
+                def register(self, *args: object, **kwargs: object) -> object:
+                    return self._selector.register(*args, **kwargs)
+
+                def unregister(self, *args: object, **kwargs: object) -> object:
+                    return self._selector.unregister(*args, **kwargs)
+
+                def get_map(self) -> object:
+                    return self._selector.get_map()
+
+                def select(self, _timeout: float | None = None) -> object:
+                    self_outer.wait_for_heartbeat(heartbeat_path)
+                    raise interruption
+
+                def close(self) -> None:
+                    self._selector.close()
+
+            self_outer = self
+            try:
+                with mock.patch.object(porkyhud.selectors, "DefaultSelector", InterruptingSelector):
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        self.run_fixture(code, timeout_s=1.0)
+                self.assertIs(raised.exception, interruption)
+                self.assert_heartbeat_stopped(heartbeat_path)
+                self.assert_recorded_processes_are_gone(pid_path)
+            finally:
+                self.cleanup_recorded_process_group(pid_path)
 
     def test_timeout_terminates_a_child_ignoring_sigterm(self) -> None:
         started = time.monotonic()
