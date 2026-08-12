@@ -7,6 +7,8 @@ import unittest
 
 from porkyhud_core import (
     AttemptOutcome,
+    ContributorState,
+    CpuContributor,
     CpuUsage,
     CpuWindow,
     CpuWindowSummary,
@@ -18,6 +20,7 @@ from porkyhud_core import (
     MemoryPressureLevel,
     OsThermalState,
     ProcessFact,
+    ProcessHistory,
     Sample,
     SourceId,
     SourceViewStatus,
@@ -31,6 +34,7 @@ from porkyhud_core import (
     new_source,
     reduce_cpu_window,
     reduce_cpu_latch,
+    reduce_process_history,
     reduce_memory_latch,
     reduce_storage_latch,
     reduce_thermal_latch,
@@ -38,6 +42,7 @@ from porkyhud_core import (
     sample_age_s,
     source_view,
     start_attempt,
+    select_cpu_contributor,
 )
 
 
@@ -307,6 +312,252 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(view.status, SourceViewStatus.STALE)
         self.assertTrue(view.refreshing)
         self.assertFalse(view.decision_ready)
+
+
+class ContributorTests(unittest.TestCase):
+    """Conservative two-sample CPU-attribution contracts."""
+
+    def process_source(self, rows, completed, previous=None):
+        state = previous or new_source(SourceId.PROCESS_TABLE, 1.0, 7.5)
+        active, revision = start_attempt(state, completed - 0.1)
+        return complete_success(active, revision, rows, completed, UTC_NOW)
+
+    def failed_process_source(self, previous, completed):
+        active, revision = start_attempt(previous, completed - 0.1)
+        return complete_failure(
+            active,
+            revision,
+            AttemptOutcome.TIMEOUT,
+            FailureCode.COMMAND_TIMEOUT,
+            completed,
+            UTC_NOW,
+        )
+
+    def history_for(self, first, second):
+        source = self.process_source(first, 1.0)
+        history = reduce_process_history(ProcessHistory(), source)
+        source = self.process_source(second, 3.0, source)
+        return reduce_process_history(history, source), source
+
+    def test_requires_stable_identity_and_clear_dominance(self):
+        first = (
+            ProcessFact(42, "Xcode", 30.0, 100),
+            ProcessFact(7, "runner", 10.0, 50),
+        )
+        second = (
+            ProcessFact(42, "Xcode", 36.0, 102),
+            ProcessFact(7, "runner", 20.0, 52),
+        )
+        history, source = self.history_for(first, second)
+
+        contributor = select_cpu_contributor(history, source, 3.0)
+
+        self.assertEqual(contributor.state, ContributorState.LEADING)
+        self.assertEqual(contributor.name, "Xcode")
+        self.assertEqual(contributor.source_revision, 2)
+
+    def test_threshold_and_ratio_boundaries_do_not_overstate_a_leader(self):
+        cases = (
+            (24.9999, 0.0, ContributorState.NO_CLEAR_LEADER),
+            (25.0, 0.0, ContributorState.LEADING),
+            (30.0, 20.0, ContributorState.LEADING),
+            (29.9999, 20.0, ContributorState.NO_CLEAR_LEADER),
+            (30.0, 30.0, ContributorState.NO_CLEAR_LEADER),
+        )
+        for top_cpu, runner_cpu, expected in cases:
+            with self.subTest(top_cpu=top_cpu, runner_cpu=runner_cpu):
+                first = (
+                    ProcessFact(42, "Xcode", 10.0, 100),
+                    ProcessFact(7, "runner", 10.0, 50),
+                )
+                second = (ProcessFact(42, "Xcode", top_cpu, 102),)
+                if runner_cpu:
+                    second += (ProcessFact(7, "runner", runner_cpu, 52),)
+                history, source = self.history_for(first, second)
+                self.assertEqual(
+                    select_cpu_contributor(history, source, 3.0).state,
+                    expected,
+                )
+
+    def test_empty_valid_table_has_no_clear_leader(self):
+        history, source = self.history_for((), ())
+        contributor = select_cpu_contributor(history, source, 3.0)
+        self.assertEqual(contributor.state, ContributorState.NO_CLEAR_LEADER)
+        self.assertIsNone(contributor.name)
+        self.assertIsNone(contributor.source_revision)
+
+    def test_pid_reuse_name_or_elapsed_change_disqualifies_the_top_process(self):
+        cases = (
+            ((ProcessFact(42, "Xcode", 10.0, 100),),
+             (ProcessFact(42, "Other", 40.0, 102),)),
+            ((ProcessFact(42, "Xcode", 10.0, 100),),
+             (ProcessFact(42, "Xcode", 40.0, 99),)),
+            ((ProcessFact(42, "Xcode", 10.0, 100),),
+             (ProcessFact(42, "Xcode", 40.0, None),)),
+            ((ProcessFact(42, "Xcode", 10.0, None),),
+             (ProcessFact(42, "Xcode", 40.0, 102),)),
+        )
+        for first, second in cases:
+            with self.subTest(first=first, second=second):
+                history, source = self.history_for(first, second)
+                self.assertEqual(
+                    select_cpu_contributor(history, source, 3.0).state,
+                    ContributorState.NO_CLEAR_LEADER,
+                )
+
+    def test_unstable_top_process_cannot_promote_a_lower_stable_process(self):
+        first = (
+            ProcessFact(42, "Xcode", 10.0, 100),
+            ProcessFact(7, "runner", 10.0, 50),
+        )
+        second = (
+            ProcessFact(42, "New Xcode", 60.0, 102),
+            ProcessFact(7, "runner", 35.0, 52),
+        )
+        history, source = self.history_for(first, second)
+        self.assertEqual(
+            select_cpu_contributor(history, source, 3.0).state,
+            ContributorState.NO_CLEAR_LEADER,
+        )
+
+    def test_history_clears_on_failure_and_skipped_attempts_never_bridge(self):
+        first = (ProcessFact(42, "Xcode", 30.0, 100),)
+        second = (ProcessFact(42, "Xcode", 36.0, 102),)
+        source = self.process_source(first, 1.0)
+        history = reduce_process_history(ProcessHistory(), source)
+        failed = self.failed_process_source(source, 2.0)
+        cleared = reduce_process_history(history, failed)
+        self.assertEqual((cleared.previous, cleared.current), ((), ()))
+        self.assertEqual(cleared.last_attempt_revision, 2)
+
+        source = self.process_source(second, 3.0, failed)
+        reset = reduce_process_history(history, source)
+        self.assertEqual(reset.previous, ())
+        self.assertEqual(reset.current, second)
+        self.assertEqual(reset.current_revision, 3)
+
+    def test_skipped_successful_source_revision_resets_to_current_only(self):
+        first = (ProcessFact(42, "Xcode", 30.0, 100),)
+        second = (ProcessFact(42, "Xcode", 36.0, 102),)
+        third = (ProcessFact(42, "Xcode", 40.0, 104),)
+        source = self.process_source(first, 1.0)
+        history = reduce_process_history(ProcessHistory(), source)
+        source = self.process_source(second, 2.0, source)
+        source = self.process_source(third, 3.0, source)
+        reset = reduce_process_history(history, source)
+        self.assertEqual(reset.previous, ())
+        self.assertEqual(reset.current, third)
+        self.assertEqual(reset.current_revision, 3)
+
+    def test_duplicate_attempt_is_identity_idempotent(self):
+        source = self.process_source((ProcessFact(42, "Xcode", 30.0, 100),), 1.0)
+        history = reduce_process_history(ProcessHistory(), source)
+        self.assertIs(reduce_process_history(history, source), history)
+
+    def test_history_attempt_revision_cannot_recede(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        source = self.process_source(rows, 1.0)
+        newer_history = ProcessHistory(
+            current=rows,
+            current_revision=2,
+            last_attempt_revision=2,
+        )
+        with self.assertRaises(ValueError):
+            reduce_process_history(newer_history, source)
+
+    def test_attribution_requires_latest_success_two_samples_and_freshness(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        source = self.process_source(rows, 1.0)
+        history = reduce_process_history(ProcessHistory(), source)
+        self.assertEqual(
+            select_cpu_contributor(history, source, 1.0).state,
+            ContributorState.UNAVAILABLE,
+        )
+        source = self.process_source(rows, 3.0, source)
+        history = reduce_process_history(history, source)
+        self.assertEqual(
+            select_cpu_contributor(history, source, 9.0).state,
+            ContributorState.LEADING,
+        )
+        self.assertEqual(
+            select_cpu_contributor(history, source, 9.0000001).state,
+            ContributorState.UNAVAILABLE,
+        )
+        failed = self.failed_process_source(source, 4.0)
+        self.assertEqual(
+            select_cpu_contributor(history, failed, 4.0).state,
+            ContributorState.UNAVAILABLE,
+        )
+
+    def test_history_current_table_must_match_the_successful_source(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        history, source = self.history_for(rows, rows)
+        forged = ProcessHistory(
+            previous=history.previous,
+            current=(ProcessFact(7, "other", 90.0, 102),),
+            previous_revision=history.previous_revision,
+            current_revision=history.current_revision,
+            last_attempt_revision=history.last_attempt_revision,
+        )
+        self.assertEqual(
+            select_cpu_contributor(forged, source, 3.0).state,
+            ContributorState.UNAVAILABLE,
+        )
+
+    def test_attribution_rejects_invalid_clock_and_age_budgets(self):
+        rows = (ProcessFact(42, "Xcode", 30.0, 100),)
+        history, source = self.history_for(rows, rows)
+        for now in (True, float("nan"), float("inf"), 2.9999):
+            with self.subTest(now=now):
+                with self.assertRaises(ValueError):
+                    select_cpu_contributor(history, source, now)
+        for max_age in (True, 0.0, -1.0, float("nan"), float("inf"), 6.1):
+            with self.subTest(max_age=max_age):
+                with self.assertRaises(ValueError):
+                    select_cpu_contributor(history, source, 3.0, max_age)
+
+    def test_duplicate_pid_or_corrupt_source_table_is_rejected(self):
+        rows = (
+            ProcessFact(42, "Xcode", 30.0, 100),
+            ProcessFact(42, "Xcode", 20.0, 101),
+        )
+        source = self.process_source(rows, 1.0)
+        with self.assertRaises(ValueError):
+            reduce_process_history(ProcessHistory(), source)
+        corrupt = self.process_source((ProcessFact(42, "Xcode", 30.0, 100),), 1.0)
+        corrupt = replace(corrupt, last_valid=replace(corrupt.last_valid, value=("bad",)))
+        with self.assertRaises(ValueError):
+            reduce_process_history(ProcessHistory(), corrupt)
+
+    def test_contributor_and_history_reject_forged_structural_combinations(self):
+        with self.assertRaises(ValueError):
+            CpuContributor(ContributorState.LEADING, None, 1)
+        with self.assertRaises(ValueError):
+            CpuContributor(ContributorState.LEADING, "Xcode", 0)
+        with self.assertRaises(ValueError):
+            CpuContributor(ContributorState.NO_CLEAR_LEADER, "Xcode", None)
+        with self.assertRaises(ValueError):
+            CpuContributor("leading", "Xcode", 1)
+
+        fact = ProcessFact(42, "Xcode", 30.0, 100)
+        cases = (
+            ((fact,), (), 1, 0, 1),
+            ((fact,), (fact,), 1, 3, 3),
+            ((fact,), (fact,), 1, 2, 3),
+            ((fact, fact), (), 1, 0, 1),
+            (("bad",), (), 1, 0, 1),
+            ((), (fact,), 0, 1, 2),
+        )
+        for previous, current, previous_revision, current_revision, last_attempt in cases:
+            with self.subTest(previous=previous, current=current):
+                with self.assertRaises(ValueError):
+                    ProcessHistory(
+                        previous,
+                        current,
+                        previous_revision,
+                        current_revision,
+                        last_attempt,
+                    )
 
 
 class CpuWindowTests(unittest.TestCase):

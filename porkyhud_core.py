@@ -152,6 +152,67 @@ class ProcessFact:
             _require_nonnegative_int(self.elapsed_seconds, "elapsed_seconds")
 
 
+class ContributorState(str, Enum):
+    LEADING = "leading"
+    NO_CLEAR_LEADER = "no_clear_leader"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class CpuContributor:
+    state: ContributorState
+    name: Optional[str] = None
+    source_revision: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, ContributorState):
+            raise ValueError("state must be a ContributorState")
+        if self.state is ContributorState.LEADING:
+            if type(self.name) is not str or not self.name:
+                raise ValueError("leading contributor requires a non-empty name")
+            if type(self.source_revision) is not int or self.source_revision <= 0:
+                raise ValueError("leading contributor requires a positive source revision")
+            return
+        if self.name is not None or self.source_revision is not None:
+            raise ValueError("non-leading contributor cannot retain identity evidence")
+
+
+@dataclass(frozen=True)
+class ProcessHistory:
+    previous: Tuple[ProcessFact, ...] = ()
+    current: Tuple[ProcessFact, ...] = ()
+    previous_revision: int = 0
+    current_revision: int = 0
+    last_attempt_revision: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.previous) is not tuple or type(self.current) is not tuple:
+            raise ValueError("process history rows must be tuples")
+        _validate_process_table(self.previous, "previous")
+        _validate_process_table(self.current, "current")
+        for value, name in (
+            (self.previous_revision, "previous_revision"),
+            (self.current_revision, "current_revision"),
+            (self.last_attempt_revision, "last_attempt_revision"),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError("%s must be a nonnegative int" % name)
+        if self.current_revision == 0:
+            if self.previous or self.current or self.previous_revision:
+                raise ValueError("absent process history must have zero sample revisions")
+            return
+        if self.current_revision != self.last_attempt_revision:
+            raise ValueError("current revision must match the latest attempt")
+        if self.previous_revision == 0:
+            if self.previous:
+                raise ValueError("missing previous sample cannot contain rows")
+            return
+        if self.previous_revision <= 0:
+            raise ValueError("previous process sample requires a positive revision")
+        if self.current_revision != self.previous_revision + 1:
+            raise ValueError("process samples must have consecutive revisions")
+
+
 @dataclass(frozen=True)
 class Sample(Generic[T]):
     value: T
@@ -425,6 +486,180 @@ def source_view(state: SourceState[T], now_mono_s: float) -> SourceView:
         last_valid_revision=last_valid_revision,
         failure=last_attempt.failure if last_attempt else None,
     )
+
+
+def reduce_process_history(
+    history: ProcessHistory, source: SourceState[Tuple[ProcessFact, ...]]
+) -> ProcessHistory:
+    """Retain only two consecutive successful process-table samples.
+
+    A process attempt is consumed once.  Any observed failure or unknown gap
+    discards prior identity evidence instead of allowing it to bridge an
+    unobserved process-table result.
+    """
+    if not isinstance(history, ProcessHistory):
+        raise ValueError("history must be a ProcessHistory")
+    if not isinstance(source, SourceState) or source.source_id is not SourceId.PROCESS_TABLE:
+        raise ValueError("source must be a process table SourceState")
+    attempt = source.last_attempt
+    if attempt is None:
+        return history
+    _validate_process_attempt(attempt)
+    if attempt.revision == history.last_attempt_revision:
+        return history
+    if attempt.revision < history.last_attempt_revision:
+        raise ValueError("process attempt revision cannot recede")
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        return ProcessHistory(last_attempt_revision=attempt.revision)
+
+    sample = _validated_process_success(source, attempt)
+    if (
+        history.current_revision == 0
+        or attempt.revision != history.last_attempt_revision + 1
+    ):
+        return ProcessHistory(
+            current=sample.value,
+            current_revision=attempt.revision,
+            last_attempt_revision=attempt.revision,
+        )
+    return ProcessHistory(
+        previous=history.current,
+        current=sample.value,
+        previous_revision=history.current_revision,
+        current_revision=attempt.revision,
+        last_attempt_revision=attempt.revision,
+    )
+
+
+def select_cpu_contributor(
+    history: ProcessHistory,
+    source: SourceState[Tuple[ProcessFact, ...]],
+    now_mono_s: float,
+    max_age_s: float = 6.0,
+) -> CpuContributor:
+    """Name a CPU contributor only when recent identity evidence is decisive."""
+    if not isinstance(history, ProcessHistory):
+        raise ValueError("history must be a ProcessHistory")
+    if not isinstance(source, SourceState) or source.source_id is not SourceId.PROCESS_TABLE:
+        raise ValueError("source must be a process table SourceState")
+    _require_finite_mono(now_mono_s, "now_mono_s")
+    _require_finite_positive(max_age_s, "max_age_s")
+    if max_age_s > 6.0:
+        raise ValueError("max_age_s cannot exceed the attribution limit")
+
+    attempt = source.last_attempt
+    if attempt is None:
+        return CpuContributor(ContributorState.UNAVAILABLE)
+    _validate_process_attempt(attempt)
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        return CpuContributor(ContributorState.UNAVAILABLE)
+    sample = _validated_process_success(source, attempt)
+    age_s = sample_age_s(source, now_mono_s)
+    if (
+        not is_decision_ready(source, now_mono_s)
+        or age_s is None
+        or age_s > max_age_s
+        or history.current_revision != sample.revision
+        or history.last_attempt_revision != attempt.revision
+        or history.previous_revision == 0
+        or history.current != sample.value
+    ):
+        return CpuContributor(ContributorState.UNAVAILABLE)
+
+    current = history.current
+    if not current:
+        return CpuContributor(ContributorState.NO_CLEAR_LEADER)
+    top = max(current, key=lambda fact: fact.cpu_percent)
+    runner_up_percent = max(
+        (fact.cpu_percent for fact in current if fact is not top), default=0.0
+    )
+    if top.cpu_percent < 25.0 or top.cpu_percent < 1.5 * runner_up_percent:
+        return CpuContributor(ContributorState.NO_CLEAR_LEADER)
+    previous = next((fact for fact in history.previous if fact.pid == top.pid), None)
+    if (
+        previous is None
+        or previous.name != top.name
+        or previous.elapsed_seconds is None
+        or top.elapsed_seconds is None
+        or top.elapsed_seconds < previous.elapsed_seconds
+    ):
+        return CpuContributor(ContributorState.NO_CLEAR_LEADER)
+    return CpuContributor(ContributorState.LEADING, top.name, sample.revision)
+
+
+def _validate_process_table(rows: Tuple[ProcessFact, ...], name: str) -> None:
+    seen_pids = set()
+    for fact in rows:
+        _validate_process_fact(fact)
+        if fact.pid in seen_pids:
+            raise ValueError("%s process rows must have unique PIDs" % name)
+        seen_pids.add(fact.pid)
+
+
+def _validate_process_fact(fact: ProcessFact) -> None:
+    if type(fact) is not ProcessFact:
+        raise ValueError("process rows must be ProcessFact values")
+    if type(fact.pid) is not int or fact.pid <= 0:
+        raise ValueError("process pid must be a positive int")
+    if type(fact.name) is not str or not fact.name:
+        raise ValueError("process name must be a non-empty string")
+    _require_finite_nonnegative(fact.cpu_percent, "process cpu_percent")
+    if fact.elapsed_seconds is not None:
+        _require_nonnegative_int(fact.elapsed_seconds, "process elapsed_seconds")
+
+
+def _validate_process_attempt(attempt: CollectionAttempt) -> None:
+    if not isinstance(attempt, CollectionAttempt):
+        raise ValueError("last_attempt must be a CollectionAttempt")
+    if type(attempt.revision) is not int or attempt.revision <= 0:
+        raise ValueError("process attempt revision must be a positive int")
+    _require_finite_mono(attempt.started_mono_s, "attempt.started_mono_s")
+    _require_finite_mono(attempt.completed_mono_s, "attempt.completed_mono_s")
+    if attempt.completed_mono_s < attempt.started_mono_s:
+        raise ValueError("process attempt completion cannot precede its start")
+    if (
+        not isinstance(attempt.completed_at_utc, datetime)
+        or attempt.completed_at_utc.tzinfo is None
+        or attempt.completed_at_utc.utcoffset() is None
+    ):
+        raise ValueError("process attempt completion timestamp must be timezone-aware")
+    if not isinstance(attempt.outcome, AttemptOutcome):
+        raise ValueError("process attempt outcome must be an AttemptOutcome")
+    if attempt.outcome is AttemptOutcome.SUCCESS:
+        if attempt.failure is not None:
+            raise ValueError("successful process attempt cannot have a failure code")
+    elif attempt.failure not in _LEGAL_FAILURES.get(attempt.outcome, set()):
+        raise ValueError("process attempt failure code is incompatible with its outcome")
+
+
+def _validated_process_success(
+    source: SourceState[Tuple[ProcessFact, ...]], attempt: CollectionAttempt
+) -> Sample[Tuple[ProcessFact, ...]]:
+    sample = source.last_valid
+    if type(sample) is not Sample or sample.revision != attempt.revision:
+        raise ValueError("successful process attempt lacks its matching sample")
+    if type(sample.value) is not tuple:
+        raise ValueError("process sample rows must be a tuple")
+    _validate_process_table(sample.value, "process sample")
+    if type(sample.revision) is not int or sample.revision <= 0:
+        raise ValueError("process sample revision must be a positive int")
+    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
+    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
+    if sample.completed_mono_s < sample.started_mono_s:
+        raise ValueError("process sample completion cannot precede its start")
+    if (
+        not isinstance(sample.completed_at_utc, datetime)
+        or sample.completed_at_utc.tzinfo is None
+        or sample.completed_at_utc.utcoffset() is None
+    ):
+        raise ValueError("process sample completion timestamp must be timezone-aware")
+    if (
+        sample.started_mono_s != attempt.started_mono_s
+        or sample.completed_mono_s != attempt.completed_mono_s
+        or sample.completed_at_utc != attempt.completed_at_utc
+    ):
+        raise ValueError("process sample does not match its completed attempt")
+    return sample
 
 
 def reduce_cpu_window(
