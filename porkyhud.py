@@ -436,7 +436,6 @@ class HealthFrame:
         if not isinstance(self.contributor, CpuContributor):
             raise ValueError("contributor must be a CpuContributor")
         for value, value_type, name in (
-            (self.cpu_percent, float, "cpu_percent"),
             (self.memory_pressure, MemoryPressure, "memory_pressure"),
             (self.thermal, OsThermalState, "thermal"),
             (self.disk_capacity, DiskCapacity, "disk_capacity"),
@@ -444,7 +443,8 @@ class HealthFrame:
             if value is not None and not isinstance(value, value_type):
                 raise ValueError("%s has the wrong type" % name)
         if self.cpu_percent is not None and (
-                not math.isfinite(self.cpu_percent) or self.cpu_percent < 0 or self.cpu_percent > 100):
+                type(self.cpu_percent) not in (int, float)
+                or not math.isfinite(self.cpu_percent) or self.cpu_percent < 0 or self.cpu_percent > 100):
             raise ValueError("cpu_percent must be finite in 0..100")
         if (type(self.captured_mono_s) not in (int, float)
                 or not math.isfinite(self.captured_mono_s)):
@@ -550,6 +550,7 @@ class SourcePoller(Generic[T]):
         self,
         initial_state: SourceState[T],
         collector: Callable[[], AdapterResult[T]],
+        on_attempt_started: Optional[Callable[[int], None]] = None,
     ) -> None:
         if not isinstance(initial_state, SourceState):
             raise ValueError("initial_state must be a SourceState")
@@ -567,9 +568,12 @@ class SourcePoller(Generic[T]):
         validate_source_state(initial_state, validation_now)
         if not callable(collector):
             raise ValueError("collector must be callable")
+        if on_attempt_started is not None and not callable(on_attempt_started):
+            raise ValueError("on_attempt_started must be callable or None")
 
         self._state = initial_state
         self._collector = collector
+        self._on_attempt_started = on_attempt_started
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._work_pending = False
@@ -634,6 +638,8 @@ class SourcePoller(Generic[T]):
                 state, revision = start_attempt(self._state, now_mono_s)
                 self._state = state
                 self._pending_revision = revision
+                if self._on_attempt_started is not None:
+                    self._on_attempt_started(revision)
                 self._work_pending = True
                 if force:
                     self._failure_count = 0
@@ -4349,6 +4355,7 @@ class LiveHealthCoordinator:
         self._per_core: tuple[float, ...] = ()
         self._per_core_revision = 0
         self._cpu_per_core_by_completion: dict[tuple[int, float], tuple[float, ...]] = {}
+        self._cpu_per_core_by_revision: dict[tuple[int, int], tuple[float, ...]] = {}
         self._system_gpu_percent: Optional[float] = None
         self._previous_time: Optional[tuple[float, datetime]] = None
         self._cpu_sampler: MacCpuSampler
@@ -4362,6 +4369,7 @@ class LiveHealthCoordinator:
         cpu_sampler = MacCpuSampler()
         gpu_sampler = GPUProcessSampler()
         pollers: dict[SourceId, SourcePoller[Any]] = {}
+        gpu_calibration_by_revision: dict[int, Optional[float]] = {}
 
         def collect_cpu() -> AdapterResult[CpuUsage]:
             result = cpu_sampler.sample_usage()
@@ -4374,7 +4382,10 @@ class LiveHealthCoordinator:
 
         def collect_gpu() -> AdapterResult[GpuProcessSample]:
             with self._lock:
-                calibration = self._system_gpu_percent
+                calibration = gpu_calibration_by_revision.pop(
+                    self._pollers[SourceId.PROCESS_GPU].snapshot().active_revision or 0,
+                    self._system_gpu_percent,
+                )
                 current = self._generation == generation and not self._closed
             if not current:
                 return AdapterResult(
@@ -4382,6 +4393,11 @@ class LiveHealthCoordinator:
                     AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                 )
             return collect_gpu_process_sample(gpu_sampler, calibration)
+
+        def capture_gpu_calibration(revision: int) -> None:
+            # SourcePoller invokes this while it holds its Condition lock.  The
+            # coordinator tick already owns _lock; do not invert that order.
+            gpu_calibration_by_revision[revision] = self._system_gpu_percent
 
         collectors: Mapping[SourceId, Callable[[], AdapterResult[Any]]] = {
             SourceId.CPU_USAGE: collect_cpu,
@@ -4399,6 +4415,7 @@ class LiveHealthCoordinator:
                         source_id, cadence_s, stale_after_s,
                     ),
                     collectors[source_id],
+                    capture_gpu_calibration if source_id is SourceId.PROCESS_GPU else None,
                 )
         except BaseException:
             self._close_poller_set(pollers, deadline)
@@ -4461,10 +4478,17 @@ class LiveHealthCoordinator:
                     and cpu.last_attempt.outcome is AttemptOutcome.SUCCESS
                     and cpu.last_valid is not None
                     and cpu.last_valid.revision != self._per_core_revision):
-                self._per_core = self._cpu_per_core_by_completion.get(
-                    (self._generation, cpu.last_valid.completed_mono_s), (),
+                completion_key = (self._generation, cpu.last_valid.completed_mono_s)
+                revision_key = (self._generation, cpu.last_valid.revision)
+                self._cpu_per_core_by_revision[revision_key] = (
+                    self._cpu_per_core_by_completion.pop(completion_key, ())
                 )
+                self._per_core = self._cpu_per_core_by_revision[revision_key]
                 self._per_core_revision = cpu.last_valid.revision
+                self._cpu_per_core_by_revision = {
+                    key: value for key, value in self._cpu_per_core_by_revision.items()
+                    if key[0] == self._generation and key[1] >= self._per_core_revision - 1
+                }
             return self._frame
 
     def source_state(self, source_id: SourceId) -> SourceState[Any]:
@@ -4532,6 +4556,8 @@ class LiveHealthCoordinator:
                 old_pollers = self._pollers
                 self._per_core = ()
                 self._per_core_revision = 0
+                self._cpu_per_core_by_completion.clear()
+                self._cpu_per_core_by_revision.clear()
                 self._frame_states = _registry_states()
                 self._create_generation()
                 error = self._close_poller_set(old_pollers, time.monotonic() + 1.0)

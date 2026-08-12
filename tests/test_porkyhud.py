@@ -2098,6 +2098,187 @@ class LiveOrchestrationTests(unittest.TestCase):
         self.assertNotIn("command", events)
         coordinator.close.assert_called_once_with()
 
+    def test_hud_closes_coordinator_when_input_raises_after_shell(self) -> None:
+        class FailingScreen(FakeScreen):
+            def getch(self) -> int:
+                raise RuntimeError("input failed")
+
+        coordinator = mock.Mock()
+        screen = FailingScreen(24, 80)
+        with mock.patch.object(porkyhud, "init_colors"), \
+                mock.patch.object(porkyhud, "apply_dark_screen"), \
+                mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator):
+            with self.assertRaisesRegex(RuntimeError, "input failed"):
+                porkyhud.hud(screen)
+        coordinator.close.assert_called_once_with()
+
+    def test_health_frame_rejects_forged_scalar_contributor_and_trigger_values(self) -> None:
+        frame = porkyhud.initial_health_frame(1.0)
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, 101.0, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+                frame.captured_mono_s, None,
+            )
+
+        accepted = porkyhud.HealthFrame(
+            frame.assessment, frame.source_views, 10, frame.memory_pressure,
+            frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+            frame.captured_mono_s, None,
+        )
+        self.assertEqual(accepted.cpu_percent, 10)
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, True, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+                frame.captured_mono_s, None,
+            )
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, None, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, object(), frame.origin,
+                frame.captured_mono_s, None,
+            )
+        with self.assertRaises(ValueError):
+            porkyhud.HealthFrame(
+                frame.assessment, frame.source_views, None, frame.memory_pressure,
+                frame.thermal, frame.disk_capacity, frame.contributor, frame.origin,
+                frame.captured_mono_s, 2.0,
+            )
+
+    def test_process_state_uses_canonical_minimized_facts_and_preserves_metadata(self) -> None:
+        command = "/usr/bin/python --token top-secret --mode run"
+        state = core.new_source(core.SourceId.PROCESS_TABLE, 2.5, 7.5)
+        state, revision = core.start_attempt(state, 1.0)
+        state = core.complete_success(
+            state, revision,
+            (porkyhud.ProcessRow(10, 31.0, 1.0, None, "R", "00:03", command),),
+            1.1, self.UTC,
+        )
+        safe = porkyhud._sanitized_process_state(state, 2.0)
+        self.assertEqual(safe.last_valid.revision, state.last_valid.revision)
+        self.assertEqual(safe.last_valid.completed_mono_s, state.last_valid.completed_mono_s)
+        self.assertNotIn("top-secret", safe.last_valid.value[0].name)
+        self.assertEqual(safe.last_valid.value, porkyhud.process_facts(state.last_valid.value))
+
+    def test_discontinuity_boundaries_and_wall_only_reset_are_exact(self) -> None:
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._closed = False
+        coordinator._previous_time = None
+        coordinator._policy = core.initial_policy_state()
+        coordinator._generation = 0
+        coordinator._frame_states = porkyhud._registry_states()
+        coordinator._per_core = ()
+        coordinator._per_core_revision = 0
+        coordinator._cpu_per_core_by_completion = {}
+        coordinator._cpu_per_core_by_revision = {}
+        coordinator._pollers = {}
+        coordinator._create_generation = mock.Mock()
+        coordinator._close_poller_set = mock.Mock(return_value=None)
+        self.assertFalse(coordinator.observe_time(0.0, self.UTC))
+        self.assertFalse(coordinator.observe_time(30.0, self.UTC + timedelta(seconds=30)))
+        self.assertFalse(coordinator.observe_time(35.0, self.UTC + timedelta(seconds=40)))
+        self.assertTrue(coordinator.observe_time(35.1, self.UTC + timedelta(seconds=46.0)))
+        coordinator._create_generation.assert_not_called()
+        self.assertTrue(coordinator.observe_time(66.0, self.UTC + timedelta(seconds=76.0)))
+        coordinator._create_generation.assert_called_once()
+
+    def test_powermetrics_timeout_and_permission_do_not_wrap_candidates(self) -> None:
+        timeout = self.command_result(
+            outcome=core.AttemptOutcome.TIMEOUT,
+            failure=core.FailureCode.COMMAND_TIMEOUT, returncode=None,
+        )
+        denied = self.command_result(
+            stderr="sudo: a password is required",
+            outcome=core.AttemptOutcome.COMMAND_ERROR,
+            failure=core.FailureCode.NONZERO_EXIT, returncode=1,
+        )
+        with mock.patch.object(porkyhud, "POWER_METRICS_SAMPLER_INDEX", 1), \
+                mock.patch.object(porkyhud, "run_structured_command", side_effect=[timeout, denied]) as runner:
+            self.assertEqual(porkyhud._collect_powermetrics_attempt().text, "")
+            self.assertTrue(porkyhud._collect_powermetrics_attempt().permission_denied)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_args_list[0].args[0], runner.call_args_list[1].args[0])
+
+    def test_draw_functions_do_not_call_collectors_or_policy_reducer(self) -> None:
+        screen = FakeScreen(24, 80)
+        with mock.patch.object(porkyhud, "run_command", side_effect=AssertionError), \
+                mock.patch.object(porkyhud, "run_structured_command", side_effect=AssertionError), \
+                mock.patch.object(porkyhud, "reduce_health", side_effect=AssertionError):
+            porkyhud.draw_initial_shell(screen, porkyhud.HudConfig())
+            porkyhud.draw_small_screen(screen, 24, 80)
+
+    def test_construction_rolls_back_created_pollers(self) -> None:
+        created = []
+        class Poller:
+            def __init__(self, *_args, **_kwargs):
+                created.append(self)
+                if len(created) == 3:
+                    raise RuntimeError("third")
+            def close(self, _timeout_s):
+                self.closed = True
+        with mock.patch.object(porkyhud, "SourcePoller", Poller):
+            with self.assertRaisesRegex(RuntimeError, "third"):
+                porkyhud.LiveHealthCoordinator()
+        self.assertTrue(all(getattr(poller, "closed", False) for poller in created[:2]))
+
+    def test_gpu_calibration_is_captured_at_attempt_acceptance(self) -> None:
+        observed = []
+        state = core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0)
+        poller = porkyhud.SourcePoller(
+            state,
+            lambda: (_ for _ in ()).throw(RuntimeError("stop")),
+            on_attempt_started=lambda revision: observed.append(revision),
+        )
+        try:
+            poller.tick(1.0)
+            self.assertEqual(observed, [1])
+        finally:
+            poller.close()
+
+    def test_attempt_hook_is_linearized_before_worker_collection(self) -> None:
+        events = []
+        done = threading.Event()
+        def collector():
+            events.append("collect")
+            done.set()
+            return porkyhud.AdapterResult(
+                core.GpuProcessSample({}, {}, True, False), 1.0, 1.1, self.UTC,
+                core.AttemptOutcome.SUCCESS, None,
+            )
+        poller = porkyhud.SourcePoller(
+            core.new_source(core.SourceId.PROCESS_GPU, 5.0, 15.0), collector,
+            on_attempt_started=lambda _revision: events.append("accepted"),
+        )
+        try:
+            poller.tick(1.0)
+            self.assertTrue(done.wait(1.0))
+            self.assertEqual(events[:2], ["accepted", "collect"])
+        finally:
+            poller.close()
+
+    def test_cpu_completion_cache_is_generation_and_revision_scoped(self) -> None:
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._generation = 2
+        coordinator._per_core_revision = 3
+        coordinator._cpu_per_core_by_completion = {(1, 1.0): (99.0,)}
+        coordinator._cpu_per_core_by_revision = {
+            (1, 1): (99.0,), (2, 1): (50.0,), (2, 2): (40.0,), (2, 3): (30.0,),
+        }
+        coordinator._per_core = (30.0,)
+        coordinator._cpu_per_core_by_revision = {
+            key: value for key, value in coordinator._cpu_per_core_by_revision.items()
+            if key[0] == coordinator._generation and key[1] >= coordinator._per_core_revision - 1
+        }
+        self.assertEqual(coordinator._per_core, (30.0,))
+        self.assertEqual(coordinator._cpu_per_core_by_revision, {(2, 2): (40.0,), (2, 3): (30.0,)})
+
+    def test_static_collector_is_session_once_and_history_only_updates_on_fresh_frame(self) -> None:
+        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["memory_pressure"], 60)
+        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["process_table"], 24)
+        self.assertEqual(porkyhud.STEADY_STATE_COMMAND_ALLOWANCES["disk_capacity"], 2)
+
     def test_future_worker_completion_is_deferred_until_frame_time_catches_up(self) -> None:
         source = core.new_source(core.SourceId.MEMORY_PRESSURE, 1.0, 2.5)
         source, revision = core.start_attempt(source, 10.0)
