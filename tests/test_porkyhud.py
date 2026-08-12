@@ -2133,12 +2133,26 @@ class LiveOrchestrationTests(unittest.TestCase):
     def test_calibration_rejects_booleans_and_out_of_range_values(self) -> None:
         coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
         coordinator._lock = threading.RLock()
+        coordinator._closed = False
         coordinator._system_gpu_percent = None
         for invalid in (True, -0.1, 100.1, float("nan")):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 coordinator.set_system_gpu_percent(invalid)
         coordinator.set_system_gpu_percent(50.0)
         self.assertEqual(coordinator._system_gpu_percent, 50.0)
+
+    def test_closed_coordinator_rejects_all_mutating_calls_before_argument_validation(self) -> None:
+        coordinator = object.__new__(porkyhud.LiveHealthCoordinator)
+        coordinator._lock = threading.RLock()
+        coordinator._closed = True
+        for call in (
+            lambda: coordinator.tick(float("nan")),
+            lambda: coordinator.observe_time(float("nan"), self.UTC),
+            lambda: coordinator.set_system_gpu_percent(True),
+            coordinator.reset_policy,
+        ):
+            with self.subTest(call=call), self.assertRaises(RuntimeError):
+                call()
 
 
 class SourcePollerTests(unittest.TestCase):

@@ -4420,13 +4420,14 @@ class LiveHealthCoordinator:
         return any(value > now_mono_s for value in times)
 
     def tick(self, now_mono_s: float, force: bool = False) -> HealthFrame:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
         if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
             raise ValueError("now_mono_s must be finite")
         if type(force) is not bool:
             raise ValueError("force must be a bool")
         with self._lock:
-            if self._closed:
-                raise RuntimeError("live coordinator is closed")
             snapshots: dict[SourceId, SourceState[Any]] = {}
             for source_id, _cadence, _stale in LIVE_SOURCE_SPECS:
                 self._pollers[source_id].tick(float(now_mono_s), force)
@@ -4474,6 +4475,9 @@ class LiveHealthCoordinator:
             return self._per_core
 
     def set_system_gpu_percent(self, percent: Optional[float]) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
         if percent is not None and (
                 type(percent) not in (int, float)
                 or not math.isfinite(percent)
@@ -4484,9 +4488,14 @@ class LiveHealthCoordinator:
 
     def reset_policy(self) -> None:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
             self._policy = reset_policy_state()
 
     def observe_time(self, now_mono_s: float, now_utc: datetime) -> bool:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("live coordinator is closed")
         if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
             raise ValueError("now_mono_s must be finite")
         normalized = _normalize_utc_timestamp(now_utc, "now_utc")
