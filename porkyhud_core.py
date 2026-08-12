@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from enum import Enum
+from enum import Enum, IntEnum
 import math
 from typing import Generic, Optional, Tuple, TypeVar
 
@@ -70,6 +70,88 @@ class SourceViewStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class MemoryPressureLevel(IntEnum):
+    NORMAL = 1
+    WARN = 2
+    CRITICAL = 4
+
+
+@dataclass(frozen=True)
+class CpuUsage:
+    percent: float
+    window_started_mono_s: float
+    window_completed_mono_s: float
+
+    def __post_init__(self) -> None:
+        _require_percent(self.percent, "percent")
+        _require_finite_mono(self.window_started_mono_s, "window_started_mono_s")
+        _require_finite_mono(self.window_completed_mono_s, "window_completed_mono_s")
+        if self.window_completed_mono_s <= self.window_started_mono_s:
+            raise ValueError("CPU usage window must have positive duration")
+
+
+@dataclass(frozen=True)
+class MemoryPressure:
+    level: MemoryPressureLevel
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.level, MemoryPressureLevel):
+            raise ValueError("level must be a MemoryPressureLevel")
+
+
+@dataclass(frozen=True)
+class OsThermalState:
+    thermal_warning_level: int
+    performance_warning_level: int
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_int(self.thermal_warning_level, "thermal_warning_level")
+        _require_nonnegative_int(
+            self.performance_warning_level, "performance_warning_level"
+        )
+
+
+@dataclass(frozen=True)
+class DiskCapacity:
+    volume_id: str
+    volume_name: str
+    mount_point: str
+    total_bytes: int
+    free_bytes: int
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.volume_id, "volume_id"),
+            (self.volume_name, "volume_name"),
+            (self.mount_point, "mount_point"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError("%s must be a non-empty string" % name)
+        _require_nonnegative_int(self.total_bytes, "total_bytes")
+        if self.total_bytes == 0:
+            raise ValueError("total_bytes must be positive")
+        _require_nonnegative_int(self.free_bytes, "free_bytes")
+        if self.free_bytes > self.total_bytes:
+            raise ValueError("free_bytes cannot exceed total_bytes")
+
+
+@dataclass(frozen=True)
+class ProcessFact:
+    pid: int
+    name: str
+    cpu_percent: float
+    elapsed_seconds: Optional[int]
+
+    def __post_init__(self) -> None:
+        if type(self.pid) is not int or self.pid <= 0:
+            raise ValueError("pid must be a positive int")
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("name must be a non-empty string")
+        _require_percent(self.cpu_percent, "cpu_percent")
+        if self.elapsed_seconds is not None:
+            _require_nonnegative_int(self.elapsed_seconds, "elapsed_seconds")
+
+
 @dataclass(frozen=True)
 class Sample(Generic[T]):
     value: T
@@ -110,6 +192,56 @@ class SourceView:
     decision_ready: bool
     last_valid_revision: Optional[int]
     failure: Optional[FailureCode]
+
+
+@dataclass(frozen=True)
+class CpuWindow:
+    samples: Tuple[Sample[CpuUsage], ...] = ()
+    last_attempt_revision: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.samples, tuple):
+            raise ValueError("samples must be a tuple")
+        if type(self.last_attempt_revision) is not int or self.last_attempt_revision < 0:
+            raise ValueError("last_attempt_revision must be a nonnegative int")
+        previous = None
+        for sample in self.samples:
+            _validate_cpu_sample(sample)
+            if previous is not None:
+                previous_usage = previous.value
+                usage = sample.value
+                if sample.revision <= previous.revision:
+                    raise ValueError("CPU window sample revisions must increase")
+                if usage.window_started_mono_s < previous_usage.window_completed_mono_s:
+                    raise ValueError("CPU window samples cannot overlap")
+                if usage.window_completed_mono_s <= previous_usage.window_completed_mono_s:
+                    raise ValueError("CPU window sample times must increase")
+            previous = sample
+        if self.samples and self.last_attempt_revision < self.samples[-1].revision:
+            raise ValueError("last_attempt_revision cannot precede retained samples")
+
+
+@dataclass(frozen=True)
+class CpuWindowSummary:
+    duration_s: float
+    mean_percent: float
+    started_mono_s: float
+    completed_mono_s: float
+
+    def __post_init__(self) -> None:
+        _require_finite_positive(self.duration_s, "duration_s")
+        _require_percent(self.mean_percent, "mean_percent")
+        _require_finite_mono(self.started_mono_s, "started_mono_s")
+        _require_finite_mono(self.completed_mono_s, "completed_mono_s")
+        if self.completed_mono_s <= self.started_mono_s:
+            raise ValueError("summary window must have positive duration")
+        if not math.isclose(
+            self.completed_mono_s - self.started_mono_s,
+            self.duration_s,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("summary duration does not match its time window")
 
 
 _LEGAL_FAILURES = {
@@ -286,6 +418,153 @@ def source_view(state: SourceState[T], now_mono_s: float) -> SourceView:
     )
 
 
+def reduce_cpu_window(
+    window: CpuWindow, source: SourceState[CpuUsage]
+) -> CpuWindow:
+    """Incorporate one completed CPU attempt without inventing coverage."""
+    if not isinstance(window, CpuWindow):
+        raise ValueError("window must be a CpuWindow")
+    if not isinstance(source, SourceState) or source.source_id is not SourceId.CPU_USAGE:
+        raise ValueError("source must be a CPU usage SourceState")
+    attempt = source.last_attempt
+    if attempt is None:
+        return window
+    _validate_cpu_attempt(attempt)
+
+    if attempt.revision == window.last_attempt_revision:
+        return window
+
+    if attempt.outcome is not AttemptOutcome.SUCCESS:
+        return CpuWindow((), attempt.revision)
+
+    sample = _validated_cpu_success(source, attempt)
+    if attempt.revision < window.last_attempt_revision:
+        return CpuWindow((sample,), attempt.revision)
+
+    if not window.samples:
+        return CpuWindow((sample,), attempt.revision)
+
+    previous = window.samples[-1]
+    previous_usage = previous.value
+    usage = sample.value
+    gap_s = usage.window_started_mono_s - previous_usage.window_completed_mono_s
+    if (
+        usage.window_started_mono_s < previous_usage.window_completed_mono_s
+        or usage.window_completed_mono_s <= previous_usage.window_completed_mono_s
+        or gap_s > 2.5
+    ):
+        return CpuWindow((sample,), attempt.revision)
+
+    return CpuWindow(
+        _retain_cpu_samples(window.samples + (sample,)), attempt.revision
+    )
+
+
+def cpu_window_summary(
+    window: CpuWindow, duration_s: float
+) -> Optional[CpuWindowSummary]:
+    """Summarize a fully represented continuous CPU interval by elapsed time."""
+    if not isinstance(window, CpuWindow):
+        raise ValueError("window must be a CpuWindow")
+    _require_finite_positive(duration_s, "duration_s")
+    if not window.samples:
+        return None
+
+    completed_mono_s = window.samples[-1].value.window_completed_mono_s
+    started_mono_s = completed_mono_s - duration_s
+    represented_until = started_mono_s
+    weighted_percent_seconds = 0.0
+
+    for sample in window.samples:
+        usage = sample.value
+        if usage.window_completed_mono_s <= represented_until:
+            continue
+        if usage.window_started_mono_s > represented_until:
+            return None
+        segment_started_mono_s = max(
+            usage.window_started_mono_s, represented_until
+        )
+        segment_duration_s = (
+            usage.window_completed_mono_s - segment_started_mono_s
+        )
+        weighted_percent_seconds += usage.percent * segment_duration_s
+        represented_until = usage.window_completed_mono_s
+
+    if represented_until < completed_mono_s:
+        return None
+    return CpuWindowSummary(
+        duration_s,
+        weighted_percent_seconds / duration_s,
+        started_mono_s,
+        completed_mono_s,
+    )
+
+
+def _retain_cpu_samples(
+    samples: Tuple[Sample[CpuUsage], ...]
+) -> Tuple[Sample[CpuUsage], ...]:
+    cutoff_mono_s = samples[-1].value.window_completed_mono_s - 15.0
+    return tuple(
+        sample
+        for sample in samples
+        if sample.value.window_completed_mono_s > cutoff_mono_s
+    )
+
+
+def _validated_cpu_success(
+    source: SourceState[CpuUsage], attempt: CollectionAttempt
+) -> Sample[CpuUsage]:
+    sample = source.last_valid
+    if sample is None or sample.revision != attempt.revision:
+        raise ValueError("successful CPU attempt lacks its matching sample")
+    _validate_cpu_sample(sample)
+    if (
+        sample.started_mono_s != attempt.started_mono_s
+        or sample.completed_mono_s != attempt.completed_mono_s
+        or sample.completed_at_utc != attempt.completed_at_utc
+    ):
+        raise ValueError("CPU sample does not match its completed attempt")
+    return sample
+
+
+def _validate_cpu_attempt(attempt: CollectionAttempt) -> None:
+    if not isinstance(attempt, CollectionAttempt):
+        raise ValueError("last_attempt must be a CollectionAttempt")
+    if type(attempt.revision) is not int or attempt.revision <= 0:
+        raise ValueError("CPU attempt revision must be a positive int")
+    _require_finite_mono(attempt.started_mono_s, "attempt.started_mono_s")
+    _require_finite_mono(attempt.completed_mono_s, "attempt.completed_mono_s")
+    if attempt.completed_mono_s < attempt.started_mono_s:
+        raise ValueError("CPU attempt completion cannot precede its start")
+    if (
+        attempt.completed_at_utc.tzinfo is None
+        or attempt.completed_at_utc.utcoffset() is None
+    ):
+        raise ValueError("CPU attempt completion timestamp must be timezone-aware")
+    if not isinstance(attempt.outcome, AttemptOutcome):
+        raise ValueError("CPU attempt outcome must be an AttemptOutcome")
+    if attempt.outcome is AttemptOutcome.SUCCESS:
+        if attempt.failure is not None:
+            raise ValueError("successful CPU attempt cannot have a failure code")
+    elif attempt.failure not in _LEGAL_FAILURES.get(attempt.outcome, set()):
+        raise ValueError("CPU attempt failure code is incompatible with its outcome")
+
+
+def _validate_cpu_sample(sample: Sample[CpuUsage]) -> None:
+    if not isinstance(sample, Sample):
+        raise ValueError("CPU window samples must be Samples")
+    if type(sample.revision) is not int or sample.revision <= 0:
+        raise ValueError("CPU sample revision must be a positive int")
+    if not isinstance(sample.value, CpuUsage):
+        raise ValueError("CPU sample value must be CpuUsage")
+    _require_finite_mono(sample.started_mono_s, "sample.started_mono_s")
+    _require_finite_mono(sample.completed_mono_s, "sample.completed_mono_s")
+    if sample.completed_mono_s < sample.started_mono_s:
+        raise ValueError("CPU sample completion cannot precede its start")
+    if sample.completed_at_utc.tzinfo is None or sample.completed_at_utc.utcoffset() is None:
+        raise ValueError("CPU sample completion timestamp must be timezone-aware")
+
+
 def _require_finite_positive(value: float, name: str) -> None:
     _require_finite_mono(value, name)
     if value <= 0:
@@ -295,6 +574,17 @@ def _require_finite_positive(value: float, name: str) -> None:
 def _require_finite_mono(value: float, name: str) -> None:
     if type(value) not in (int, float) or not math.isfinite(value):
         raise ValueError("%s must be a finite int or float" % name)
+
+
+def _require_percent(value: float, name: str) -> None:
+    _require_finite_mono(value, name)
+    if value < 0 or value > 100:
+        raise ValueError("%s must be within 0..100" % name)
+
+
+def _require_nonnegative_int(value: int, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError("%s must be a nonnegative int" % name)
 
 
 def _validate_completion(

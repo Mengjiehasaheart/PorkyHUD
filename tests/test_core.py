@@ -1,18 +1,28 @@
 """Behavioral contract tests for the immutable telemetry source reducer."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from math import inf, nan
 import unittest
 
 from porkyhud_core import (
     AttemptOutcome,
+    CpuUsage,
+    CpuWindow,
+    DiskCapacity,
     FailureCode,
+    MemoryPressure,
+    MemoryPressureLevel,
+    OsThermalState,
+    ProcessFact,
     SourceId,
     SourceViewStatus,
     complete_failure,
     complete_success,
+    cpu_window_summary,
     is_decision_ready,
     new_source,
+    reduce_cpu_window,
     sample_age_s,
     source_view,
     start_attempt,
@@ -285,6 +295,210 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(view.status, SourceViewStatus.STALE)
         self.assertTrue(view.refreshing)
         self.assertFalse(view.decision_ready)
+
+
+class CpuWindowTests(unittest.TestCase):
+    def complete_cpu(self, source, started, completed, percent):
+        active, revision = start_attempt(source, started)
+        return complete_success(
+            active,
+            revision,
+            CpuUsage(percent, started, completed),
+            completed,
+            UTC_NOW,
+        )
+
+    def failed_cpu(self, source, started, completed):
+        active, revision = start_attempt(source, started)
+        return complete_failure(
+            active,
+            revision,
+            AttemptOutcome.TIMEOUT,
+            FailureCode.COMMAND_TIMEOUT,
+            completed,
+            UTC_NOW,
+        )
+
+    def test_time_weighted_window_clips_oldest_segment(self):
+        window = CpuWindow()
+        source = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        for start, end, percent in ((0.0, 6.0, 100.0),
+                                    (6.0, 12.0, 50.0),
+                                    (12.0, 18.0, 100.0)):
+            source = self.complete_cpu(source, start, end, percent)
+            window = reduce_cpu_window(window, source)
+        summary = cpu_window_summary(window, 15.0)
+        self.assertAlmostEqual(summary.duration_s, 15.0)
+        self.assertAlmostEqual(summary.mean_percent, 80.0)
+        self.assertEqual(summary.started_mono_s, 3.0)
+        self.assertEqual(summary.completed_mono_s, 18.0)
+
+    def test_complete_windows_preserve_exact_90_and_70_percent_means(self):
+        for percent in (90.0, 70.0):
+            with self.subTest(percent=percent):
+                source = self.complete_cpu(
+                    new_source(SourceId.CPU_USAGE, 1.0, 2.5),
+                    0.0,
+                    15.0,
+                    percent,
+                )
+                summary = cpu_window_summary(
+                    reduce_cpu_window(CpuWindow(), source), 15.0
+                )
+                self.assertEqual(summary.mean_percent, percent)
+
+    def test_gap_of_exactly_2_5_seconds_is_retained_but_not_represented(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        source = self.complete_cpu(source, 7.5, 12.5, 60.0)
+        retained = reduce_cpu_window(window, source)
+        self.assertEqual(len(retained.samples), 2)
+        self.assertIsNone(cpu_window_summary(retained, 12.5))
+
+    def test_gap_strictly_greater_than_2_5_seconds_resets_to_current_sample(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        source = self.complete_cpu(source, 7.5001, 12.5, 60.0)
+        reset = reduce_cpu_window(window, source)
+        self.assertEqual(len(reset.samples), 1)
+        self.assertEqual(reset.samples[0].revision, source.last_valid.revision)
+
+    def test_overlapping_and_reversed_windows_reset_to_current_sample(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        active, revision = start_attempt(source, 5.0)
+        source = complete_success(
+            active, revision, CpuUsage(70.0, 4.0, 9.0), 9.0, UTC_NOW
+        )
+        overlapped = reduce_cpu_window(window, source)
+        self.assertEqual(len(overlapped.samples), 1)
+
+        reversed_source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 8.0, 60.0
+        )
+        reversed_window = reduce_cpu_window(CpuWindow(), reversed_source)
+        active, revision = start_attempt(reversed_source, 8.0)
+        reversed_source = complete_success(
+            active, revision, CpuUsage(70.0, 5.0, 7.0), 9.0, UTC_NOW
+        )
+        reversed_result = reduce_cpu_window(reversed_window, reversed_source)
+        self.assertEqual(len(reversed_result.samples), 1)
+
+    def test_failed_latest_attempt_clears_window(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        failed = self.failed_cpu(source, 5.0, 6.0)
+        cleared = reduce_cpu_window(window, failed)
+        self.assertEqual(cleared.samples, ())
+        self.assertEqual(cleared.last_attempt_revision, failed.last_attempt.revision)
+
+    def test_duplicate_revision_is_idempotent(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        self.assertIs(reduce_cpu_window(window, source), window)
+
+    def test_counter_reset_revision_replaces_existing_history(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        window = CpuWindow(reduce_cpu_window(CpuWindow(), source).samples, 5)
+        reset = reduce_cpu_window(window, source)
+        self.assertEqual(reset.samples, (source.last_valid,))
+        self.assertEqual(reset.last_attempt_revision, 1)
+
+    def test_cpu_window_rejects_source_mismatches_and_corrupt_successes(self):
+        with self.assertRaises(ValueError):
+            reduce_cpu_window(
+                CpuWindow(), new_source(SourceId.MEMORY_PRESSURE, 1.0, 2.5)
+            )
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 5.0, 60.0
+        )
+        corrupt = replace(source, last_valid=replace(source.last_valid, revision=2))
+        with self.assertRaises(ValueError):
+            reduce_cpu_window(CpuWindow(), corrupt)
+        corrupt_attempt = replace(
+            source,
+            last_attempt=replace(
+                source.last_attempt, failure=FailureCode.COMMAND_TIMEOUT
+            ),
+        )
+        with self.assertRaises(ValueError):
+            reduce_cpu_window(CpuWindow(), corrupt_attempt)
+
+    def test_window_retains_the_15_second_history_and_boundary_sample(self):
+        source = new_source(SourceId.CPU_USAGE, 1.0, 2.5)
+        window = CpuWindow()
+        for started, completed in ((0.0, 6.0), (6.0, 12.0), (12.0, 18.0),
+                                   (18.0, 24.0)):
+            source = self.complete_cpu(source, started, completed, 50.0)
+            window = reduce_cpu_window(window, source)
+        self.assertEqual(
+            tuple(sample.value.window_started_mono_s for sample in window.samples),
+            (6.0, 12.0, 18.0),
+        )
+
+    def test_summary_requires_complete_continuous_representation(self):
+        source = self.complete_cpu(
+            new_source(SourceId.CPU_USAGE, 1.0, 2.5), 0.0, 10.0, 80.0
+        )
+        window = reduce_cpu_window(CpuWindow(), source)
+        self.assertIsNone(cpu_window_summary(window, 15.0))
+        for duration in (0.0, -1.0, True, nan, inf):
+            with self.subTest(duration=duration):
+                with self.assertRaises(ValueError):
+                    cpu_window_summary(window, duration)
+
+    def test_cpu_usage_rejects_invalid_percentages_and_windows(self):
+        for percent in (-0.1, 100.1, True, nan, inf, -inf):
+            with self.subTest(percent=percent):
+                with self.assertRaises(ValueError):
+                    CpuUsage(percent, 0.0, 1.0)
+        for started, completed in ((True, 1.0), (0.0, True), (nan, 1.0),
+                                   (0.0, inf), (1.0, 1.0), (1.0, 0.0)):
+            with self.subTest(started=started, completed=completed):
+                with self.assertRaises(ValueError):
+                    CpuUsage(50.0, started, completed)
+
+    def test_normalized_facts_enforce_identity_and_numeric_invariants(self):
+        self.assertEqual(MemoryPressure(MemoryPressureLevel.NORMAL).level,
+                         MemoryPressureLevel.NORMAL)
+        with self.assertRaises(ValueError):
+            MemoryPressure(1)
+        for thermal, performance in ((-1, 0), (0, -1), (True, 0), (0, True)):
+            with self.subTest(thermal=thermal, performance=performance):
+                with self.assertRaises(ValueError):
+                    OsThermalState(thermal, performance)
+        for total, free in ((-1, 0), (0, 0), (1, -1), (1, 2),
+                            (True, 0), (1, True)):
+            with self.subTest(total=total, free=free):
+                with self.assertRaises(ValueError):
+                    DiskCapacity("disk1", "Data", "/", total, free)
+        for values in (("", "Data", "/"), ("disk1", "", "/"),
+                       ("disk1", "Data", "")):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    DiskCapacity(*values, 1, 0)
+        for pid, name, percent, elapsed in ((0, "App", 1.0, None),
+                                             (True, "App", 1.0, None),
+                                             (1, "", 1.0, None),
+                                             (1, "App", True, None),
+                                             (1, "App", 100.1, None),
+                                             (1, "App", 1.0, -1),
+                                             (1, "App", 1.0, True)):
+            with self.subTest(pid=pid, name=name, percent=percent, elapsed=elapsed):
+                with self.assertRaises(ValueError):
+                    ProcessFact(pid, name, percent, elapsed)
 
 
 if __name__ == "__main__":
