@@ -313,6 +313,20 @@ utun0 1380 Link x 1 0 300 1 0 400 0
         with mock.patch.object(porkyhud, "run_command", return_value=netstat):
             self.assertEqual(porkyhud.network_bytes(), (1300, 2400))
 
+    def test_disk_activity_requires_complete_numeric_triplets(self) -> None:
+        """A truncated iostat sample is unknown while a complete zero row is measured."""
+
+        prefix = "disk0\nKB/t xfrs MB\n0 0 0\n"
+        with mock.patch.object(porkyhud, "run_command", return_value=prefix + "1 2\n"):
+            malformed = porkyhud.disk_activity()
+        self.assertEqual(malformed.source, "unavailable")
+
+        with mock.patch.object(porkyhud, "run_command", return_value=prefix + "0 0 0\n"):
+            measured_zero = porkyhud.disk_activity()
+        self.assertEqual(measured_zero.source, "iostat")
+        self.assertEqual(measured_zero.bytes_per_sec, 0.0)
+        self.assertEqual(measured_zero.iops, 0.0)
+
 
 class StructuredCommandTests(unittest.TestCase):
     def run_fixture(
@@ -4308,12 +4322,14 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         process_rows_data: tuple[object, ...] = (),
         agx_results: list[object] | None = None,
         now_mono_s: float = 2.0,
+        descriptive_values=None,
         ram_used_percent: float = 50.0,
         compressed_bytes: float = 0.0,
         swap_used_bytes: float = 0.0,
     ) -> dict[str, object]:
         """Collect a deterministic one-shot snapshot through its public boundary."""
 
+        descriptive_values = descriptive_values or {}
         total = 100 * 1024 ** 3
         free = int(total * free_fraction)
         memory = {
@@ -4365,16 +4381,21 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         with mock.patch.object(porkyhud, "MacCpuSampler", FakeCpuSampler), \
                 mock.patch.object(porkyhud.time, "sleep"), \
                 mock.patch.object(porkyhud.time, "monotonic", return_value=now_mono_s), \
-                mock.patch.object(porkyhud, "collect_static_info", return_value=static,
+                mock.patch.object(porkyhud, "collect_static_info",
+                                  return_value=descriptive_values.get("system", static),
                                   side_effect=RuntimeError("private") if descriptive_failure == "collect_static_info" else None), \
-                mock.patch.object(porkyhud, "memory_stats", return_value=memory,
+                mock.patch.object(porkyhud, "_snapshot_memory_stats",
+                                  return_value=descriptive_values.get("memory", memory),
                                   side_effect=RuntimeError("private") if descriptive_failure == "memory_stats" else None), \
-                mock.patch.object(porkyhud, "battery_info", return_value=make_battery(),
+                mock.patch.object(porkyhud, "_snapshot_battery_info",
+                                  return_value=descriptive_values.get("battery", make_battery()),
                                   side_effect=RuntimeError("private") if descriptive_failure == "battery_info" else None), \
-                mock.patch.object(porkyhud, "sensor_info", return_value=sensor,
+                mock.patch.object(porkyhud, "sensor_info",
+                                  return_value=descriptive_values.get("sensors", sensor),
                                   side_effect=RuntimeError("private") if descriptive_failure == "sensor_info" else None), \
                 mock.patch.object(porkyhud, "disk_info", return_value=disk), \
-                mock.patch.object(porkyhud, "disk_activity", return_value=porkyhud.DiskActivity(),
+                mock.patch.object(porkyhud, "disk_activity",
+                                  return_value=descriptive_values.get("activity", porkyhud.DiskActivity()),
                                   side_effect=RuntimeError("private") if descriptive_failure == "disk_activity" else None), \
                 mock.patch.object(porkyhud, "collect_memory_pressure",
                                   return_value=success(core.MemoryPressure(core.MemoryPressureLevel(memory_pressure))),
@@ -4556,6 +4577,44 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         self.assertEqual(builder.call_count, 1)
         self.assertEqual(executor.call_args.kwargs["max_workers"], 6)
 
+    def test_snapshot_constructs_delta_samplers_before_the_executor(self) -> None:
+        """CPU and GPU baselines are established before any snapshot work can start."""
+
+        events = []
+        marker = RuntimeError("pool unavailable")
+
+        class CpuSampler:
+            def __init__(self):
+                events.append("cpu")
+
+        class GpuSampler:
+            def __init__(self):
+                events.append("gpu")
+
+        class Executor:
+            def __init__(self, **_kwargs):
+                events.append("pool")
+                raise marker
+
+        with mock.patch.object(porkyhud, "MacCpuSampler", CpuSampler), \
+                mock.patch.object(porkyhud, "GPUProcessSampler", GpuSampler), \
+                mock.patch.object(porkyhud, "ThreadPoolExecutor", Executor), \
+                self.assertRaises(RuntimeError) as caught:
+            porkyhud.collect_snapshot()
+        self.assertIs(caught.exception, marker)
+        self.assertEqual(events, ["cpu", "gpu", "pool"])
+
+    def test_snapshot_constructor_baseexception_propagates_before_pool_creation(self) -> None:
+        """Sampler interruption keeps exact identity and cannot create executor ownership."""
+
+        marker = KeyboardInterrupt("constructor")
+        with mock.patch.object(porkyhud, "MacCpuSampler", side_effect=marker), \
+                mock.patch.object(porkyhud, "ThreadPoolExecutor") as executor, \
+                self.assertRaises(KeyboardInterrupt) as caught:
+            porkyhud.collect_snapshot()
+        self.assertIs(caught.exception, marker)
+        executor.assert_not_called()
+
     def test_snapshot_queues_initial_typed_attempts_before_descriptive_work(self) -> None:
         """Slow descriptive futures cannot delay the five health evidence attempts."""
 
@@ -4591,7 +4650,7 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         self.assertEqual(
             [getattr(function, "_mock_name", None) or function.__name__
              for function, _args in submitted[5:9]],
-            ["collect_static_info", "memory_stats", "battery_info", "disk_activity"],
+            ["collect_static_info", "_snapshot_memory_stats", "_snapshot_battery_info", "disk_activity"],
         )
 
     def test_text_snapshot_uses_exact_unknown_fallbacks(self) -> None:
@@ -4609,6 +4668,23 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         text = "\n".join(str(call.args[0]) for call in output.call_args_list)
         self.assertIn("read: health assessment unavailable.", text)
         self.assertIn("Package: --", text)
+
+    def test_text_snapshot_treats_null_read_or_message_as_unavailable(self) -> None:
+        """Nullable machine input cannot crash or print a literal None assessment."""
+
+        base = {
+            "system": {}, "cpu": {"average_percent": None, "cores": []},
+            "memory": {"used_bytes": None, "total_bytes": None, "used_percent": None},
+            "sensors": {}, "disk": {"activity": {"bytes_per_sec": None, "iops": None}},
+            "processes": [],
+        }
+        for read in (None, {}, {"message": None}):
+            with self.subTest(read=read), mock.patch("builtins.print") as output:
+                porkyhud.print_text_snapshot({**base, "read": read})
+            self.assertEqual(
+                output.call_args_list[1].args[0],
+                "read: health assessment unavailable.",
+            )
 
     def test_typed_collector_failures_and_descriptive_failures_stay_unavailable(self) -> None:
         """Snapshot boundaries never leak collector errors or substitute legacy disk data."""
@@ -4643,6 +4719,157 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
                 self.assertEqual(snapshot[key]["thermal_warning"], "unavailable")
             else:
                 self.assertEqual(snapshot["disk"]["activity"]["source"], "unavailable")
+
+    def test_wrong_type_descriptive_results_use_exact_unavailable_wire_shapes(self) -> None:
+        """Returned values are validated as strictly as raised collector failures."""
+
+        system_keys = {
+            "host", "os", "build", "kernel", "model", "chip", "physical_cpu",
+            "logical_cpu", "memory", "cpu_clusters", "core_labels", "cpu_index_map",
+            "core_counts", "gpus", "gpu_core_count", "max_gpu_freq_mhz", "model_id",
+            "cpu_cores", "gpu_fp32_tflops",
+        }
+        memory_keys = {
+            "used_percent", "used_bytes", "total_bytes", "swap_used_bytes",
+            "swap_total_bytes",
+        }
+        battery_keys = {
+            "percent", "present", "source", "state", "remaining", "external_connected",
+            "is_charging", "fully_charged", "cycle_count", "design_cycles",
+            "health_percent", "temp_c", "virtual_temp_c", "voltage_v", "amperage_a",
+            "charger_watts", "charger_name",
+        }
+        sensor_keys = {
+            "thermal_warning", "performance_warning", "cpu_power_w", "gpu_power_w",
+            "cpu_temp_c", "gpu_temp_c", "fan_rpm", "privileged_locked", "raw_hint",
+            "ane_power_w", "dram_power_w", "gpu_sram_power_w", "package_power_w",
+            "gpu_active_percent", "gpu_freq_mhz", "e_cluster_active", "p_cluster_active",
+            "s_cluster_active", "e_cluster_freq_mhz", "p_cluster_freq_mhz",
+            "s_cluster_freq_mhz", "dram_read_gbs", "dram_write_gbs", "fan_count",
+            "fans", "temp_sensors", "sensor_sample_age_s",
+        }
+        activity_keys = {"bytes_per_sec", "iops", "sample_age", "source"}
+        expected_keys = {
+            "system": system_keys, "memory": memory_keys, "battery": battery_keys,
+            "sensors": sensor_keys, "activity": activity_keys,
+        }
+        for name, bad_value in (
+            ("system", None), ("memory", "bad"), ("battery", object()),
+            ("sensors", None), ("activity", {"bytes_per_sec": 0.0}),
+        ):
+            with self.subTest(name=name):
+                snapshot = self.collect_snapshot_with(
+                    descriptive_values={name: bad_value},
+                )
+                section = snapshot["disk"]["activity"] if name == "activity" else snapshot[name]
+                self.assertEqual(set(section), expected_keys[name])
+                with mock.patch("builtins.print"):
+                    porkyhud.print_text_snapshot(snapshot)
+
+    def test_corrupt_static_and_memory_mappings_fail_closed_per_wire_field(self) -> None:
+        """Malformed descriptive mappings cannot reach layout or numeric formatting."""
+
+        snapshot = self.collect_snapshot_with(descriptive_values={
+            "system": {"host": "kept-host", "core_labels": object(), "cpu_index_map": "bad"},
+            "memory": {"total": 100.0, "used": "bad", "swap_used": 1.0},
+        })
+
+        self.assertEqual(snapshot["system"]["host"], "kept-host")
+        self.assertEqual(snapshot["system"]["core_labels"], [])
+        self.assertEqual(snapshot["system"]["cpu_index_map"], [])
+        self.assertIsNone(snapshot["memory"]["used_percent"])
+        self.assertIsNone(snapshot["memory"]["used_bytes"])
+        self.assertIsNone(snapshot["memory"]["swap_used_bytes"])
+
+    def test_huge_descriptor_integers_fail_closed_at_every_numeric_projection(self) -> None:
+        """Numeric validation is total even for integers too large for float coercion."""
+
+        huge = 10 ** 1000
+        cases = (
+            ("system", {"host": "kept", "gpu_core_count": huge},
+             lambda snapshot: snapshot["system"]["gpu_core_count"]),
+            ("memory", {"total": huge, "used": 1},
+             lambda snapshot: snapshot["memory"]["total_bytes"]),
+            ("battery", make_battery(percent=huge),
+             lambda snapshot: snapshot["battery"]["percent"]),
+            ("sensors", replace(settled_sensor(), package_power_w=huge),
+             lambda snapshot: snapshot["sensors"]["package_power_w"]),
+            ("activity", porkyhud.DiskActivity(bytes_per_sec=huge),
+             lambda snapshot: snapshot["disk"]["activity"]["bytes_per_sec"]),
+        )
+        for name, corrupt, projected_value in cases:
+            with self.subTest(name=name):
+                snapshot = self.collect_snapshot_with(descriptive_values={name: corrupt})
+                self.assertIsNone(projected_value(snapshot))
+
+    def test_snapshot_memory_empty_commands_do_not_manufacture_zero_usage(self) -> None:
+        """Physical capacity alone is not evidence that used and swap bytes are zero."""
+
+        with mock.patch.object(porkyhud, "_physical_memory_bytes", return_value=16 * 1024 ** 3), \
+                mock.patch.object(porkyhud, "run_command", return_value=""):
+            memory = porkyhud._snapshot_memory_stats()
+
+        self.assertEqual(porkyhud._snapshot_memory_projection(memory), {
+            "used_percent": None,
+            "used_bytes": None,
+            "total_bytes": None,
+            "swap_used_bytes": None,
+            "swap_total_bytes": None,
+        })
+
+    def test_snapshot_memory_accepts_recognized_detail_and_zero_swap_evidence(self) -> None:
+        """A complete legacy response may truthfully report measured zero swap."""
+
+        vm_stat = """Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free: 10.
+Pages speculative: 0.
+Anonymous pages: 1.
+Pages wired down: 1.
+Pages occupied by compressor: 0.
+"""
+
+        def command(args, **_kwargs):
+            return vm_stat if args == ["vm_stat"] else "total = 0.00M  used = 0.00M  free = 0.00M"
+
+        with mock.patch.object(porkyhud, "_physical_memory_bytes", return_value=40960.0), \
+                mock.patch.object(porkyhud, "run_command", side_effect=command):
+            memory = porkyhud._snapshot_memory_stats()
+
+        self.assertEqual(porkyhud._snapshot_memory_projection(memory), {
+            "used_percent": 20.0,
+            "used_bytes": 8192,
+            "total_bytes": 40960.0,
+            "swap_used_bytes": 0.0,
+            "swap_total_bytes": 0.0,
+        })
+
+    def test_snapshot_battery_malformed_or_localized_output_is_unknown(self) -> None:
+        """Unrecognized command text cannot prove that no battery is installed."""
+
+        for pmset_raw in (
+            "Ahora usando 'Alimentacion de CA'\n bateria desconocida",
+            "Now drawing from 'AC Power'\n malformed battery row",
+        ):
+            with self.subTest(pmset_raw=pmset_raw), mock.patch.object(
+                porkyhud, "run_command", side_effect=[pmset_raw, ""],
+            ):
+                battery = porkyhud._snapshot_battery_info()
+            projection = porkyhud._snapshot_battery_projection(battery)
+            self.assertIsNone(projection["present"])
+            self.assertIsNone(projection["external_connected"])
+            self.assertIsNone(projection["is_charging"])
+            self.assertIsNone(projection["fully_charged"])
+
+    def test_snapshot_battery_accepts_recognized_batteryless_evidence(self) -> None:
+        """The canonical pmset AC-only response truthfully proves battery absence."""
+
+        with mock.patch.object(
+            porkyhud, "run_command", side_effect=["Now drawing from 'AC Power'\n", ""],
+        ):
+            battery = porkyhud._snapshot_battery_info()
+        projection = porkyhud._snapshot_battery_projection(battery)
+        self.assertIs(projection["present"], False)
+        self.assertIs(projection["external_connected"], True)
 
     def test_snapshot_rejects_now_before_any_typed_completion(self) -> None:
         """Clock reversal is an invalid snapshot, not a silently fresh assessment."""
@@ -4711,6 +4938,170 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
             )
         self.assertIs(caught.exception, interrupt)
 
+    def test_snapshot_retries_failed_shutdown_and_joins_before_primary_propagates(self) -> None:
+        """A shutdown interruption cannot strand worker threads or replace the primary."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        primary = KeyboardInterrupt("primary")
+        shutdown_marker = KeyboardInterrupt("shutdown")
+        instances = []
+        before = {thread.ident for thread in threading.enumerate()
+                  if thread.name.startswith("porkyhud-snapshot")}
+
+        class FailingOnceExecutor:
+            def __init__(self, **kwargs):
+                self.executor = real_executor(**kwargs)
+                self.shutdown_calls = 0
+                instances.append(self)
+
+            def submit(self, function, *args):
+                return self.executor.submit(function, *args)
+
+            def shutdown(self, **kwargs):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 1:
+                    raise shutdown_marker
+                return self.executor.shutdown(**kwargs)
+
+        residual = None
+        try:
+            with mock.patch.object(porkyhud, "ThreadPoolExecutor", FailingOnceExecutor), \
+                    self.assertRaises(KeyboardInterrupt) as caught:
+                self.collect_snapshot_with(
+                    typed_failure="collect_memory_pressure", interrupt_marker=primary,
+                )
+            residual = {thread.ident for thread in threading.enumerate()
+                        if thread.name.startswith("porkyhud-snapshot")}
+        finally:
+            for instance in instances:
+                instance.executor.shutdown(wait=True, cancel_futures=True)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(instances[0].shutdown_calls, 2)
+        self.assertEqual(residual, before)
+
+    def test_snapshot_retries_cleanup_only_shutdown_then_propagates_first_error(self) -> None:
+        """Cleanup-only BaseException is delayed until a later join attempt completes."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        marker = KeyboardInterrupt("shutdown only")
+        instances = []
+        before = {thread.ident for thread in threading.enumerate()
+                  if thread.name.startswith("porkyhud-snapshot")}
+
+        class FailingOnceExecutor:
+            def __init__(self, **kwargs):
+                self.executor = real_executor(**kwargs)
+                self.shutdown_calls = 0
+                instances.append(self)
+
+            def submit(self, function, *args):
+                return self.executor.submit(function, *args)
+
+            def shutdown(self, **kwargs):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 1:
+                    raise marker
+                return self.executor.shutdown(**kwargs)
+
+        residual = None
+        try:
+            with mock.patch.object(porkyhud, "ThreadPoolExecutor", FailingOnceExecutor), \
+                    self.assertRaises(KeyboardInterrupt) as caught:
+                self.collect_snapshot_with()
+            residual = {thread.ident for thread in threading.enumerate()
+                        if thread.name.startswith("porkyhud-snapshot")}
+        finally:
+            for instance in instances:
+                instance.executor.shutdown(wait=True, cancel_futures=True)
+        self.assertIs(caught.exception, marker)
+        self.assertEqual(instances[0].shutdown_calls, 2)
+        self.assertEqual(residual, before)
+
+    def test_snapshot_retries_a_failed_waiting_shutdown_until_workers_join(self) -> None:
+        """Failure of the waiting phase itself still gets a later waiting attempt."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        marker = KeyboardInterrupt("waiting shutdown")
+        instances = []
+        before = {thread.ident for thread in threading.enumerate()
+                  if thread.name.startswith("porkyhud-snapshot")}
+
+        class FailingWaitExecutor:
+            def __init__(self, **kwargs):
+                self.executor = real_executor(**kwargs)
+                self.shutdown_calls = 0
+                instances.append(self)
+
+            def submit(self, function, *args):
+                return self.executor.submit(function, *args)
+
+            def shutdown(self, **kwargs):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 2:
+                    raise marker
+                return self.executor.shutdown(**kwargs)
+
+        residual = None
+        try:
+            with mock.patch.object(porkyhud, "ThreadPoolExecutor", FailingWaitExecutor), \
+                    self.assertRaises(KeyboardInterrupt) as caught:
+                self.collect_snapshot_with()
+            residual = {thread.ident for thread in threading.enumerate()
+                        if thread.name.startswith("porkyhud-snapshot")}
+        finally:
+            for instance in instances:
+                instance.executor.shutdown(wait=True, cancel_futures=True)
+        self.assertIs(caught.exception, marker)
+        self.assertEqual(instances[0].shutdown_calls, 3)
+        self.assertEqual(residual, before)
+
+    def test_snapshot_attempts_every_cancel_and_joins_before_cancel_error_propagates(self) -> None:
+        """RuntimeError and BaseException from cancel cannot skip sibling cleanup or join."""
+
+        real_executor = porkyhud.ThreadPoolExecutor
+        for marker in (RuntimeError("cancel"), KeyboardInterrupt("cancel")):
+            with self.subTest(marker=type(marker).__name__):
+                instances = []
+                before = {thread.ident for thread in threading.enumerate()
+                          if thread.name.startswith("porkyhud-snapshot")}
+
+                class CancelFuture:
+                    def __init__(self, future, owner):
+                        self.future = future
+                        self.owner = owner
+
+                    def result(self):
+                        return self.future.result()
+
+                    def cancel(self):
+                        self.owner.cancel_calls += 1
+                        raise marker
+
+                class CancelExecutor:
+                    def __init__(self, **kwargs):
+                        self.executor = real_executor(**kwargs)
+                        self.submitted = 0
+                        self.cancel_calls = 0
+                        instances.append(self)
+
+                    def submit(self, function, *args):
+                        self.submitted += 1
+                        return CancelFuture(self.executor.submit(function, *args), self)
+
+                    def shutdown(self, **kwargs):
+                        return self.executor.shutdown(**kwargs)
+
+                with mock.patch.object(porkyhud, "ThreadPoolExecutor", CancelExecutor), \
+                        self.assertRaises(type(marker)) as caught:
+                    self.collect_snapshot_with()
+                self.assertIs(caught.exception, marker)
+                self.assertEqual(instances[0].cancel_calls, instances[0].submitted)
+                self.assertEqual(
+                    {thread.ident for thread in threading.enumerate()
+                     if thread.name.startswith("porkyhud-snapshot")},
+                    before,
+                )
+
     def test_process_gpu_unknown_zero_and_measurement_keep_distinct_json_and_text_values(self) -> None:
         """GPU projection distinguishes absent evidence, stable zero, and measured use."""
 
@@ -4749,6 +5140,50 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
                 )
             self.assertEqual(len(snapshot["processes"]), 1)
             self.assertIsNone(snapshot["processes"][0]["gpu"])
+
+    def test_snapshot_merges_actual_agx_attempt_matrix_without_losing_processes(self) -> None:
+        """The public snapshot distinguishes failed, absent, new, and measured AGX rows."""
+
+        completed_at = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        row = porkyhud.ProcessRow(42, 20.0, 1.0, None, "R", "00:01", "/bin/task")
+
+        def result(value, started, completed, outcome=core.AttemptOutcome.SUCCESS,
+                   failure=None):
+            return porkyhud.AdapterResult(
+                value, started, completed, completed_at, outcome, failure,
+            )
+
+        failure = result(
+            None, 0.0, 0.1, core.AttemptOutcome.TIMEOUT,
+            core.FailureCode.COMMAND_TIMEOUT,
+        )
+        baseline = result(porkyhud.GpuProcessSample({}, {}, True, False), 0.0, 0.1)
+        cases = (
+            ("baseline failure", [failure, result(
+                porkyhud.GpuProcessSample({}, {42: "task"}, True, False), 0.2, 0.3,
+            )], None),
+            ("measurement failure", [baseline, result(
+                None, 0.2, 0.3, core.AttemptOutcome.TIMEOUT,
+                core.FailureCode.COMMAND_TIMEOUT,
+            )], None),
+            ("complete absence", [baseline, result(
+                porkyhud.GpuProcessSample({}, {}, True, True), 0.2, 0.3,
+            )], 0.0),
+            ("new pid", [baseline, result(
+                porkyhud.GpuProcessSample({}, {42: "task"}, True, True), 0.2, 0.3,
+            )], None),
+            ("measured match", [baseline, result(
+                porkyhud.GpuProcessSample({42: 7.5}, {42: "task"}, True, True),
+                0.2, 0.3,
+            )], 7.5),
+        )
+        for name, attempts, expected_gpu in cases:
+            with self.subTest(name=name):
+                snapshot = self.collect_snapshot_with(
+                    process_rows_data=(row,), agx_results=attempts,
+                )
+            self.assertEqual(len(snapshot["processes"]), 1)
+            self.assertEqual(snapshot["processes"][0]["gpu"], expected_gpu)
 
     def test_signal_during_palette_setup_still_restores_terminal_colors(self) -> None:
         stdout = mock.Mock()
@@ -4912,9 +5347,9 @@ class RuntimeProcessAndSnapshotTests(unittest.TestCase):
         ), mock.patch.object(porkyhud.time, "sleep"), mock.patch.object(
             porkyhud.time, "monotonic", return_value=2.0), mock.patch.object(
             porkyhud,
-            "memory_stats",
+            "_snapshot_memory_stats",
             return_value=memory,
-        ), mock.patch.object(porkyhud, "battery_info", return_value=battery), mock.patch.object(
+        ), mock.patch.object(porkyhud, "_snapshot_battery_info", return_value=battery), mock.patch.object(
             porkyhud,
             "sensor_info",
             return_value=sensor,

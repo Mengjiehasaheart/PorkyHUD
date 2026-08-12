@@ -3660,8 +3660,8 @@ def _physical_memory_bytes() -> float:
         return total
 
 
-def memory_detail() -> dict[str, float]:
-    """Return vm_stat-derived detail using the cached physical byte size."""
+def _memory_detail_attempt() -> tuple[dict[str, float], bool]:
+    """Return legacy detail plus whether vm_stat supplied recognized evidence."""
 
     total = _physical_memory_bytes()
     raw = run_command(["vm_stat"], timeout=1.5)
@@ -3689,7 +3689,7 @@ def memory_detail() -> dict[str, float]:
     used = min(total, max(0.0, app + wired + compressed))
     available = min(total, max(0.0, free + cached))
 
-    return {
+    detail = {
         "total": total,
         "used": used,
         "available": available,
@@ -3701,10 +3701,25 @@ def memory_detail() -> dict[str, float]:
         "wired": wired,
         "compressed": compressed,
     }
+    required_used_fields = {
+        "anonymous pages", "pages wired down", "pages occupied by compressor",
+    }
+    proven = (
+        total > 0
+        and page_match is not None
+        and required_used_fields.issubset(pages)
+    )
+    return detail, proven
 
 
-def swap_stats() -> tuple[float, float]:
-    """Return swap used/total bytes from one bounded legacy probe."""
+def memory_detail() -> dict[str, float]:
+    """Return vm_stat-derived detail using the cached physical byte size."""
+
+    return _memory_detail_attempt()[0]
+
+
+def _swap_stats_attempt() -> tuple[tuple[float, float], bool]:
+    """Return legacy swap values plus whether the response matched its grammar."""
 
     swap_raw = run_command(["sysctl", "vm.swapusage"])
     swap_total = swap_used = 0.0
@@ -3713,7 +3728,13 @@ def swap_stats() -> tuple[float, float]:
         swap_total = float(swap_match.group(1)) * 1024 * 1024
         swap_used = float(swap_match.group(2)) * 1024 * 1024
 
-    return swap_used, swap_total
+    return (swap_used, swap_total), swap_match is not None
+
+
+def swap_stats() -> tuple[float, float]:
+    """Return swap used/total bytes from one bounded legacy probe."""
+
+    return _swap_stats_attempt()[0]
 
 
 def merge_memory_stats(
@@ -3733,9 +3754,19 @@ def memory_stats() -> dict[str, float]:
     return merge_memory_stats(memory_detail(), swap_stats())
 
 
-def battery_info() -> BatteryInfo:
-    pmset_raw = run_command(["pmset", "-g", "batt"])
-    ioreg_raw = run_command(["ioreg", "-r", "-c", "AppleSmartBattery", "-d", "1"], timeout=1.5)
+def _snapshot_memory_stats() -> dict[str, float]:
+    """Collect only memory fields backed by recognized one-shot probe evidence."""
+
+    detail, detail_proven = _memory_detail_attempt()
+    swap, swap_proven = _swap_stats_attempt()
+    result = dict(detail) if detail_proven else {}
+    if swap_proven:
+        result["swap_used"], result["swap_total"] = swap
+    return result
+
+
+def _battery_info_from_raw(pmset_raw: str, ioreg_raw: str) -> BatteryInfo:
+    """Parse the legacy battery projection from already collected command text."""
 
     source_match = re.search(r"Now drawing from '([^']+)'", pmset_raw)
     battery_match = re.search(r"(\d+)%;\s*([^;]+);\s*([^;]+);?", pmset_raw)
@@ -3780,6 +3811,35 @@ def battery_info() -> BatteryInfo:
         charger_watts=charger_watts,
         charger_name=charger_name,
     )
+
+
+def battery_info() -> BatteryInfo:
+    pmset_raw = run_command(["pmset", "-g", "batt"])
+    ioreg_raw = run_command(
+        ["ioreg", "-r", "-c", "AppleSmartBattery", "-d", "1"], timeout=1.5,
+    )
+    return _battery_info_from_raw(pmset_raw, ioreg_raw)
+
+
+def _snapshot_battery_info() -> Optional[BatteryInfo]:
+    """Return battery data only when one legacy response has recognized evidence."""
+
+    pmset_raw = run_command(["pmset", "-g", "batt"])
+    ioreg_raw = run_command(
+        ["ioreg", "-r", "-c", "AppleSmartBattery", "-d", "1"], timeout=1.5,
+    )
+    battery_row = re.search(r"(\d+)%;\s*([^;]+);\s*([^;]+);?", pmset_raw)
+    recognized_ioreg = re.search(
+        r'"(?:ExternalConnected|IsCharging|FullyCharged|CurrentCapacity|'
+        r'MaxCapacity|Voltage|InstantAmperage|CycleCount)"\s*=',
+        ioreg_raw,
+    )
+    recognized_batteryless = re.fullmatch(
+        r"\s*Now drawing from 'AC Power'\s*", pmset_raw,
+    )
+    if battery_row is None and recognized_ioreg is None and recognized_batteryless is None:
+        return None
+    return _battery_info_from_raw(pmset_raw, ioreg_raw)
 
 
 def battery_summary(battery: BatteryInfo) -> str:
@@ -3902,12 +3962,13 @@ def disk_activity() -> DiskActivity:
     if not numeric_lines:
         return DiskActivity(source="unavailable")
     parts = numeric_lines[-1].split()
-    values: list[float] = []
-    for part in parts:
-        try:
-            values.append(float(part))
-        except ValueError:
-            pass
+    try:
+        values = [float(part) for part in parts]
+    except ValueError:
+        return DiskActivity(source="unavailable")
+    if (len(values) < 3 or len(values) % 3 != 0
+            or any(not math.isfinite(value) for value in values)):
+        return DiskActivity(source="unavailable")
     total_mb = 0.0
     total_xfers = 0.0
     for offset in range(0, len(values) - 2, 3):
@@ -6393,8 +6454,70 @@ def _snapshot_system_fallback() -> dict[str, Any]:
         "logical_cpu": None, "memory": "unavailable", "cpu_clusters": [],
         "core_labels": [], "cpu_index_map": [], "core_counts": {}, "gpus": [],
         "gpu_core_count": None, "max_gpu_freq_mhz": None, "model_id": "unavailable",
-        "cpu_cores": "unavailable",
+        "cpu_cores": "unavailable", "gpu_fp32_tflops": None,
     }
+
+
+def _snapshot_finite_number(value: Any, *, nonnegative: bool = False) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        return False
+    return finite and (not nonnegative or value >= 0)
+
+
+def _snapshot_system_projection(value: Any) -> dict[str, Any]:
+    """Return only validated static fields in the fixed snapshot wire shape."""
+
+    projected = _snapshot_system_fallback()
+    if not isinstance(value, Mapping):
+        return projected
+    try:
+        static = dict(value)
+    except Exception:
+        return projected
+
+    for key in ("host", "os", "build", "kernel", "model", "chip", "memory",
+                "model_id", "cpu_cores"):
+        candidate = static.get(key)
+        if isinstance(candidate, str) and candidate:
+            projected[key] = candidate
+    for key in ("physical_cpu", "logical_cpu"):
+        candidate = static.get(key)
+        if ((isinstance(candidate, str) and candidate)
+                or (type(candidate) is int and candidate >= 0)):
+            projected[key] = candidate
+    for key in ("gpu_core_count", "max_gpu_freq_mhz", "gpu_fp32_tflops"):
+        candidate = static.get(key)
+        if _snapshot_finite_number(candidate, nonnegative=True):
+            projected[key] = candidate
+
+    labels = static.get("core_labels")
+    if isinstance(labels, list) and all(isinstance(label, str) for label in labels):
+        projected["core_labels"] = list(labels)
+    index_map = static.get("cpu_index_map")
+    if (isinstance(index_map, list)
+            and all(type(index) is int and index >= 0 for index in index_map)):
+        projected["cpu_index_map"] = list(index_map)
+    counts = static.get("core_counts")
+    if (isinstance(counts, Mapping)
+            and all(isinstance(key, str) and type(count) is int and count >= 0
+                    for key, count in counts.items())):
+        projected["core_counts"] = dict(counts)
+
+    for key in ("cpu_clusters", "gpus"):
+        rows = static.get(key)
+        if (isinstance(rows, list)
+                and all(isinstance(row, Mapping) for row in rows)):
+            try:
+                converted = [dict(row) for row in rows]
+                json.dumps(converted)
+            except (Exception, TypeError, ValueError):
+                continue
+            projected[key] = converted
+    return projected
 
 
 def _snapshot_battery_fallback() -> dict[str, Any]:
@@ -6410,6 +6533,21 @@ def _snapshot_battery_fallback() -> dict[str, Any]:
 
 def _snapshot_battery_projection(battery: Any) -> dict[str, Any]:
     if not isinstance(battery, BatteryInfo):
+        return _snapshot_battery_fallback()
+    numeric_fields = (
+        battery.percent, battery.cycle_count, battery.design_cycles,
+        battery.health_percent, battery.temp_c, battery.virtual_temp_c,
+        battery.voltage_v, battery.amperage_a, battery.charger_watts,
+    )
+    if (any(value is not None and not _snapshot_finite_number(value)
+            for value in numeric_fields)
+            or any(type(value) is not bool for value in (
+                battery.present, battery.external_connected, battery.is_charging,
+                battery.fully_charged,
+            ))
+            or any(not isinstance(value, str) for value in (
+                battery.source, battery.state, battery.remaining, battery.charger_name,
+            ))):
         return _snapshot_battery_fallback()
     if (not battery.present and battery.source == "Power"
             and battery.state == "unknown" and battery.remaining == "unknown"):
@@ -6431,23 +6569,105 @@ def _snapshot_sensor_fallback() -> dict[str, Any]:
     }
 
 
-def _snapshot_memory_projection(memory: Optional[dict[str, float]]) -> dict[str, Optional[float]]:
-    if memory is None:
-        return {
-            "used_percent": None, "used_bytes": None, "total_bytes": None,
-            "swap_used_bytes": None, "swap_total_bytes": None,
-        }
-    total = memory.get("total")
-    used = memory.get("used")
-    valid_total = isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0
-    valid_used = isinstance(used, (int, float)) and not isinstance(used, bool)
+def _snapshot_sensor_projection(sensor: Any) -> dict[str, Any]:
+    if not isinstance(sensor, SensorInfo):
+        return _snapshot_sensor_fallback()
+    numeric_fields = (
+        sensor.cpu_power_w, sensor.gpu_power_w, sensor.cpu_temp_c, sensor.gpu_temp_c,
+        sensor.fan_rpm, sensor.ane_power_w, sensor.dram_power_w,
+        sensor.gpu_sram_power_w, sensor.package_power_w, sensor.gpu_active_percent,
+        sensor.gpu_freq_mhz, sensor.e_cluster_active, sensor.p_cluster_active,
+        sensor.s_cluster_active, sensor.e_cluster_freq_mhz, sensor.p_cluster_freq_mhz,
+        sensor.s_cluster_freq_mhz, sensor.dram_read_gbs, sensor.dram_write_gbs,
+    )
+    valid_fans = (
+        isinstance(sensor.fans, list)
+        and all(isinstance(fan, FanReading) for fan in sensor.fans)
+    )
+    valid_temps = (
+        isinstance(sensor.temp_sensors, list)
+        and all(isinstance(reading, TempReading) for reading in sensor.temp_sensors)
+    )
+    if (not isinstance(sensor.thermal_warning, str)
+            or not isinstance(sensor.performance_warning, str)
+            or type(sensor.privileged_locked) is not bool
+            or not isinstance(sensor.raw_hint, str)
+            or type(sensor.fan_count) is not int or sensor.fan_count < 0
+            or not _snapshot_finite_number(sensor.sensor_sample_age_s, nonnegative=True)
+            or any(value is not None and not _snapshot_finite_number(value)
+                   for value in numeric_fields)
+            or not valid_fans or not valid_temps):
+        return _snapshot_sensor_fallback()
+    try:
+        projected = asdict(sensor)
+        json.dumps(projected)
+    except (Exception, TypeError, ValueError):
+        return _snapshot_sensor_fallback()
+    if set(projected) != set(_snapshot_sensor_fallback()):
+        return _snapshot_sensor_fallback()
+    return projected
+
+
+def _snapshot_memory_fallback() -> dict[str, Optional[float]]:
     return {
-        "used_percent": (float(used) / float(total) * 100.0) if valid_total and valid_used else None,
-        "used_bytes": used if valid_used else None,
-        "total_bytes": total if valid_total else None,
-        "swap_used_bytes": memory.get("swap_used") if isinstance(memory.get("swap_used"), (int, float)) else None,
-        "swap_total_bytes": memory.get("swap_total") if isinstance(memory.get("swap_total"), (int, float)) else None,
+        "used_percent": None, "used_bytes": None, "total_bytes": None,
+        "swap_used_bytes": None, "swap_total_bytes": None,
     }
+
+
+def _snapshot_memory_projection(memory: Any) -> dict[str, Optional[float]]:
+    projected = _snapshot_memory_fallback()
+    if not isinstance(memory, Mapping):
+        return projected
+    try:
+        values = dict(memory)
+    except Exception:
+        return projected
+    total = values.get("total")
+    used = values.get("used")
+    valid_detail = (
+        _snapshot_finite_number(total)
+        and total > 0
+        and _snapshot_finite_number(used, nonnegative=True)
+        and used <= total
+    )
+    swap_used = values.get("swap_used")
+    swap_total = values.get("swap_total")
+    valid_swap = (
+        _snapshot_finite_number(swap_used, nonnegative=True)
+        and _snapshot_finite_number(swap_total, nonnegative=True)
+        and swap_used <= swap_total
+    )
+    if valid_detail:
+        projected.update({
+            "used_percent": float(used) / float(total) * 100.0,
+            "used_bytes": used,
+            "total_bytes": total,
+        })
+    if valid_swap:
+        projected.update({
+            "swap_used_bytes": swap_used,
+            "swap_total_bytes": swap_total,
+        })
+    return projected
+
+
+def _snapshot_activity_fallback() -> dict[str, Any]:
+    return {
+        "bytes_per_sec": None, "iops": None, "sample_age": None,
+        "source": "unavailable",
+    }
+
+
+def _snapshot_activity_projection(activity: Any) -> dict[str, Any]:
+    if (not isinstance(activity, DiskActivity)
+            or not isinstance(activity.source, str)
+            or not activity.source or activity.source == "unavailable"
+            or any(not _snapshot_finite_number(value, nonnegative=True) for value in (
+                activity.bytes_per_sec, activity.iops, activity.sample_age,
+            ))):
+        return _snapshot_activity_fallback()
+    return asdict(activity)
 
 
 def _snapshot_result(future: Any, fallback: Callable[[], T]) -> T:
@@ -6470,17 +6690,17 @@ def collect_snapshot() -> dict[str, Any]:
     """Collect one truthful, isolated snapshot without creating live pollers."""
 
     futures: list[Any] = []
+    try:
+        cpu_sampler: Optional[MacCpuSampler] = MacCpuSampler()
+    except Exception:
+        cpu_sampler = None
+    try:
+        gpu_sampler: Optional[GPUProcessSampler] = GPUProcessSampler()
+    except Exception:
+        gpu_sampler = None
     pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="porkyhud-snapshot")
     primary_error: Optional[BaseException] = None
     try:
-        try:
-            cpu_sampler: Optional[MacCpuSampler] = MacCpuSampler()
-        except Exception:
-            cpu_sampler = None
-        try:
-            gpu_sampler: Optional[GPUProcessSampler] = GPUProcessSampler()
-        except Exception:
-            gpu_sampler = None
         memory_pressure_future = pool.submit(_snapshot_adapter_attempt, collect_memory_pressure)
         thermal_future = pool.submit(_snapshot_adapter_attempt, collect_os_thermal_state)
         capacity_future = pool.submit(_snapshot_adapter_attempt, collect_disk_capacity)
@@ -6491,8 +6711,8 @@ def collect_snapshot() -> dict[str, Any]:
             if gpu_sampler is not None else None
         )
         static_future = pool.submit(collect_static_info)
-        memory_future = pool.submit(memory_stats)
-        battery_future = pool.submit(battery_info)
+        memory_future = pool.submit(_snapshot_memory_stats)
+        battery_future = pool.submit(_snapshot_battery_info)
         activity_future = pool.submit(disk_activity)
         futures.extend((static_future, memory_future, battery_future, activity_future,
                         memory_pressure_future, thermal_future, capacity_future,
@@ -6547,11 +6767,11 @@ def collect_snapshot() -> dict[str, Any]:
             raise ValueError("snapshot clock precedes typed evidence completion")
         frame = _snapshot_frame(states, now_mono_s)
 
-        static = _snapshot_result(static_future, _snapshot_system_fallback)
+        static = _snapshot_system_projection(_snapshot_result(static_future, lambda: None))
         memory = _snapshot_result(memory_future, lambda: None)
-        battery = _snapshot_result(battery_future, _snapshot_battery_fallback)
+        battery = _snapshot_result(battery_future, lambda: None)
         activity = _snapshot_result(activity_future, lambda: None)
-        sensor = _snapshot_result(sensor_future, _snapshot_sensor_fallback)
+        sensor = _snapshot_result(sensor_future, lambda: None)
         rows = tuple(processes_result.value or ()) if processes_result.outcome is AttemptOutcome.SUCCESS else ()
         if rows:
             rows = merge_gpu_process_rows(rows, states[SourceId.PROCESS_GPU], now_mono_s)
@@ -6564,10 +6784,7 @@ def collect_snapshot() -> dict[str, Any]:
             if capacity is not None else
             {"label": None, "mount": None, "total": None, "used": None, "free": None}
         )
-        activity_projection = (
-            asdict(activity) if isinstance(activity, DiskActivity) and activity.source != "unavailable" else
-            {"bytes_per_sec": None, "iops": None, "sample_age": None, "source": "unavailable"}
-        )
+        activity_projection = _snapshot_activity_projection(activity)
         cpu_ready = frame.cpu_percent is not None
         core_values, core_labels = display_core_usage(list(per_core), static)
         return {
@@ -6582,7 +6799,7 @@ def collect_snapshot() -> dict[str, Any]:
             },
             "memory": _snapshot_memory_projection(memory),
             "battery": _snapshot_battery_projection(battery),
-            "sensors": asdict(sensor) if isinstance(sensor, SensorInfo) else sensor,
+            "sensors": _snapshot_sensor_projection(sensor),
             "disk": {"capacity": capacity_projection, "activity": activity_projection},
             "processes": [
                 {**asdict(row), "command": sanitize_command(row.command)}
@@ -6601,10 +6818,17 @@ def collect_snapshot() -> dict[str, Any]:
                 if cleanup_error is None:
                     cleanup_error = error
         try:
-            pool.shutdown(wait=True, cancel_futures=True)
+            pool.shutdown(wait=False, cancel_futures=True)
         except BaseException as error:
             if cleanup_error is None:
                 cleanup_error = error
+        for _attempt in range(2):
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+                break
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         if primary_error is None and cleanup_error is not None:
             raise cleanup_error
 
@@ -6616,7 +6840,10 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
     sensors = snapshot["sensors"]
     disk = snapshot["disk"]
     print("PorkyHUD snapshot")
-    print(snapshot.get("read", {}).get("message", "read: health assessment unavailable."))
+    read = snapshot.get("read")
+    message = read.get("message") if isinstance(read, Mapping) else None
+    print(message if isinstance(message, str) and message
+          else "read: health assessment unavailable.")
     print(f"Mac: {system.get('chip', 'Mac')} / {system.get('model', '')}")
     average = cpu.get("average_percent")
     if average is None:
