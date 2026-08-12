@@ -1173,6 +1173,224 @@ class StructuredCommandTests(unittest.TestCase):
                     )
 
 
+class DecisionAdapterTests(unittest.TestCase):
+    """Regression contracts for macOS evidence adapters, not policy decisions."""
+
+    def command_result(
+        self,
+        stdout: str = "",
+        outcome: core.AttemptOutcome = core.AttemptOutcome.SUCCESS,
+        failure: core.FailureCode | None = None,
+    ) -> porkyhud.CommandResult:
+        return porkyhud.CommandResult(
+            "fixture", stdout, "", 0 if outcome is core.AttemptOutcome.SUCCESS else None,
+            10.0, 10.2, datetime(2026, 8, 11, 12, tzinfo=timezone.utc), outcome, failure,
+        )
+
+    def test_adapter_result_accepts_only_core_outcome_failure_pairs(self) -> None:
+        completed = datetime(2026, 8, 11, 12, tzinfo=timezone.utc)
+        result = porkyhud.AdapterResult("value", 1.0, 2.0, completed,
+                                        core.AttemptOutcome.SUCCESS, None)
+        self.assertEqual(result.value, "value")
+        with self.assertRaises(FrozenInstanceError):
+            result.value = "other"  # type: ignore[misc]
+        legal_pairs = {
+            core.AttemptOutcome.NOT_APPLICABLE: (core.FailureCode.NOT_APPLICABLE,),
+            core.AttemptOutcome.UNSUPPORTED: (core.FailureCode.UNSUPPORTED_CAPABILITY,),
+            core.AttemptOutcome.PERMISSION_DENIED: (core.FailureCode.PERMISSION_DENIED,),
+            core.AttemptOutcome.MISSING_DEPENDENCY: (core.FailureCode.MISSING_EXECUTABLE,),
+            core.AttemptOutcome.TIMEOUT: (core.FailureCode.COMMAND_TIMEOUT, core.FailureCode.DEADLINE_EXCEEDED),
+            core.AttemptOutcome.COMMAND_ERROR: (
+                core.FailureCode.NONZERO_EXIT, core.FailureCode.DECODE_ERROR, core.FailureCode.OUTPUT_LIMIT,
+            ),
+            core.AttemptOutcome.PARSE_ERROR: (core.FailureCode.EMPTY_OUTPUT, core.FailureCode.PARSER_REJECTED),
+            core.AttemptOutcome.CANCELLED: (core.FailureCode.USER_CANCELLED,),
+            core.AttemptOutcome.UNKNOWN_ERROR: (core.FailureCode.UNEXPECTED_EXCEPTION,),
+        }
+        for outcome, failures in legal_pairs.items():
+            for failure in failures:
+                with self.subTest(outcome=outcome, failure=failure):
+                    failed = porkyhud.AdapterResult(None, 1.0, 2.0, completed, outcome, failure)
+                    self.assertEqual((failed.outcome, failed.failure), (outcome, failure))
+        with self.assertRaises(ValueError):
+            porkyhud.AdapterResult(None, 1.0, 2.0, completed,
+                                   core.AttemptOutcome.PARSE_ERROR, None)
+        with self.assertRaises(ValueError):
+            porkyhud.AdapterResult(None, 1.0, 2.0, completed,
+                                   core.AttemptOutcome.SUCCESS,
+                                   core.FailureCode.PARSER_REJECTED)
+
+    def test_memory_pressure_accepts_only_public_levels(self) -> None:
+        accepted = {
+            "1\n": core.MemoryPressureLevel.NORMAL,
+            "2": core.MemoryPressureLevel.WARN,
+            "4\n": core.MemoryPressureLevel.CRITICAL,
+        }
+        for raw, expected in accepted.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(porkyhud.parse_memory_pressure_level(raw).level, expected)
+        for raw in ("", "0", "3", "8", "normal", "1 warning", "01", "+1", "1\n2"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    porkyhud.parse_memory_pressure_level(raw)
+
+    def test_memory_pressure_collector_preserves_command_failure_and_classifies_parse_errors(self) -> None:
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result("2\n")) as run:
+            result = porkyhud.collect_memory_pressure()
+        self.assertEqual(result.value, core.MemoryPressure(core.MemoryPressureLevel.WARN))
+        run.assert_called_once_with(
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            category="memory-pressure", timeout_s=1.0, stdout_limit=8192, stderr_limit=8192,
+        )
+        timeout = self.command_result(
+            outcome=core.AttemptOutcome.TIMEOUT, failure=core.FailureCode.COMMAND_TIMEOUT,
+        )
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=timeout):
+            failed = porkyhud.collect_memory_pressure()
+        self.assertEqual((failed.outcome, failed.failure),
+                         (core.AttemptOutcome.TIMEOUT, core.FailureCode.COMMAND_TIMEOUT))
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result("")):
+            empty = porkyhud.collect_memory_pressure()
+        self.assertEqual((empty.outcome, empty.failure),
+                         (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.EMPTY_OUTPUT))
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result("3")):
+            rejected = porkyhud.collect_memory_pressure()
+        self.assertEqual((rejected.outcome, rejected.failure),
+                         (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.PARSER_REJECTED))
+
+    def test_thermal_requires_both_explicit_signals(self) -> None:
+        clear = ("Note: No thermal warning level has been recorded\n"
+                 "Note: No performance warning level has been recorded\n")
+        self.assertEqual(porkyhud.parse_os_thermal_state(clear), core.OsThermalState(0, 0))
+        self.assertEqual(porkyhud.parse_os_thermal_state(
+            "Thermal Warning Level = 0\nPerformance Warning Level = 3\n"),
+            core.OsThermalState(0, 3))
+        self.assertEqual(porkyhud.parse_os_thermal_state(
+            "Thermal Warning Level = 1\nPerformance Warning Level = 2\n"),
+            core.OsThermalState(1, 2))
+        for raw in ("Thermal Warning Level = 1\n", "localized unknown output\n", "",
+                    "Thermal Warning Level = -1\nPerformance Warning Level = 0\n",
+                    "Thermal Warning Level = 1\nThermal Warning Level = 2\n"
+                    "Performance Warning Level = 0\n"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    porkyhud.parse_os_thermal_state(raw)
+
+    def test_thermal_collector_uses_exact_public_command_and_failure_classes(self) -> None:
+        raw = "Thermal Warning Level = 0\nPerformance Warning Level = 1\n"
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=self.command_result(raw)) as run:
+            result = porkyhud.collect_os_thermal_state()
+        self.assertEqual(result.value, core.OsThermalState(0, 1))
+        run.assert_called_once_with(
+            ["/usr/bin/pmset", "-g", "therm"], category="thermal-os", timeout_s=1.5,
+            stdout_limit=8192, stderr_limit=8192,
+        )
+        nonzero = self.command_result(
+            outcome=core.AttemptOutcome.COMMAND_ERROR, failure=core.FailureCode.NONZERO_EXIT,
+        )
+        with mock.patch.object(porkyhud, "run_structured_command", return_value=nonzero):
+            failed = porkyhud.collect_os_thermal_state()
+        self.assertEqual((failed.outcome, failed.failure),
+                         (core.AttemptOutcome.COMMAND_ERROR, core.FailureCode.NONZERO_EXIT))
+
+    def test_disk_capacity_prefers_writable_data_and_preserves_provenance(self) -> None:
+        stat = type("Stat", (), {"f_flag": 0, "f_fsid": 44})()
+        usage = type("Usage", (), {"total": 1000, "used": 250, "free": 750})()
+        with mock.patch.object(porkyhud.os.path, "exists", side_effect=lambda path: path == "/System/Volumes/Data"), \
+             mock.patch.object(porkyhud.os, "statvfs", return_value=stat), \
+             mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
+            result = porkyhud.collect_disk_capacity()
+        self.assertEqual(result.value, core.DiskCapacity("fsid:44", "Data", "/System/Volumes/Data", 1000, 750))
+
+    def test_disk_capacity_uses_writable_root_and_reports_absence_or_inspection_error(self) -> None:
+        readonly = type("Stat", (), {"f_flag": porkyhud.os.ST_RDONLY, "f_fsid": 1})()
+        root = type("Stat", (), {"f_flag": 0, "f_fsid": 2})()
+        usage = type("Usage", (), {"total": 200, "used": 50, "free": 150})()
+        with mock.patch.object(porkyhud.os.path, "exists", return_value=True), \
+             mock.patch.object(porkyhud.os, "statvfs", side_effect=[readonly, root]), \
+             mock.patch.object(porkyhud.shutil, "disk_usage", return_value=usage):
+            fallback = porkyhud.collect_disk_capacity()
+        self.assertEqual(fallback.value, core.DiskCapacity("fsid:2", "Root", "/", 200, 150))
+        with mock.patch.object(porkyhud.os.path, "exists", return_value=False):
+            absent = porkyhud.collect_disk_capacity()
+        self.assertEqual((absent.outcome, absent.failure),
+                         (core.AttemptOutcome.NOT_APPLICABLE, core.FailureCode.NOT_APPLICABLE))
+        with mock.patch.object(porkyhud.os.path, "exists", return_value=True), \
+             mock.patch.object(porkyhud.os, "statvfs", side_effect=OSError("boom")):
+            broken = porkyhud.collect_disk_capacity()
+        self.assertEqual((broken.outcome, broken.failure),
+                         (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION))
+
+    def test_cpu_usage_uses_counter_read_window_and_resets_on_bad_counters(self) -> None:
+        sampler = object.__new__(porkyhud.MacCpuSampler)
+        sampler.available = True
+        sampler.previous = [(100, 0, 100, 0), (10, 0, 10, 0)]
+        sampler.last_read_completed_mono_s = 5.0
+        sampler.last_per_core = ()
+        sampler._read_raw = mock.Mock(return_value=[(130, 0, 110, 0), (20, 0, 20, 0)])
+        with mock.patch.object(porkyhud.time, "monotonic", side_effect=[7.0, 7.5]), \
+             mock.patch.object(porkyhud, "utc_now", return_value=datetime(2026, 8, 11, 12, tzinfo=timezone.utc)):
+            result = sampler.sample_usage()
+        self.assertAlmostEqual(result.value.percent, 40 / 60 * 100)
+        self.assertEqual((result.value.window_started_mono_s, result.value.window_completed_mono_s), (5.0, 7.5))
+        self.assertEqual(sampler.last_per_core, (75.0, 50.0))
+        sampler._read_raw = mock.Mock(return_value=[(1, 0, 1, 0), (1, 0, 1, 0)])
+        with mock.patch.object(porkyhud.time, "monotonic", side_effect=[8.0, 8.5]), \
+             mock.patch.object(porkyhud, "utc_now", return_value=datetime(2026, 8, 11, 12, tzinfo=timezone.utc)):
+            reset = sampler.sample_usage()
+        self.assertEqual((reset.outcome, reset.failure),
+                         (core.AttemptOutcome.PARSE_ERROR, core.FailureCode.PARSER_REJECTED))
+        self.assertIsNone(reset.value)
+        self.assertEqual(sampler.last_per_core, ())
+        sampler._read_raw = mock.Mock(return_value=[])
+        with mock.patch.object(porkyhud.time, "monotonic", side_effect=[9.0, 9.5]), \
+             mock.patch.object(porkyhud, "utc_now", return_value=datetime(2026, 8, 11, 12, tzinfo=timezone.utc)):
+            missing = sampler.sample_usage()
+        self.assertEqual((missing.outcome, missing.failure),
+                         (core.AttemptOutcome.UNKNOWN_ERROR, core.FailureCode.UNEXPECTED_EXCEPTION))
+        self.assertIsNone(missing.value)
+
+    def test_sensor_os_thermal_is_independent_and_missing_state_is_unavailable(self) -> None:
+        os_state = core.OsThermalState(0, 2)
+        with mock.patch.object(porkyhud, "run_command") as run, \
+             mock.patch.object(porkyhud, "thermal_level_from_sysctl") as private_probe, \
+             mock.patch.object(porkyhud, "read_smc_sensors", return_value=([], [])), \
+             mock.patch.object(porkyhud, "powermetrics_sample", return_value="thermal pressure: nominal"):
+            sensor = porkyhud.sensor_info(os_state)
+        run.assert_not_called()
+        private_probe.assert_not_called()
+        self.assertEqual((sensor.thermal_warning, sensor.performance_warning), ("nominal", "active"))
+        with mock.patch.object(porkyhud, "read_smc_sensors", return_value=([], [])), \
+             mock.patch.object(porkyhud, "powermetrics_sample", return_value="thermal pressure: active"):
+            unavailable = porkyhud.sensor_info()
+        self.assertEqual((unavailable.thermal_warning, unavailable.performance_warning),
+                         ("unavailable", "unavailable"))
+        message, level = porkyhud.system_read([], {"total": 1.0, "used": 0.0},
+                                               porkyhud.DiskInfo("root", "/", 100, 0, 100),
+                                               porkyhud.DiskActivity(), make_battery(), unavailable, [])
+        self.assertEqual(level, "good")
+        self.assertIn("Quiet", message)
+
+    def test_sudoers_rule_has_intrinsic_timeout_and_check_only_validation(self) -> None:
+        expected = (
+            "# PorkyHUD advanced sensor access.\n"
+            "# Allows admin users to run PorkyHUD's bounded powermetrics samples without a password.\n"
+            "Cmnd_Alias PORKYHUD_POWERMETRICS = /usr/bin/powermetrics --samplers thermal\\,cpu_power\\,gpu_power\\,ane_power\\,battery\\,smc --show-extra-power-info -n 1 -i 1000, /usr/bin/powermetrics --samplers thermal\\,cpu_power\\,gpu_power\\,ane_power\\,battery --show-extra-power-info -n 1 -i 1000, /usr/bin/powermetrics --samplers all --show-extra-power-info -n 1 -i 1000\n"
+            "%admin ALL=(root) TIMEOUT=3s NOPASSWD: PORKYHUD_POWERMETRICS\n"
+        )
+        self.assertEqual(porkyhud.sudoers_contents(), expected)
+        with mock.patch.object(porkyhud.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertTrue(porkyhud.validate_sudoers_file("/tmp/porkyhud-rule"))
+        run.assert_called_once_with([porkyhud.VISUDO_PATH, "-c", "-s", "-f", "/tmp/porkyhud-rule"])
+
+    @unittest.skipUnless(porkyhud.platform.system() == "Darwin", "visudo syntax is macOS-specific")
+    def test_generated_sudoers_timeout_passes_macos_check_only_validation(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as rule:
+            rule.write(porkyhud.sudoers_contents())
+            rule.flush()
+            self.assertTrue(porkyhud.validate_sudoers_file(rule.name))
+
+
 class CommandPrivacyTests(unittest.TestCase):
     def test_sensitive_arguments_are_redacted_in_common_forms(self) -> None:
         command = (

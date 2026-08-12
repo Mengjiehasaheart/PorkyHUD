@@ -35,9 +35,17 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from operator import attrgetter
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Generic, Optional, Sequence, TypeVar
 
-from porkyhud_core import AttemptOutcome, FailureCode
+from porkyhud_core import (
+    AttemptOutcome,
+    CpuUsage,
+    DiskCapacity,
+    FailureCode,
+    MemoryPressure,
+    MemoryPressureLevel,
+    OsThermalState,
+)
 
 
 REFRESH_SECONDS = 1.0
@@ -62,6 +70,10 @@ POWER_METRICS_SAMPLER_SETS = [
     "thermal,cpu_power,gpu_power,ane_power,battery",
     "all",
 ]
+POWER_METRICS_SAMPLE_COUNT = 1
+POWER_METRICS_INTERVAL_MS = 1000
+PRIVILEGED_COMMAND_TIMEOUT_S = 3
+POWER_METRICS_RUNNER_TIMEOUT_S = 5.5
 KERNEL_INDEX_SMC = 2
 SMC_CMD_READ_BYTES = 5
 SMC_CMD_READ_INDEX = 8
@@ -77,6 +89,7 @@ COMMAND_READ_CHUNK_BYTES = 64 * 1024
 COMMAND_TERMINATE_GRACE_SECONDS = 0.2
 COMMAND_CLEANUP_SECONDS = 1.0
 COMMAND_CLEANUP_RETRY_SECONDS = 0.01
+T = TypeVar("T")
 THEMES: list[dict[str, Any]] = [
     {
         "name": "Neon Grid",
@@ -423,6 +436,188 @@ class CommandResult:
             self.outcome is not AttemptOutcome.SUCCESS and self.failure not in allowed
         ):
             raise ValueError("command outcome and failure are inconsistent")
+
+
+@dataclass(frozen=True)
+class AdapterResult(Generic[T]):
+    """A parsed health observation with the outcome of its bounded attempt."""
+
+    value: Optional[T]
+    started_mono_s: float
+    completed_mono_s: float
+    completed_at_utc: datetime
+    outcome: AttemptOutcome
+    failure: Optional[FailureCode]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.started_mono_s, (int, float))
+            or isinstance(self.started_mono_s, bool)
+            or not isinstance(self.completed_mono_s, (int, float))
+            or isinstance(self.completed_mono_s, bool)
+            or not math.isfinite(self.started_mono_s)
+            or not math.isfinite(self.completed_mono_s)
+            or self.completed_mono_s < self.started_mono_s
+        ):
+            raise ValueError("adapter timestamps must be finite and ordered")
+        if not isinstance(self.completed_at_utc, datetime) or self.completed_at_utc.tzinfo is None:
+            raise ValueError("adapter completion timestamp must be timezone-aware")
+        object.__setattr__(self, "completed_at_utc", self.completed_at_utc.astimezone(timezone.utc))
+        legal_failures = {
+            AttemptOutcome.SUCCESS: set(),
+            AttemptOutcome.NOT_APPLICABLE: {FailureCode.NOT_APPLICABLE},
+            AttemptOutcome.UNSUPPORTED: {FailureCode.UNSUPPORTED_CAPABILITY},
+            AttemptOutcome.PERMISSION_DENIED: {FailureCode.PERMISSION_DENIED},
+            AttemptOutcome.MISSING_DEPENDENCY: {FailureCode.MISSING_EXECUTABLE},
+            AttemptOutcome.TIMEOUT: {FailureCode.COMMAND_TIMEOUT, FailureCode.DEADLINE_EXCEEDED},
+            AttemptOutcome.COMMAND_ERROR: {
+                FailureCode.NONZERO_EXIT, FailureCode.DECODE_ERROR, FailureCode.OUTPUT_LIMIT,
+            },
+            AttemptOutcome.PARSE_ERROR: {FailureCode.EMPTY_OUTPUT, FailureCode.PARSER_REJECTED},
+            AttemptOutcome.CANCELLED: {FailureCode.USER_CANCELLED},
+            AttemptOutcome.UNKNOWN_ERROR: {FailureCode.UNEXPECTED_EXCEPTION},
+        }
+        if not isinstance(self.outcome, AttemptOutcome) or (
+            self.failure is not None and not isinstance(self.failure, FailureCode)
+        ):
+            raise TypeError("adapter outcome and failure must be core enums")
+        allowed = legal_failures[self.outcome]
+        if (self.outcome is AttemptOutcome.SUCCESS and (self.failure is not None or self.value is None)) or (
+            self.outcome is not AttemptOutcome.SUCCESS and (self.failure not in allowed or self.value is not None)
+        ):
+            raise ValueError("adapter outcome, failure, and value are inconsistent")
+
+
+def utc_now() -> datetime:
+    """Indirection keeps adapter completion-time tests deterministic."""
+
+    return datetime.now(timezone.utc)
+
+
+def _adapter_from_command(result: CommandResult, parser: Callable[[str], T]) -> AdapterResult[T]:
+    if result.outcome is not AttemptOutcome.SUCCESS:
+        return AdapterResult(
+            None, result.started_mono_s, result.completed_mono_s, result.completed_at_utc,
+            result.outcome, result.failure,
+        )
+    try:
+        value = parser(result.stdout)
+    except ValueError:
+        failure = FailureCode.EMPTY_OUTPUT if not result.stdout.strip() else FailureCode.PARSER_REJECTED
+        return AdapterResult(
+            None, result.started_mono_s, time.monotonic(), utc_now(),
+            AttemptOutcome.PARSE_ERROR, failure,
+        )
+    return AdapterResult(
+        value, result.started_mono_s, time.monotonic(), utc_now(), AttemptOutcome.SUCCESS, None,
+    )
+
+
+def parse_memory_pressure_level(raw: str) -> MemoryPressure:
+    """Parse only the public vm-pressure values Apple documents."""
+
+    value = raw.strip()
+    if value not in {"1", "2", "4"} or not re.fullmatch(r"[ \t\r]*[124][ \t\r]*\n?", raw):
+        raise ValueError("unrecognized memory pressure level")
+    return MemoryPressure(MemoryPressureLevel(int(value)))
+
+
+def collect_memory_pressure() -> AdapterResult[MemoryPressure]:
+    return _adapter_from_command(
+        run_structured_command(
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            category="memory-pressure", timeout_s=1.0, stdout_limit=8192, stderr_limit=8192,
+        ),
+        parse_memory_pressure_level,
+    )
+
+
+_THERMAL_CLEAR = "Note: No thermal warning level has been recorded"
+_PERFORMANCE_CLEAR = "Note: No performance warning level has been recorded"
+_THERMAL_NUMERIC = re.compile(r"^Thermal Warning Level = ([0-9]+)$")
+_PERFORMANCE_NUMERIC = re.compile(r"^Performance Warning Level = ([0-9]+)$")
+
+
+def parse_os_thermal_state(raw: str) -> OsThermalState:
+    """Require one exact public thermal and performance indication each."""
+
+    thermal: Optional[int] = None
+    performance: Optional[int] = None
+    for line in raw.splitlines():
+        if line == _THERMAL_CLEAR:
+            candidate = 0
+            if thermal is not None:
+                raise ValueError("duplicate thermal signal")
+            thermal = candidate
+            continue
+        if line == _PERFORMANCE_CLEAR:
+            candidate = 0
+            if performance is not None:
+                raise ValueError("duplicate performance signal")
+            performance = candidate
+            continue
+        thermal_match = _THERMAL_NUMERIC.fullmatch(line)
+        if thermal_match:
+            if thermal is not None:
+                raise ValueError("duplicate thermal signal")
+            thermal = int(thermal_match.group(1))
+            continue
+        performance_match = _PERFORMANCE_NUMERIC.fullmatch(line)
+        if performance_match:
+            if performance is not None:
+                raise ValueError("duplicate performance signal")
+            performance = int(performance_match.group(1))
+            continue
+        lowered = line.lower()
+        if "thermal warning" in lowered or "performance warning" in lowered:
+            raise ValueError("unrecognized thermal signal")
+    if thermal is None or performance is None:
+        raise ValueError("incomplete thermal state")
+    return OsThermalState(thermal, performance)
+
+
+def collect_os_thermal_state() -> AdapterResult[OsThermalState]:
+    return _adapter_from_command(
+        run_structured_command(
+            ["/usr/bin/pmset", "-g", "therm"], category="thermal-os", timeout_s=1.5,
+            stdout_limit=8192, stderr_limit=8192,
+        ),
+        parse_os_thermal_state,
+    )
+
+
+def collect_disk_capacity() -> AdapterResult[DiskCapacity]:
+    """Select the writable macOS data volume, then writable root, with provenance."""
+
+    started_mono_s = time.monotonic()
+    inspection_failed = False
+    for volume_name, mount_point in (("Data", "/System/Volumes/Data"), ("Root", "/")):
+        if not os.path.exists(mount_point):
+            continue
+        try:
+            filesystem = os.statvfs(mount_point)
+            if filesystem.f_flag & os.ST_RDONLY:
+                continue
+            usage = shutil.disk_usage(mount_point)
+        except OSError:
+            inspection_failed = True
+            continue
+        return AdapterResult(
+            DiskCapacity(
+                "fsid:%s" % filesystem.f_fsid, volume_name, mount_point, usage.total, usage.free,
+            ),
+            started_mono_s, time.monotonic(), utc_now(), AttemptOutcome.SUCCESS, None,
+        )
+    completed_mono_s = time.monotonic()
+    if inspection_failed:
+        return AdapterResult(
+            None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.UNKNOWN_ERROR,
+            FailureCode.UNEXPECTED_EXCEPTION,
+        )
+    return AdapterResult(
+        None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.NOT_APPLICABLE,
+        FailureCode.NOT_APPLICABLE,
+    )
 
 
 def _validate_structured_command(
@@ -1825,9 +2020,9 @@ def powermetrics_args(samplers: str) -> list[str]:
         samplers,
         "--show-extra-power-info",
         "-n",
-        "1",
+        str(POWER_METRICS_SAMPLE_COUNT),
         "-i",
-        "1000",
+        str(POWER_METRICS_INTERVAL_MS),
     ]
 
 
@@ -1851,12 +2046,12 @@ def sudoers_contents() -> str:
         "# PorkyHUD advanced sensor access.\n"
         "# Allows admin users to run PorkyHUD's bounded powermetrics samples without a password.\n"
         f"Cmnd_Alias PORKYHUD_POWERMETRICS = {', '.join(command_lines)}\n"
-        "%admin ALL=(root) NOPASSWD: PORKYHUD_POWERMETRICS\n"
+        f"%admin ALL=(root) TIMEOUT={PRIVILEGED_COMMAND_TIMEOUT_S}s NOPASSWD: PORKYHUD_POWERMETRICS\n"
     )
 
 
 def validate_sudoers_file(path: str) -> bool:
-    return subprocess.run([VISUDO_PATH, "-cf", path]).returncode == 0
+    return subprocess.run([VISUDO_PATH, "-c", "-s", "-f", path]).returncode == 0
 
 
 def install_sensor_access() -> int:
@@ -2165,7 +2360,7 @@ def powermetrics_sample() -> str:
     for samplers in POWER_METRICS_SAMPLER_SETS:
         raw = run_command(
             [SUDO_PATH, "-n", *powermetrics_args(samplers)],
-            timeout=5.5,
+            timeout=POWER_METRICS_RUNNER_TIMEOUT_S,
         )
         if raw:
             return raw
@@ -2477,6 +2672,8 @@ class MacCpuSampler:
     def __init__(self) -> None:
         self.available = False
         self.previous: list[tuple[int, int, int, int]] | None = None
+        self.last_read_completed_mono_s: Optional[float] = None
+        self.last_per_core: tuple[float, ...] = ()
         try:
             self.lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
             self.lib.mach_host_self.restype = ctypes.c_uint
@@ -2496,6 +2693,7 @@ class MacCpuSampler:
             ]
             self.host = self.lib.mach_host_self()
             self.previous = self._read_raw()
+            self.last_read_completed_mono_s = time.monotonic()
             self.available = bool(self.previous)
         except Exception:
             self.available = False
@@ -2536,27 +2734,91 @@ class MacCpuSampler:
                 )
         return rows
 
-    def sample(self) -> list[float]:
-        if not self.available:
-            return []
-        current = self._read_raw()
-        if not current or not self.previous or len(current) != len(self.previous):
-            self.previous = current
-            return []
+    def _failure(self, started_mono_s: float, outcome: AttemptOutcome, failure: FailureCode) -> AdapterResult[CpuUsage]:
+        self.last_per_core = ()
+        return AdapterResult(None, started_mono_s, time.monotonic(), utc_now(), outcome, failure)
 
-        usage: list[float] = []
-        for before, after in zip(self.previous, current):
-            deltas = [max(0, after[i] - before[i]) for i in range(4)]
-            idle = deltas[self.CPU_STATE_IDLE]
-            busy = (
-                deltas[self.CPU_STATE_USER]
-                + deltas[self.CPU_STATE_SYSTEM]
-                + deltas[self.CPU_STATE_NICE]
+    def sample_usage(self) -> AdapterResult[CpuUsage]:
+        """Read Mach counters and aggregate their deltas without per-core weighting."""
+
+        started_mono_s = time.monotonic()
+        if not self.available:
+            self.previous = None
+            self.last_read_completed_mono_s = None
+            return self._failure(
+                started_mono_s, AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
             )
-            total = busy + idle
-            usage.append((busy / total * 100.0) if total else 0.0)
+        try:
+            current = self._read_raw()
+        except Exception:
+            current = []
+        completed_mono_s = time.monotonic()
+        if not current:
+            self.previous = None
+            self.last_read_completed_mono_s = None
+            self.last_per_core = ()
+            return AdapterResult(
+                None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.UNKNOWN_ERROR,
+                FailureCode.UNEXPECTED_EXCEPTION,
+            )
+        before = self.previous
+        previous_completed = self.last_read_completed_mono_s
+        if not before or previous_completed is None or len(current) != len(before):
+            self.previous = current
+            self.last_read_completed_mono_s = completed_mono_s
+            self.last_per_core = ()
+            return AdapterResult(
+                None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.PARSE_ERROR,
+                FailureCode.PARSER_REJECTED,
+            )
+
+        busy_total = 0
+        total_total = 0
+        per_core: list[float] = []
+        for prior, latest in zip(before, current):
+            if any(latest[index] < prior[index] for index in range(self.CPU_STATE_MAX)):
+                self.previous = current
+                self.last_read_completed_mono_s = completed_mono_s
+                self.last_per_core = ()
+                return AdapterResult(
+                    None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.PARSE_ERROR,
+                    FailureCode.PARSER_REJECTED,
+                )
+            deltas = [latest[index] - prior[index] for index in range(self.CPU_STATE_MAX)]
+            busy = deltas[self.CPU_STATE_USER] + deltas[self.CPU_STATE_SYSTEM] + deltas[self.CPU_STATE_NICE]
+            total = busy + deltas[self.CPU_STATE_IDLE]
+            if total <= 0:
+                self.previous = current
+                self.last_read_completed_mono_s = completed_mono_s
+                self.last_per_core = ()
+                return AdapterResult(
+                    None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.PARSE_ERROR,
+                    FailureCode.PARSER_REJECTED,
+                )
+            busy_total += busy
+            total_total += total
+            per_core.append(busy / total * 100.0)
+        if total_total <= 0 or completed_mono_s <= previous_completed:
+            self.previous = current
+            self.last_read_completed_mono_s = completed_mono_s
+            self.last_per_core = ()
+            return AdapterResult(
+                None, started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.PARSE_ERROR,
+                FailureCode.PARSER_REJECTED,
+            )
         self.previous = current
-        return usage
+        self.last_read_completed_mono_s = completed_mono_s
+        self.last_per_core = tuple(per_core)
+        return AdapterResult(
+            CpuUsage(busy_total / total_total * 100.0, previous_completed, completed_mono_s),
+            started_mono_s, completed_mono_s, utc_now(), AttemptOutcome.SUCCESS, None,
+        )
+
+    def sample(self) -> list[float]:
+        """Legacy display projection; Tasks 10/11 own migration of its callers."""
+
+        result = self.sample_usage()
+        return list(self.last_per_core) if result.outcome is AttemptOutcome.SUCCESS else []
 
 
 def collect_static_info() -> dict[str, Any]:
@@ -2786,20 +3048,20 @@ def battery_summary(battery: BatteryInfo) -> str:
     return f"{battery.source}: {percent} {state} {battery.remaining}".strip()
 
 
-def sensor_info() -> SensorInfo:
-    therm_raw = run_command(["pmset", "-g", "therm"], timeout=1.5)
-    thermal_warning = "nominal"
-    performance_warning = "nominal"
-    sysctl_thermal = thermal_level_from_sysctl()
-    if sysctl_thermal is not None:
-        thermal_warning = sysctl_thermal[0]
-    therm_lower = therm_raw.lower()
-    therm_error = "error:" in therm_lower or "failed to get" in therm_lower
-    if therm_raw and not therm_error:
-        if "no thermal warning" not in therm_lower:
-            thermal_warning = "active"
-        if "no performance warning" not in therm_lower:
-            performance_warning = "active"
+def sensor_info(os_thermal: Optional[OsThermalState] = None) -> SensorInfo:
+    """Collect optional sensor detail without replacing independent OS warning evidence."""
+
+    def warning_state(level: Optional[int]) -> str:
+        if level is None:
+            return "unavailable"
+        return "nominal" if level == 0 else "active"
+
+    thermal_warning = warning_state(
+        os_thermal.thermal_warning_level if os_thermal is not None else None
+    )
+    performance_warning = warning_state(
+        os_thermal.performance_warning_level if os_thermal is not None else None
+    )
 
     smc_fans, smc_temp_sensors = read_smc_sensors()
     smc_online = bool(smc_fans or smc_temp_sensors)
@@ -2815,10 +3077,6 @@ def sensor_info() -> SensorInfo:
     gpu_temp = gpu_temp if gpu_temp is not None else temp_from_readings(temp_sensors, ("gpu", "graphics", "agx"))
     fan_rpm = max((fan.rpm for fan in fans), default=None)
     fan_count = len(fans)
-
-    pressure_match = re.search(r"thermal pressure\s*:\s*([A-Za-z ]+)", power_raw, re.IGNORECASE)
-    if pressure_match:
-        thermal_warning = pressure_match.group(1).strip().lower()
 
     cpu_power = parse_any_power_value(power_raw, ["CPU Power", "Processor Power"])
     gpu_power = parse_any_power_value(power_raw, ["GPU Power"])
@@ -2870,17 +3128,15 @@ def sensor_info() -> SensorInfo:
 
 
 def disk_info() -> DiskInfo:
-    candidates = [
-        ("data", "/System/Volumes/Data"),
-        ("root", "/"),
-    ]
-    for label, mount in candidates:
-        if os.path.exists(mount):
-            try:
-                usage = shutil.disk_usage(mount)
-            except OSError:
-                continue
-            return DiskInfo(label=label, mount=mount, total=usage.total, used=usage.used, free=usage.free)
+    capacity = collect_disk_capacity()
+    if capacity.value is not None:
+        value = capacity.value
+        return DiskInfo(
+            label=value.volume_name.lower(), mount=value.mount_point, total=value.total_bytes,
+            used=value.total_bytes - value.free_bytes, free=value.free_bytes,
+        )
+    # Legacy callers cannot represent an unavailable capacity result. Preserve their
+    # return type without treating that fallback as decision-driving provenance.
     usage = shutil.disk_usage("/")
     return DiskInfo(label="root", mount="/", total=usage.total, used=usage.used, free=usage.free)
 
@@ -3269,7 +3525,7 @@ def system_read(
     top_gpu = max(rows, key=lambda row: row.gpu, default=None)
     net_bps = net_down + net_up
 
-    settled_states = ("nominal", "pending", "checking")
+    settled_states = ("nominal", "pending", "checking", "unavailable")
     if sensor.performance_warning not in settled_states:
         return ("read: macOS is holding performance back; heat is the reason.", "hot")
     if sensor.thermal_warning not in settled_states:
