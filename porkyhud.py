@@ -37,6 +37,17 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Generic, Mapping, Optional, Sequence, Tuple, TypeVar
 
+from porkyhud_insights import (
+    InsightStatus, VmRateState, VmRateView, summarize_cpu_samples, update_vm_rates,
+    vm_counters_from_mapping,
+)
+from porkyhud_visual import render_mascot, wordmark_lines
+from porkyhud_inventory import (
+    InventoryResult, NetworkInventory, InventoryStatus, ProbeResult,
+    InventoryObservation, observe_inventory,
+    collect_devices, collect_network, collect_connections,
+)
+
 from porkyhud_core import (
     AttemptOutcome,
     ContributorState,
@@ -96,14 +107,14 @@ STEADY_STATE_COMMAND_ALLOWANCES: Mapping[str, int] = MappingProxyType({
     "powermetrics": 4,
 })
 RETRY_LAUNCH_RESERVE = 12
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
-LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "cinema"]
-OPERATIONAL_MODES = ("balanced", "compute", "thermals", "io", "processes")
+LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections", "cinema"]
+OPERATIONAL_MODES = ("balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections")
 DIRECT_MODE_KEYS = {
     "1": "balanced", "2": "compute", "3": "thermals",
-    "4": "io", "5": "processes", "6": "cinema",
+    "4": "io", "5": "processes", "6": "cinema", "7": "insights", "8": "devices", "9": "network", "0": "connections",
 }
 DARK_BG_RGB = "#05070d"
 DARK_FG_RGB = "#e6f7ff"
@@ -151,6 +162,14 @@ PAIR_CRITICAL = 5
 PAIR_STRUCTURE = 6
 PAIR_SECONDARY = 7
 PAIR_BRAND = 8
+PAIR_PIG_LIT = 9
+PAIR_PIG_BODY = 10
+PAIR_PIG_SHADOW = 11
+PAIR_PIG_DETAIL = 12
+# Decorative colors are deliberately independent from health roles.
+MASCOT_COLORS = {PAIR_PIG_LIT: 224, PAIR_PIG_BODY: 211,
+                  PAIR_PIG_SHADOW: 175, PAIR_PIG_DETAIL: 255}
+VISUAL_STYLES = ("sculpted", "outline", "ascii")
 # Compatibility aliases for the existing public module surface. New rendering
 # code uses the semantic PAIR_* names exclusively.
 PRIMARY = PAIR_PRIMARY
@@ -219,10 +238,14 @@ THEMES: list[dict[str, Any]] = [
 
 @dataclass
 class HudConfig:
-    theme_index: int = 0
+    theme_index: int = 3
     animation_mode: int = 0
     layout_index: int = 0
     show_help: bool = False
+    visual_style: str = "sculpted"
+    intro_enabled: bool = True
+    show_menu: bool = False
+    menu_index: int = 0
     message: str = ""
     message_until: float = 0.0
 
@@ -254,7 +277,8 @@ def _mode_copy_name(mode: str) -> str:
         return {
             "balanced": "Overview", "compute": "Compute",
             "thermals": "Thermals", "io": "I/O",
-            "processes": "Processes", "cinema": "Cinema",
+            "processes": "Processes", "insights": "Insights", "devices": "Devices", "network": "Network",
+            "connections": "Connections", "cinema": "Cinema",
         }[mode]
     except (KeyError, TypeError):
         raise ValueError("unknown display mode")
@@ -599,6 +623,17 @@ class HealthFrame:
         object.__setattr__(self, "source_views", MappingProxyType(ordered))
 
 
+@dataclass(frozen=True)
+class DescriptiveSample:
+    """One atomic value/timing projection; retained values keep their old age."""
+
+    value: Any
+    age_s: float
+    error: str
+    revision: int
+    completed_mono_s: float
+
+
 class AsyncPoller:
     """Runs slow collectors off the render loop and keeps the last good sample."""
 
@@ -620,11 +655,16 @@ class AsyncPoller:
         self.first_start = initialized_at
         self._running = False
         self._force_pending = False
+        self._revision = 0
+        self._closed = False
+        self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
     def tick(self, now: float, force: bool = False) -> Any:
         thread: threading.Thread | None = None
         with self._lock:
+            if self._closed:
+                raise RuntimeError("descriptive poller is closed")
             due = force or self.last_start == 0.0 or now - self.last_finish >= self.interval
             if force and self._running:
                 self._force_pending = True
@@ -640,16 +680,37 @@ class AsyncPoller:
         self.last_start = now
         if self.first_start == 0.0:
             self.first_start = now
-        return threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        return self._thread
 
-    def snapshot(self, now: float | None = None) -> tuple[Any, float, str]:
+    def sample_snapshot(self, now: float | None = None) -> DescriptiveSample:
         sampled_at = time.monotonic() if now is None else now
         with self._lock:
             reference = self.last_success or self.first_start
             age = max(0.0, sampled_at - reference) if reference else 0.0
-            return self.value, age, self.error
+            return DescriptiveSample(self.value, age, self.error,
+                                     self._revision, self.last_finish)
+
+    def snapshot(self, now: float | None = None) -> tuple[Any, float, str]:
+        sample = self.sample_snapshot(now)
+        return sample.value, sample.age_s, sample.error
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("timeout_s must be finite and nonnegative")
+        with self._lock:
+            self._closed = True
+            self._force_pending = False
+            worker = self._thread
+        if (worker is not None and worker is not threading.current_thread()
+                and worker.ident is not None):
+            worker.join(timeout_s)
 
     def _run(self) -> None:
+        with self._lock:
+            if self._closed:
+                self._running = False
+                return
         try:
             value = self.collector()
             error = ""
@@ -658,13 +719,15 @@ class AsyncPoller:
             error = str(exc)
         next_thread: threading.Thread | None = None
         with self._lock:
-            if value is not None:
+            if value is not None and not self._closed:
                 self.value = value
                 self.last_success = time.monotonic()
-            self.error = error
-            self.last_finish = time.monotonic()
+            if not self._closed:
+                self.error = error
+                self.last_finish = time.monotonic()
+                self._revision += 1
             self._running = False
-            if self._force_pending:
+            if self._force_pending and not self._closed:
                 self._force_pending = False
                 next_thread = self._prepare_thread(self.last_finish)
         if next_thread is not None:
@@ -1144,6 +1207,7 @@ class CommandResult:
                 FailureCode.DECODE_ERROR,
                 FailureCode.OUTPUT_LIMIT,
             },
+            AttemptOutcome.CANCELLED: {FailureCode.USER_CANCELLED},
             AttemptOutcome.UNKNOWN_ERROR: {FailureCode.UNEXPECTED_EXCEPTION},
         }
         allowed = legal_failures.get(self.outcome)
@@ -1712,7 +1776,7 @@ class _CommandLifecycleWorker:
         while True:
             if _command_was_cancelled(self.request.control):
                 self._prepare_abnormal(
-                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                    AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                 )
                 return False
             remaining = deadline - time.monotonic()
@@ -1734,7 +1798,7 @@ class _CommandLifecycleWorker:
                     continue
             if not _command_try_normal_commit(self.request.control):
                 self._prepare_abnormal(
-                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                    AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                 )
                 return False
             self.leader_reaped = _command_worker_reap_leader(
@@ -1763,7 +1827,7 @@ class _CommandLifecycleWorker:
         while open_streams:
             if _command_was_cancelled(self.request.control):
                 self._prepare_abnormal(
-                    AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                    AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                 )
                 return
             remaining = deadline - time.monotonic()
@@ -1784,7 +1848,7 @@ class _CommandLifecycleWorker:
                         pass
                     _command_request_cancellation(self.request.control)
                     self._prepare_abnormal(
-                        AttemptOutcome.UNKNOWN_ERROR, FailureCode.UNEXPECTED_EXCEPTION,
+                        AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED,
                     )
                     return
                 if name == "leader-exit":
@@ -1975,7 +2039,7 @@ class _CommandLifecycleWorker:
         try:
             _command_wait_start_gate(self.request.start_gate)
             if _command_was_cancelled(self.request.control):
-                self._prepare_unknown()
+                self._prepare_abnormal(AttemptOutcome.CANCELLED, FailureCode.USER_CANCELLED)
             else:
                 self.selector = selectors.DefaultSelector()
                 if self._spawn():
@@ -2120,9 +2184,12 @@ def run_structured_command(
     timeout_s: float,
     stdout_limit: int,
     stderr_limit: int,
+    *, cancel_event: Optional[threading.Event] = None,
 ) -> CommandResult:
     """Run a no-shell command with bounded output and private failure classification."""
 
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise ValueError("cancel_event must be a threading.Event")
     normalized_args = _validate_structured_command(
         args, category, timeout_s, stdout_limit, stderr_limit
     )
@@ -2240,7 +2307,7 @@ def run_structured_command(
                     assert thread is not None
                     _command_start_thread(thread)
                     start_returned = True
-                if caller_fault:
+                if caller_fault or (cancel_event is not None and cancel_event.is_set()):
                     notify_cancellation()
                 open_gate()
                 if not start_returned:
@@ -2248,7 +2315,7 @@ def run_structured_command(
                     continue
                 publication_ready = False
                 while not publication_ready:
-                    if caller_fault:
+                    if caller_fault or (cancel_event is not None and cancel_event.is_set()):
                         notify_cancellation()
                     assert published is not None
                     publication_ready = _command_wait_publication(published, 0.05)
@@ -3748,6 +3815,52 @@ def _physical_memory_bytes() -> float:
         return total
 
 
+def parse_vm_counters(raw: str) -> dict[str, int]:
+    """Project only complete, recognized cumulative page counters from vm_stat.
+
+    Older responses without all four optional counters expose no activity
+    projection.  Present malformed or duplicate counters invalidate the
+    attempt so retained activity cannot be mistaken for a fresh zero.
+    """
+
+    names = {
+        "Compressions": "vm_compressions",
+        "Decompressions": "vm_decompressions",
+        "Swapins": "vm_swapins",
+        "Swapouts": "vm_swapouts",
+    }
+    counters: dict[str, int] = {}
+    page_sizes: list[int] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        page_match = re.fullmatch(
+            r"Mach Virtual Memory Statistics: \(page size of ([0-9]+) bytes\)",
+            stripped,
+        )
+        if page_match is not None:
+            page_sizes.append(int(page_match.group(1)))
+        name, separator, _value = stripped.partition(":")
+        if name not in names or not separator:
+            continue
+        key = names[name]
+        value_match = re.fullmatch(r"[A-Za-z]+:\s*([0-9]+)\.", stripped)
+        if key in counters or value_match is None:
+            raise ValueError("malformed or duplicate vm_stat activity counter")
+        counters[key] = int(value_match.group(1))
+        if counters[key] >= 2**64:
+            raise ValueError("vm_stat activity counter exceeds its native range")
+    if not counters:
+        return {}
+    if len(page_sizes) != 1:
+        raise ValueError("vm_stat activity requires one recognized page size")
+    page_size = page_sizes[0]
+    if page_size <= 0 or page_size > 2**32 or page_size & (page_size - 1):
+        raise ValueError("vm_stat page size must be a positive power of two")
+    if len(counters) != len(names):
+        return {}
+    return {"vm_page_size": page_size, **counters}
+
+
 def _memory_detail_attempt() -> tuple[dict[str, float], bool]:
     """Return legacy detail plus whether vm_stat supplied recognized evidence."""
 
@@ -3789,6 +3902,7 @@ def _memory_detail_attempt() -> tuple[dict[str, float], bool]:
         "wired": wired,
         "compressed": compressed,
     }
+    detail.update(parse_vm_counters(raw))
     required_used_fields = {
         "anonymous pages", "pages wired down", "pages occupied by compressor",
     }
@@ -3803,7 +3917,10 @@ def _memory_detail_attempt() -> tuple[dict[str, float], bool]:
 def memory_detail() -> dict[str, float]:
     """Return vm_stat-derived detail using the cached physical byte size."""
 
-    return _memory_detail_attempt()[0]
+    detail, proven = _memory_detail_attempt()
+    if not proven:
+        raise ValueError("memory detail response unrecognized")
+    return detail
 
 
 def _swap_stats_attempt() -> tuple[tuple[float, float], bool]:
@@ -3822,7 +3939,10 @@ def _swap_stats_attempt() -> tuple[tuple[float, float], bool]:
 def swap_stats() -> tuple[float, float]:
     """Return swap used/total bytes from one bounded legacy probe."""
 
-    return _swap_stats_attempt()[0]
+    values, proven = _swap_stats_attempt()
+    if not proven:
+        raise ValueError("swap response unrecognized")
+    return values
 
 
 def merge_memory_stats(
@@ -4093,6 +4213,8 @@ def network_bytes() -> tuple[int, int]:
             continue
         previous = iface_totals.get(name, (0, 0))
         iface_totals[name] = (max(previous[0], ibytes), max(previous[1], obytes))
+    if header is None or "Ibytes" not in header or "Obytes" not in header:
+        raise ValueError("network counter response unrecognized")
     return (
         sum(value[0] for value in iface_totals.values()),
         sum(value[1] for value in iface_totals.values()),
@@ -4103,30 +4225,27 @@ def _network_rate_update(
     baseline: Optional[tuple[tuple[int, int], float]],
     totals: tuple[int, int],
     sampled_mono_s: float,
-) -> tuple[
-    tuple[tuple[int, int], float], Optional[tuple[float, float]]
-]:
-    """Prime cumulative counters, then derive only monotonic sample deltas."""
+) -> tuple[tuple[tuple[int, int], float], Optional[tuple[float, float]]]:
+    """Derive rates from distinct completed samples, including measured idle."""
 
-    sampled = (int(totals[0]), int(totals[1]))
+    if (len(totals) != 2 or any(type(value) is not int or value < 0 for value in totals)
+            or isinstance(sampled_mono_s, bool)
+            or not math.isfinite(sampled_mono_s) or sampled_mono_s < 0):
+        raise ValueError("network counters and sample clock must be valid")
+    sampled = (totals[0], totals[1])
     now = float(sampled_mono_s)
+    current = (sampled, now)
     if baseline is None:
-        return (sampled, now), None
+        return current, None
     previous, previous_mono_s = baseline
-    if sampled == previous:
-        return baseline, None
-    if sampled[0] < previous[0] or sampled[1] < previous[1]:
-        return (sampled, now), (0.0, 0.0)
     elapsed = now - previous_mono_s
-    if elapsed <= 0.0:
-        return (sampled, now), (0.0, 0.0)
-    return (
-        (sampled, now),
-        (
-            (sampled[0] - previous[0]) / elapsed,
-            (sampled[1] - previous[1]) / elapsed,
-        ),
-    )
+    if elapsed == 0 and sampled == previous:
+        return baseline, None
+    if (elapsed <= 0.0 or elapsed > 5.0
+            or sampled[0] < previous[0] or sampled[1] < previous[1]):
+        return current, None
+    return current, ((sampled[0] - previous[0]) / elapsed,
+                     (sampled[1] - previous[1]) / elapsed)
 
 
 def collect_runtime_stats() -> RuntimeStats:
@@ -4559,8 +4678,35 @@ def _registry_states() -> Mapping[SourceId, SourceState[Any]]:
     })
 
 
+class _ProcessFactCache:
+    """Retain one minimized projection, without trusting mutable process rows."""
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        self._sample: Any = None
+        self._row_key: tuple[Any, ...] = ()
+        self._facts: tuple[ProcessFact, ...] = ()
+
+    def facts(self, sample: Any) -> tuple[ProcessFact, ...]:
+        # ProcessRow is mutable. Include field types so bool/int equality cannot
+        # hide a corrupted PID or CPU value behind a previously valid sample.
+        row_key = tuple(
+            (type(row.pid), row.pid, type(row.cpu), row.cpu,
+             type(row.etime), row.etime, type(row.command), row.command)
+            for row in sample.value
+        )
+        if sample is self._sample and row_key == self._row_key:
+            return self._facts
+        facts = process_facts(sample.value)
+        self._sample, self._row_key, self._facts = sample, row_key, facts
+        return facts
+
+
 def _sanitized_process_state(
     state: SourceState[Any], now_mono_s: float,
+    process_cache: Optional[_ProcessFactCache] = None,
 ) -> SourceState[tuple[ProcessFact, ...]]:
     """Copy retained process rows across the effect/policy privacy boundary."""
 
@@ -4570,13 +4716,15 @@ def _sanitized_process_state(
     rows = state.last_valid.value
     if type(rows) is not tuple or any(not isinstance(row, ProcessRow) for row in rows):
         raise ValueError("process table sample must contain ProcessRow values")
-    facts = process_facts(rows)
+    facts = (process_facts(rows) if process_cache is None
+             else process_cache.facts(state.last_valid))
     sample = replace(state.last_valid, value=facts)
     return replace(state, last_valid=sample)
 
 
 def _validated_live_states(
     states: Mapping[SourceId, SourceState[Any]], now_mono_s: float,
+    process_cache: Optional[_ProcessFactCache] = None,
 ) -> Mapping[SourceId, SourceState[Any]]:
     """Reject malformed, missing, extra, or misplaced evidence before reduction."""
 
@@ -4600,7 +4748,7 @@ def _validated_live_states(
             raise ValueError("source cadence must match the live registry")
         copied[source_id] = state
     copied[SourceId.PROCESS_TABLE] = _sanitized_process_state(
-        copied[SourceId.PROCESS_TABLE], now_mono_s,
+        copied[SourceId.PROCESS_TABLE], now_mono_s, process_cache,
     )
     return MappingProxyType(copied)
 
@@ -4650,12 +4798,13 @@ def build_health_frame(
     policy_state: PolicyState,
     states: Mapping[SourceId, SourceState[Any]],
     now_mono_s: float,
+    *, process_cache: Optional[_ProcessFactCache] = None,
 ) -> tuple[PolicyState, HealthFrame]:
     """Reduce one validated live registry into a privacy-safe frame."""
 
     if type(now_mono_s) not in (int, float) or not math.isfinite(now_mono_s):
         raise ValueError("now_mono_s must be finite")
-    checked = _validated_live_states(states, float(now_mono_s))
+    checked = _validated_live_states(states, float(now_mono_s), process_cache)
     facts = HealthFacts(
         checked[SourceId.CPU_USAGE],
         checked[SourceId.MEMORY_PRESSURE],
@@ -4671,11 +4820,11 @@ def build_health_frame(
     contributor = select_cpu_contributor(
         next_policy.process_history, checked[SourceId.PROCESS_TABLE], float(now_mono_s),
     )
+    cpu_usage = _ready_value(checked[SourceId.CPU_USAGE], CpuUsage, float(now_mono_s))
     frame = HealthFrame(
         assessment=assessment,
         source_views=views,
-        cpu_percent=_ready_value(checked[SourceId.CPU_USAGE], CpuUsage, float(now_mono_s)).percent
-        if _ready_value(checked[SourceId.CPU_USAGE], CpuUsage, float(now_mono_s)) is not None else None,
+        cpu_percent=cpu_usage.percent if cpu_usage is not None else None,
         memory_pressure=_ready_value(checked[SourceId.MEMORY_PRESSURE], MemoryPressure, float(now_mono_s)),
         thermal=_ready_value(checked[SourceId.THERMAL_OS], OsThermalState, float(now_mono_s)),
         disk_capacity=_ready_value(checked[SourceId.DISK_CAPACITY], DiskCapacity, float(now_mono_s)),
@@ -4711,6 +4860,7 @@ class LiveHealthCoordinator:
         ] = None
         self._system_gpu_percent: Optional[float] = None
         self._previous_time: Optional[tuple[float, datetime]] = None
+        self._process_facts_cache = _ProcessFactCache()
         self._cpu_sampler: MacCpuSampler
         self._gpu_sampler: GPUProcessSampler
         self._pollers: Mapping[SourceId, SourcePoller[Any]]
@@ -4822,6 +4972,7 @@ class LiveHealthCoordinator:
         self._cpu_sampler = cpu_sampler
         self._gpu_sampler = gpu_sampler
         self._pollers = MappingProxyType(pollers)
+        self._process_facts_cache.clear()
 
     @staticmethod
     def _close_poller_set(
@@ -4872,6 +5023,7 @@ class LiveHealthCoordinator:
                     frame_states[source_id] = state
             self._policy, self._frame = build_health_frame(
                 self._policy, MappingProxyType(frame_states), float(now_mono_s),
+                process_cache=getattr(self, "_process_facts_cache", None),
             )
             self._frame_states = MappingProxyType(frame_states)
             cpu = frame_states[SourceId.CPU_USAGE]
@@ -4977,6 +5129,9 @@ class LiveHealthCoordinator:
                 return
             self._closed = True
             pollers = self._pollers
+            process_cache = getattr(self, "_process_facts_cache", None)
+            if process_cache is not None:
+                process_cache.clear()
         error = self._close_poller_set(pollers, time.monotonic() + 1.0)
         if error is not None:
             raise error
@@ -5295,6 +5450,10 @@ def display_mode_name(mode: str) -> str:
         "io": "4 I/O",
         "processes": "5 PROCESSES",
         "cinema": "6 CINEMA",
+        "insights": "7 INSIGHTS",
+        "devices": "8 DEVICES",
+        "network": "9 NETWORK",
+        "connections": "0 CONNECTIONS",
     }
     try:
         return names[mode]
@@ -5865,61 +6024,62 @@ def cpu_lane_text(label: str, index: int, percent: float, width: int, phase: int
 
 
 def pig_mascot_lines(phase: int) -> list[str]:
-    blink = (phase // 10) % 18 == 0
-    grin_frames = ["\\____/", "\\_u__/", "\\____/", "\\_v__/"]
-    eyes = "--  --" if blink else "oo  oo" if (phase // 18) % 5 else "^^  ^^"
-    ear_tip = "~" if (phase // 9) % 2 else "^"
-    return [
-        f"   /{ear_tip}\\   _.._   /{ear_tip}\\  ",
-        "  /  `.'    `.'  \\ ",
-        f" |    {eyes}    |",
-        " |    .-oo-.    |",
-        f" |    {grin_frames[(phase // 7) % len(grin_frames)]:^6}    |",
-        "  '._  ----  _.'  ",
-    ]
+    """Compatibility projection of the shared, pure mascot renderer."""
+
+    return list(render_mascot(phase, unicode_enabled=unicode_ok()).plain_rows)
 
 
-def draw_header(screen: curses.window, width: int, phase: int, static: dict[str, Any], config: HudConfig) -> int:
-    """Draw legacy branding without frame lifecycle effects; reserved for Cinema."""
+def draw_signature(
+    screen: curses.window, y: int, width: int, static: Mapping[str, Any],
+    config: HudConfig, phase: int,
+) -> int:
+    """Seven rows of branding; all health information remains above this band."""
 
-    height, _screen_width = screen.getmaxyx()
-    if width >= 118 and height >= 34 and config.layout_name != "compact":
-        title_lines = [
-            " ____            _          _   _ _   _ ____  ",
-            "|  _ \\ ___  _ __| | ___   _| | | | | | |  _ \\ ",
-            "| |_) / _ \\| '__| |/ / | | | |_| | | | | | | |",
-            "|  __/ (_) | |  |   <| |_| |  _  | |_| | |_| |",
-            "|_|   \\___/|_|  |_|\\_\\\\__, |_| |_|\\___/|____/ ",
-            "                       |___/                  ",
-        ]
-        mascot_lines = pig_mascot_lines(phase)
-        for idx, line in enumerate(title_lines):
-            attr = color_pair(PAIR_INFO) | curses.A_BOLD if idx in (0, 2) else color_pair(PAIR_PRIMARY)
-            safe_add(screen, idx, 2, line, attr)
-        pig_x = min(max(58, len(title_lines[0]) + 8), max(2, width - 54))
-        for idx, line in enumerate(mascot_lines):
-            attr = color_pair(PAIR_BRAND) | curses.A_BOLD if idx in (2, 3) else color_pair(PAIR_SECONDARY)
-            safe_add(screen, idx, pig_x, line, attr)
-        rig = f"{static.get('chip', 'Mac')} / {static.get('model', '')}".strip()
-        safe_add(screen, 3, max(58, width - len(rig) - 3), rig[: max(0, width - 62)], color_pair(PAIR_PRIMARY))
-        meta = f"{COPYRIGHT_TEXT}  |  {config.theme_name} / {config.layout_name}"
-        safe_add(screen, 5, max(58, width - len(meta) - 3), meta, color_pair(PAIR_SECONDARY) | curses.A_BOLD)
-        divider = list("-" * (width - 2))
-        head = (phase * 3) % max(1, width - 2)
-        for offset, char in enumerate("<*>"):
-            idx = head + offset
-            if 0 <= idx < len(divider):
-                divider[idx] = char
-        safe_add(screen, 6, 1, "".join(divider), color_pair(PAIR_STRUCTURE))
-        return 7
+    mascot = render_mascot(phase, style=config.visual_style,
+                          unicode_enabled=unicode_ok())
+    roles = {"brand": PAIR_PIG_BODY, "highlight": PAIR_PIG_LIT,
+             "shadow": PAIR_PIG_SHADOW, "detail": PAIR_PIG_DETAIL,
+             "structure": PAIR_STRUCTURE}
+    for row_index, spans in enumerate(mascot.rows):
+        x = 2
+        for span in spans:
+            _rect_add(screen, y + row_index, x, span.text, max(0, 30 - x),
+                      color_pair(roles[span.role]))
+            x += display_cell_width(span.text)
+    x = 33
+    budget = width - x - 2
+    mark = wordmark_lines("compact" if config.visual_style == "sculpted" else "outline",
+                          unicode_enabled=unicode_ok() and config.visual_style != "ascii")
+    for index, line in enumerate(mark[:3]):
+        _rect_add(screen, y + index, x, line, budget,
+                  color_pair(PAIR_PRIMARY) | curses.A_BOLD)
+    _rect_add(screen, y + 3, x, "YOUR MAC, IN FOCUS", budget, color_pair(PAIR_INFO))
+    chip = str(static.get("chip") or "Discovering your Mac")
+    memory = str(static.get("memory") or "")
+    _rect_add(screen, y + 4, x, chip + (" · " + memory if memory else ""), budget,
+              color_pair(PAIR_PRIMARY))
+    motion = ("off", "calm", "vivid")[config.animation_mode % 3]
+    _rect_add(screen, y + 5, x, "%s · %s · motion %s" %
+              (config.theme_name, config.visual_style, motion), budget,
+              color_pair(PAIR_SECONDARY))
+    _rect_add(screen, y + 6, x, "─" * budget if unicode_ok() else "-" * budget,
+              budget, color_pair(PAIR_STRUCTURE))
+    return y + 7
 
-    title = " P O R K Y H U D "
-    safe_add(screen, 0, 1, title, color_pair(PAIR_INFO) | curses.A_BOLD)
-    meta = f"{COPYRIGHT_TEXT} | {config.theme_name} / {config.layout_name}"
-    safe_add(screen, 1, max(1, width - len(meta) - 2), meta[: max(0, width - 3)], color_pair(PAIR_SECONDARY))
-    divider = list("-" * (width - 2))
-    divider[(phase * 2) % max(1, width - 2)] = "*"
-    safe_add(screen, 2, 1, "".join(divider), color_pair(PAIR_STRUCTURE))
+
+def draw_header(screen: curses.window, width: int, phase: int,
+                static: dict[str, Any], config: HudConfig) -> int:
+    """Compatibility branding adapter; frame lifecycle stays with the caller."""
+
+    height, _ = screen.getmaxyx()
+    if width >= 118 and height >= 34:
+        return draw_signature(screen, 0, width, static, config, phase)
+    _rect_add(screen, 0, 1, " P O R K Y H U D ", width - 2,
+              color_pair(PAIR_PRIMARY) | curses.A_BOLD)
+    _rect_add(screen, 1, 1, "%s · %s / %s" %
+              (COPYRIGHT_TEXT, config.theme_name, config.layout_name), width - 2,
+              color_pair(PAIR_SECONDARY))
+    _rect_add(screen, 2, 1, "-" * (width - 2), width - 2, color_pair(PAIR_STRUCTURE))
     return 3
 
 
@@ -6576,73 +6736,246 @@ def draw_overview_body(
     screen: curses.window, body_y: int, body_h: int, width: int,
     frame: HealthFrame, history: MetricHistory, rows: Sequence[ProcessRow],
     sort_mode: str, sensor: Optional[SensorInfo] = None,
+    *, static: Optional[Mapping[str, Any]] = None,
+    config: Optional[HudConfig] = None, phase: int = 0,
 ) -> int:
-    """Draw the fixed Overview hierarchy without collection or frame effects."""
+    """A calm visual identity above explicit evidence and identity-only workloads."""
 
-    body_w = width - 2
-    elapsed = 0.0
-    details = []
-    for source_id, label in _CORE_SOURCE_LABELS.items():
+    config = config or HudConfig()
+    y = draw_signature(screen, body_y, width, static or {}, config, phase)
+    h = body_h - 7
+    left_w = (width - 3) // 2
+    right_x = left_w + 2
+    right_w = width - right_x - 1
+    draw_box(screen, y, 1, h, left_w, "EVIDENCE DETAIL", color_pair(PAIR_STRUCTURE))
+    draw_box(screen, y, right_x, h, right_w, "TOP PROCESSES · " + sort_mode,
+             color_pair(PAIR_STRUCTURE))
+    for index, (source_id, label) in enumerate(_CORE_SOURCE_LABELS.items()):
         view = frame.source_views[source_id]
         value = (_live_ribbon_value(frame, source_id)
-                 if view.status is SourceViewStatus.LIVE
-                 else source_view_text(view, elapsed))
-        details.append("%s %s" % (label, value))
-    _body_add(
-        screen, body_y, 1, "EVIDENCE DETAIL · " + " · ".join(details), body_w,
-        color_pair(PAIR_INFO) | curses.A_BOLD,
-    )
-    _body_add(
-        screen, body_y + 1, 1,
-        "PROVENANCE · macOS core evidence · current frame",
-        body_w, color_pair(PAIR_SECONDARY),
-    )
-    _body_add(
-        screen, body_y + 2, 1, "TOP PROCESSES · sort %s" % sort_mode,
-        body_w, color_pair(PAIR_STRUCTURE) | curses.A_BOLD,
-    )
-    visible_rows = max(0, min(5, body_h - 5))
-    for index, row in enumerate(rows[:visible_rows]):
-        metric = (row.mem if sort_mode == "MEM" else
-                  (row.gpu if sort_mode == "GPU" else row.cpu))
-        metric_text = "--" if metric is None else "%.1f" % metric
-        identity_width = max(8, body_w - 16)
-        identity = truncate_display_cells(
-            process_identity(row.command), identity_width,
-        )
-        identity_field = identity + " " * max(
-            0, identity_width - display_cell_width(identity),
-        )
-        _body_add(
-            screen, body_y + 3 + index, 1,
-            "%2d  %s %s %s" % (
-                index + 1, identity_field, sort_mode, metric_text,
-            ),
-            body_w, color_pair(PAIR_PRIMARY),
-        )
+                 if view.status is SourceViewStatus.LIVE else source_view_text(view))
+        _body_add(screen, y + 1 + index, 3, "%s  %s" % (label, value),
+                  left_w - 4, color_pair(PAIR_INFO if view.status is SourceViewStatus.LIVE
+                                           else PAIR_SECONDARY))
+    _body_add(screen, y + 6, 3, "PROVENANCE · macOS core evidence", left_w - 4,
+              color_pair(PAIR_SECONDARY))
+    if h >= 10:
+        _body_add(screen, y + 7, 3, "CPU 60s · " + sparkline(history.cpu, max(1, left_w - 14)),
+                  left_w - 4, color_pair(PAIR_INFO))
     exceptional = []
-    for source_id, label in _CORE_SOURCE_LABELS.items():
-        view = frame.source_views[source_id]
-        if view.status is not SourceViewStatus.LIVE:
-            exceptional.append("%s %s" % (label, source_view_text(view)))
     if frame.decisive_triggered_mono_s is not None:
-        exceptional.append("recovery confirmation in progress")
+        exceptional.append("recovery confirmation")
     if sensor is not None and sensor.privileged_locked:
         exceptional.append("LOCKED · u: temporary unlock")
-    next_y = body_y + 3 + visible_rows
-    if exceptional and next_y < body_y + body_h:
-        _body_add(
-            screen, next_y, 1, "EXCEPTION · " + " · ".join(exceptional),
-            body_w, color_pair(PAIR_PRIMARY) | curses.A_BOLD,
-        )
-        next_y += 1
-    if body_y + body_h + 1 >= 24 and width >= 80 and next_y < body_y + body_h:
-        _body_add(
-            screen, next_y, 1,
-            "CPU 60s · %s" % sparkline(history.cpu, max(8, body_w - 10), 100.0),
-            body_w, color_pair(PAIR_STRUCTURE),
-        )
+    if exceptional:
+        _body_add(screen, y + h - 2, 3, " · ".join(exceptional), left_w - 4,
+                  color_pair(PAIR_PRIMARY) | curses.A_BOLD)
+    visible = max(0, min(8, h - 3))
+    for index, row in enumerate(rows[:visible]):
+        metric = row.mem if sort_mode == "MEM" else row.gpu if sort_mode == "GPU" else row.cpu
+        metric_text = "--" if metric is None else "%.1f%%" % metric
+        identity_width = max(4, right_w - 14)
+        identity = truncate_display_cells(process_identity(row.command), identity_width)
+        identity += " " * max(0, identity_width - display_cell_width(identity))
+        _body_add(screen, y + 1 + index, right_x + 2,
+                  "%s %s" % (identity, metric_text), right_w - 4, color_pair(PAIR_PRIMARY))
+    if not rows:
+        _body_add(screen, y + 1, right_x + 2, "Waiting for process evidence", right_w - 4,
+                  color_pair(PAIR_SECONDARY))
     return 0
+
+
+def draw_insights_body(
+    screen: curses.window, y: int, h: int, width: int, frame: HealthFrame,
+    mem: Mapping[str, float], vm_view: Optional[VmRateView],
+    cpu_samples: Sequence[tuple[float, float]], history: MetricHistory,
+) -> None:
+    """Descriptive measured context, kept separate from the decision policy."""
+
+    left_w = (width - 3) // 2
+    right_x = left_w + 2
+    right_w = width - right_x - 1
+    draw_box(screen, y, 1, h, left_w, "CPU · RECENT 60s", color_pair(PAIR_STRUCTURE))
+    draw_box(screen, y, right_x, h, right_w, "MEMORY MECHANICS", color_pair(PAIR_STRUCTURE))
+    summary = (summarize_cpu_samples(cpu_samples, frame.captured_mono_s)
+               if frame.source_views[SourceId.CPU_USAGE].decision_ready else None)
+    left = ["Descriptive · sampled observations"]
+    if summary is None:
+        cpu_view = frame.source_views[SourceId.CPU_USAGE]
+        left += ["CHECKING · collecting samples" if cpu_view.decision_ready else
+                 cpu_view.status.value + " · recent samples unavailable"]
+    else:
+        left += ["Mean    %.1f%%" % summary.mean_percent,
+                 "Peak    %.1f%%" % summary.peak_percent,
+                 "Samples %d · span %.1fs" % (summary.sample_count, summary.coverage_s)]
+    left += ["", sparkline(history.cpu, max(1, left_w - 4)), "",
+             "Aggregate CPU capacity: 0–100%", "Process CPU: 100% = one core",
+             "Averages describe observed samples.", "Health uses its own 15s window."]
+    rates = vm_view.rates if vm_view is not None else None
+    status = vm_view.status.value if vm_view is not None else "CHECKING"
+    right = ["%s · live page-counter deltas" % status]
+    if rates is None:
+        right += [vm_view.detail if vm_view is not None else "Waiting for two valid samples",
+                  "Missing data never becomes zero."]
+    else:
+        right += ["Compress     %8.1f pages/s" % rates.compressions_per_s,
+                  "Decompress   %8.1f pages/s" % rates.decompressions_per_s,
+                  "Swap in      %8.1f pages/s" % rates.swapins_per_s,
+                  "Swap out     %8.1f pages/s" % rates.swapouts_per_s,
+                  "Sample window %.2fs" % rates.window_s]
+    right += ["", "Compressed footprint " + human_bytes(mem.get("compressed", 0))
+              if "compressed" in mem else "Compressed footprint unavailable",
+              "Swap allocated " + human_bytes(mem.get("swap_used", 0))
+              if "swap_used" in mem else "Swap allocation unavailable",
+              "", "Pages/s measures VM activity.", "It is not physical disk throughput.",
+              "macOS pressure drives health."]
+    for x, w, lines in ((3, left_w - 4, left), (right_x + 2, right_w - 4, right)):
+        for index, line in enumerate(lines[:max(0, h - 2)]):
+            _body_add(screen, y + 1 + index, x, line, w,
+                      color_pair(PAIR_INFO if index in (1, 2, 3, 4) else PAIR_SECONDARY))
+
+
+EXPLORE_OPTIONS = (
+    ("insights", "7", "Measured insights", "CPU observations, compression and swap activity"),
+    ("devices", "8", "Connected devices", "USB, Thunderbolt and display topology"),
+    ("network", "9", "Network environment", "Interfaces, addresses, default route and DNS"),
+    ("connections", "0", "TCP connections", "Observed listeners and established peers"),
+)
+def _inventory_probe(argv: Sequence[str], *, timeout_s: float,
+                     max_output_bytes: int,
+                     cancel_event: Optional[threading.Event] = None) -> ProbeResult:
+    """Adapt bounded command outcomes without exposing stderr or argv."""
+
+    if cancel_event is not None and cancel_event.is_set():
+        return ProbeResult(status=InventoryStatus.ERROR, detail="inventory closed")
+    options = {"cancel_event": cancel_event} if cancel_event is not None else {}
+    result = run_structured_command(argv, "inventory", timeout_s,
+                                    max_output_bytes, 16 * 1024, **options)
+    statuses = {
+        AttemptOutcome.SUCCESS: InventoryStatus.LIVE,
+        AttemptOutcome.TIMEOUT: InventoryStatus.TIMEOUT,
+        AttemptOutcome.PERMISSION_DENIED: InventoryStatus.PERMISSION_DENIED,
+        AttemptOutcome.MISSING_DEPENDENCY: InventoryStatus.MISSING,
+        AttemptOutcome.UNSUPPORTED: InventoryStatus.UNSUPPORTED,
+    }
+    status = statuses.get(result.outcome, InventoryStatus.ERROR)
+    # Some commands report a proved denial as a nonzero exit. Its raw text is
+    # examined only here and never projected into inventory or UI records.
+    if result.failure is FailureCode.PERMISSION_DENIED or (
+            result.outcome is AttemptOutcome.COMMAND_ERROR
+            and re.search(r"permission denied|operation not permitted|must be root",
+                          result.stderr, re.IGNORECASE)):
+        status = InventoryStatus.PERMISSION_DENIED
+    return ProbeResult(result.stdout if status is InventoryStatus.LIVE else "", status,
+                       "" if status is InventoryStatus.LIVE else "bounded macOS probe unavailable")
+
+
+INVENTORY_COLLECTORS = {
+    "devices": collect_devices, "network": collect_network,
+    "connections": collect_connections,
+}
+
+
+def inventory_lines(mode: str, result: Any) -> list[str]:
+    """Readable row projection over structured, privacy-limited native facts."""
+
+    if mode == "devices":
+        return ["%s · %s" % (item.kind, item.name) +
+                (" | " + " · ".join(value for value in
+                 (item.vendor, item.product_id, item.speed, item.parent, item.port) if value)
+                 if any((item.vendor, item.product_id, item.speed, item.parent, item.port)) else "")
+                for item in result.items]
+    if mode == "network":
+        lines = ["IPv4 default route · %s · interface %s [%s]" %
+                 (result.gateway or "unknown", result.default_interface or "unknown",
+                  result.route_status.value),
+                 "DNS · %s [%s]" % (", ".join(result.dns_servers) or "none reported",
+                                    result.dns_status.value),
+                 "Hardware port mapping [%s]" % result.hardware_status.value, ""]
+        for item in result.items:
+            lines.append("%s · %s · %s · MTU %s" %
+                         (item.name, " · ".join(value for value in (item.hardware_port, item.medium) if value) or "interface",
+                          item.state, item.mtu if item.mtu is not None else "unknown"))
+            addresses = ["IPv4 " + value for value in item.ipv4]
+            addresses += ["IPv6 " + value for value in item.ipv6]
+            if item.mac:
+                addresses.append("MAC " + item.mac)
+            lines.append("  " + (" · ".join(addresses) or "No addresses reported"))
+        return lines
+    if mode == "connections":
+        return ["%-12s %s  →  %s · Rx/Tx queue bytes %s/%s" %
+                (item.state, item.local, item.remote, item.recv_queue, item.send_queue)
+                for item in result.items]
+    raise ValueError("unknown inventory view")
+
+
+def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
+                        width: int, result: Any, age_s: float, error: str,
+                        scroll: int, retained: bool = False) -> int:
+    title = {"devices": "CONNECTED DEVICES", "network": "NETWORK ENVIRONMENT",
+             "connections": "TCP CONNECTIONS"}[mode]
+    draw_box(screen, y, 1, h, width - 2, title, color_pair(PAIR_STRUCTURE))
+    if result is None:
+        lines = ["ERROR · collection unavailable" if error else "CHECKING · collecting bounded macOS inventory"]
+        status = "ERROR" if error else "CHECKING"
+    else:
+        status = "ERROR" if error else ("STALE" if age_s > 30.0 and
+                 result.status is InventoryStatus.LIVE else result.status.value)
+        lines = inventory_lines(mode, result)
+        if not lines:
+            lines = [result.detail or "No matching records reported"]
+        if result.status is not InventoryStatus.LIVE:
+            lines.insert(0, result.detail or "Inventory unavailable")
+    if result is not None and status == "LIVE" and not result.complete:
+        status = "PARTIAL"
+    _body_add(screen, y + 1, 3,
+              "%s · observed locally · %s" % (status,
+               "retained sample · %.0fs" % age_s if result is not None and
+               (retained or result.status is InventoryStatus.LIVE and (error or age_s > 30.0))
+               else "read-only"),
+              width - 6, color_pair(PAIR_INFO if status == "LIVE" else PAIR_SECONDARY))
+    # Wrap at display-cell boundaries so narrow viewports retain every field.
+    wrapped = []
+    for line in lines:
+        projected = semantic_text(line, unicode_ok())
+        while display_cell_width(projected) > width - 6:
+            segment = truncate_display_cells(projected, width - 8)
+            if not segment:
+                break
+            wrapped.append(segment)
+            projected = "  " + projected[len(segment):]
+        wrapped.append(projected)
+    lines = wrapped
+    available = max(0, h - 5)
+    effective = max(0, min(scroll, max(0, len(lines) - available)))
+    for index, line in enumerate(lines[effective:effective + available]):
+        _body_add(screen, y + 2 + index, 3, line, width - 6, color_pair(PAIR_PRIMARY))
+    note = ("Protected sockets may be hidden" if mode == "connections" else
+            "No connectivity test or network changes" if mode == "network" else
+            "Reported topology · serial numbers omitted")
+    limited = " · TRUNCATED" if result is not None and result.truncated else ""
+    _body_add(screen, y + h - 2, 3, "%d–%d / %d%s · %s" %
+              (effective + 1 if lines else 0, min(len(lines), effective + available),
+               len(lines), limited, note), width - 6, color_pair(PAIR_SECONDARY))
+    return effective
+
+
+def draw_explore_menu(screen: curses.window, config: HudConfig) -> None:
+    height, width = screen.getmaxyx()
+    w, h = min(70, width - 6), 14
+    y, x = max(3, (height - h) // 2), (width - w) // 2
+    fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
+    draw_box(screen, y, x, h, w, "EXPLORE YOUR MAC", color_pair(PAIR_STRUCTURE))
+    for index, (_mode, key, label, description) in enumerate(EXPLORE_OPTIONS):
+        selected = index == config.menu_index
+        _rect_add(screen, y + 2 + index * 2, x + 3,
+                  (("› " if unicode_ok() else "> ") if selected else "  ") + key + "  " + label, w - 6,
+                  color_pair(PAIR_INFO if selected else PAIR_PRIMARY) |
+                  (curses.A_BOLD if selected else 0))
+        _rect_add(screen, y + 3 + index * 2, x + 7, description, w - 10,
+                  color_pair(PAIR_SECONDARY))
+    _rect_add(screen, y + h - 2, x + 3, "↑/↓ select · Enter open · d/Esc close", w - 6,
+              color_pair(PAIR_SECONDARY))
 
 
 def draw_mode_body(
@@ -6651,7 +6984,10 @@ def draw_mode_body(
     mem: Mapping[str, float], battery: BatteryInfo, sensor: SensorInfo,
     disk: DiskInfo, activity: DiskActivity, net_down: float, net_up: float,
     history: MetricHistory, rows: Sequence[ProcessRow], scroll: int,
-    sort_mode: str, phase: int,
+    sort_mode: str, phase: int, *, config: Optional[HudConfig] = None,
+    vm_view: Optional[VmRateView] = None,
+    cpu_samples: Sequence[tuple[float, float]] = (),
+    inventory: Any = None, inventory_age: float = 0.0, inventory_error: str = "", inventory_retained: bool = False,
 ) -> int:
     """Dispatch one deterministic body inside the global header/footer geometry."""
 
@@ -6672,23 +7008,19 @@ def draw_mode_body(
     if mode == "balanced":
         return draw_overview_body(
             screen, body_y, body_h, width, frame, history, row_values, sort_mode,
-            sensor,
+            sensor, static=static_values, config=config, phase=phase,
         )
+    if mode == "insights":
+        draw_insights_body(screen, body_y, body_h, width, frame, memory_values,
+                           vm_view, cpu_samples, history)
+        return 0
+    if mode in INVENTORY_COLLECTORS:
+        return draw_inventory_body(screen, mode, body_y, body_h, width,
+                                   inventory, inventory_age, inventory_error, scroll, inventory_retained)
     if mode == "cinema":
         if width < 118 or body_y + body_h + 1 < 34 or body_h < 7:
             raise ValueError("Cinema requires 118×34")
-        brand_lines = (
-            "PORKYHUD CINEMA · SIGNAL FIRST",
-            "  /\\  _.._  /\\",
-            " |  oo  oo  |",
-            " |   .-oo-.  |",
-            "  '._ ---- _.'",
-            "TRUSTED DECISION COCKPIT",
-            "-" * max(1, body_w),
-        )
-        for index, line in enumerate(brand_lines):
-            _body_add(screen, body_y + index, 1, line, body_w,
-                      color_pair(PAIR_BRAND) | curses.A_BOLD)
+        draw_signature(screen, body_y, width, static_values, config or HudConfig(), phase)
         operational_y = body_y + 7
         operational_h = body_h - 7
         left_w, center_w, right_w = wide_column_widths(width, "cinema")
@@ -6756,14 +7088,14 @@ def set_message(config: HudConfig, text: str, ttl: float = 3.0) -> None:
 def shortcut_status(width: int) -> str:
     _projection_width(width)
     return semantic_text(
-        "1–5 mode · h help · m sort · r refresh · q quit", unicode_ok(),
+        "1–5 mode · d explore · h help · t theme · a motion · q quit", unicode_ok(),
     )
 
 
 def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorInfo) -> None:
     height, width = screen.getmaxyx()
     w = min(72, max(48, width - 8))
-    h = 16
+    h = min(21, height - 4)
     y = max(2, (height - h) // 2)
     x = max(2, (width - w) // 2)
     fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
@@ -6780,13 +7112,15 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
         "q             quit",
         "Esc / h / ?   close this panel",
         "1–5           select operational mode",
+        "d / 7–9 / 0   Explore / insights, devices, network, TCP",
         "t             cycle theme",
+        "s             sculpted / outline / ASCII style",
         "l             cycle supported modes",
         "a             motion: off / calm / vivid",
         "m             sort process grid by CPU, memory, or GPU",
-        "r             refresh live telemetry",
-        "arrows/j/k    scroll processes",
-        "PgUp/PgDn/Home/End  jump through processes",
+        "r             refresh telemetry and selected inventory",
+        "arrows/j/k    scroll processes or inventory",
+        "PgUp/PgDn/Home/End  page or jump to either end",
         "",
     ]
     if width >= 118 and height >= 34:
@@ -6827,7 +7161,7 @@ def init_colors(theme_index: int = 0) -> None:
         return
 
     theme = THEMES[theme_index % len(THEMES)]["colors"]
-    for pair_id, foreground in theme.items():
+    for pair_id, foreground in {**theme, **MASCOT_COLORS}.items():
         try:
             curses.init_pair(pair_id, color_id(foreground), background)
         except (curses.error, ValueError):
@@ -6977,19 +7311,30 @@ def _render_age_key(
     )
 
 
-def hud(screen: curses.window) -> None:
+def hud(screen: curses.window, config: Optional[HudConfig] = None) -> None:
     """Own terminal-session cleanup even when input or drawing raises."""
 
     coordinators: list[LiveHealthCoordinator] = []
+    inventory_jobs: list[tuple[AsyncPoller, threading.Event]] = []
     try:
-        _hud_impl(screen, coordinators)
+        _hud_impl(screen, coordinators, config, inventory_jobs)
     finally:
-        if coordinators:
-            coordinators[0].close()
+        for _poller, cancellation in inventory_jobs:
+            cancellation.set()
+        try:
+            if coordinators:
+                coordinators[0].close()
+        finally:
+            if inventory_jobs:
+                deadline = time.monotonic() + 1.5
+                for poller, _cancellation in inventory_jobs:
+                    poller.close(max(0.0, deadline - time.monotonic()))
 
 
 def _hud_impl(
     screen: curses.window, coordinators: list[LiveHealthCoordinator],
+    initial_config: Optional[HudConfig] = None,
+    inventory_jobs: Optional[list[tuple[AsyncPoller, threading.Event]]] = None,
 ) -> None:
     try:
         curses.curs_set(0)
@@ -7001,7 +7346,8 @@ def _hud_impl(
         pass
     screen.nodelay(True)
     screen.keypad(True)
-    config = HudConfig()
+    config = initial_config or HudConfig()
+    inventory_jobs = inventory_jobs if inventory_jobs is not None else []
     init_colors(config.theme_index)
     apply_dark_screen(screen)
     draw_initial_shell(screen, config)
@@ -7019,6 +7365,7 @@ def _hud_impl(
     static_poller: Optional[AsyncPoller] = None
     uptime_at_start = 0
     uptime_clock_start = time.monotonic()
+    intro_started = uptime_clock_start
     per_core: list[float] = []
     mem: dict[str, float] = {}
     battery = BatteryInfo(None, False, "Power", "checking", "checking", False,
@@ -7037,7 +7384,7 @@ def _hud_impl(
     latest_thermal: list[Optional[OsThermalState]] = [None]
     activity = DiskActivity()
     memory_poller = AsyncPoller(MEMORY_DETAIL_REFRESH_SECONDS, memory_detail, mem)
-    swap_poller = AsyncPoller(SWAP_REFRESH_SECONDS, swap_stats, (0.0, 0.0))
+    swap_poller = AsyncPoller(SWAP_REFRESH_SECONDS, swap_stats)
     network_poller = AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes)
     battery_poller = AsyncPoller(BATTERY_REFRESH_SECONDS, battery_info, battery)
     sensor_poller = AsyncPoller(
@@ -7049,6 +7396,12 @@ def _hud_impl(
     history = MetricHistory()
     history_source_generation = coordinator.source_generation()
     last_history_cpu_revision: Optional[int] = None
+    cpu_samples: deque[tuple[float, float]] = deque(maxlen=120)
+    vm_state = VmRateState()
+    vm_view = VmRateView()
+    memory_sample_revision = 0
+    network_sample_revision = 0
+    memory_sample_completed = 0.0
     force_live = True
     force_memory = True
     force_swap = True
@@ -7061,6 +7414,13 @@ def _hud_impl(
     descriptive_revision = 0
     last_render_state: Optional[tuple[Any, ...]] = None
     last_render_age_key: Optional[tuple[Any, ...]] = None
+    inventory_pollers: dict[str, AsyncPoller] = {}
+    inventory = None
+    inventory_age = 0.0
+    inventory_error = ""
+    inventory_retained = False
+    inventory_render_key = None
+    force_inventory = False
 
     def quit_hud() -> None:
         # The outer hud() finally owns the single aggregate close.
@@ -7072,17 +7432,40 @@ def _hud_impl(
         key = screen.getch()
         ui_changed = False
         if key in (ord("q"), ord("Q")) or (
-                key == 27 and not config.show_help):
+                key == 27 and not config.show_help and not config.show_menu):
             quit_hud()
             return
+        if key != -1:
+            config.intro_enabled = False
         controls_enabled = height >= 22 and width >= 76
         if not controls_enabled and key != 27:
+            key = -1
+        if config.show_menu:
+            if key in (27, ord("d"), ord("D"), ord("h"), ord("?")):
+                config.show_menu = False
+            elif key in (curses.KEY_DOWN, ord("j")):
+                config.menu_index = (config.menu_index + 1) % len(EXPLORE_OPTIONS)
+            elif key in (curses.KEY_UP, ord("k")):
+                config.menu_index = (config.menu_index - 1) % len(EXPLORE_OPTIONS)
+            elif key in (10, 13, curses.KEY_ENTER):
+                set_message(config, select_mode(config, EXPLORE_OPTIONS[config.menu_index][0], height, width))
+                config.show_menu = False
+                scroll = 0
+            elif key >= 0 and chr(key) in ("7", "8", "9", "0"):
+                set_message(config, select_mode(config, DIRECT_MODE_KEYS[chr(key)], height, width))
+                config.show_menu = False
+                scroll = 0
+            if key != -1:
+                ui_changed = True
             key = -1
         if config.show_help:
             if key in (27, ord("h"), ord("H"), ord("?")):
                 config.show_help = False
                 set_message(config, "shortcut panel closed")
                 ui_changed = True
+        elif key in (ord("d"), ord("D")):
+            config.show_menu = True
+            ui_changed = True
         elif key in (ord("h"), ord("H"), ord("?")):
             config.show_help = True
             set_message(config, "shortcut panel opened")
@@ -7100,6 +7483,11 @@ def _hud_impl(
             init_colors(config.theme_index)
             apply_dark_screen(screen)
             set_message(config, f"theme switched to {config.theme_name}")
+            ui_changed = True
+        elif key in (ord("s"), ord("S")):
+            config.visual_style = VISUAL_STYLES[(VISUAL_STYLES.index(config.visual_style) + 1)
+                                                % len(VISUAL_STYLES)]
+            set_message(config, "visual style: " + config.visual_style)
             ui_changed = True
         elif key in (ord("l"), ord("L")):
             set_message(config, cycle_mode(config, height, width))
@@ -7144,6 +7532,9 @@ def _hud_impl(
             ui_changed = True
         elif key in (ord("r"), ord("R")):
             force_live = True
+            force_inventory = True
+            force_memory = force_swap = force_network = True
+            force_battery = force_sensor = force_disk_activity = True
             set_message(config, "refreshing live telemetry")
             ui_changed = True
 
@@ -7151,6 +7542,10 @@ def _hud_impl(
         current_source_generation = coordinator.source_generation()
         if current_source_generation != history_source_generation:
             history.clear()
+            cpu_samples.clear()
+            vm_state, vm_view = VmRateState(), VmRateView()
+            network_baseline = None
+            net_down = net_up = None
             last_history_cpu_revision = None
             history_source_generation = current_source_generation
         frame = coordinator.tick(now, force_live)
@@ -7181,7 +7576,24 @@ def _hud_impl(
             uptime_at_start = int(static.get("boot_seconds", uptime_at_start) or 0)
             descriptive_revision += 1
         memory_poller.tick(now, force_memory)
-        sampled_memory, _memory_age, _memory_error = memory_poller.snapshot(now)
+        memory_sample = memory_poller.sample_snapshot(now)
+        sampled_memory = memory_sample.value
+        if memory_sample.revision != memory_sample_revision:
+            memory_sample_revision = memory_sample.revision
+            memory_sample_completed = memory_sample.completed_mono_s
+            try:
+                counters = vm_counters_from_mapping(sampled_memory or {})
+            except (TypeError, ValueError):
+                counters = None
+            vm_state, vm_view = update_vm_rates(
+                vm_state, counters, memory_sample_completed,
+                source_error=bool(memory_sample.error),
+            )
+            descriptive_revision += 1
+        elif (memory_sample_completed and now - memory_sample_completed > 6.0
+              and vm_view.status is InsightStatus.LIVE):
+            vm_view = VmRateView(InsightStatus.STALE, None, "memory activity sample delayed")
+            descriptive_revision += 1
         if sampled_memory and sampled_memory != mem:
             mem = sampled_memory
             descriptive_revision += 1
@@ -7193,25 +7605,29 @@ def _hud_impl(
                 mem = merged_memory
                 descriptive_revision += 1
         network_poller.tick(now, force_network)
-        sampled_network, _network_age, _network_error = network_poller.snapshot(now)
-        if (sampled_network is None and _network_error
-                and network_baseline is None
-                and (net_down, net_up) != (-1.0, -1.0)):
+        network_sample = network_poller.sample_snapshot(now)
+        if network_sample.revision != network_sample_revision:
+            network_sample_revision = network_sample.revision
+            if network_sample.error or network_sample.value is None:
+                network_baseline = None
+                sampled_rates = (-1.0, -1.0)
+            else:
+                try:
+                    network_baseline, sampled_rates = _network_rate_update(
+                        network_baseline, network_sample.value, network_sample.completed_mono_s,
+                    )
+                except (TypeError, ValueError):
+                    network_baseline = None
+                    sampled_rates = (-1.0, -1.0)
+            next_rates = sampled_rates if sampled_rates is not None else (None, None)
+            if next_rates != (net_down, net_up):
+                net_down, net_up = next_rates
+                descriptive_revision += 1
+        elif (network_baseline is not None and now - network_baseline[1] > 5.0
+              and (net_down, net_up) != (-1.0, -1.0)):
+            network_baseline = None
             net_down = net_up = -1.0
             descriptive_revision += 1
-        if (sampled_network is not None
-                and (network_baseline is None
-                     or sampled_network != network_baseline[0])):
-            first_network_sample = network_baseline is None
-            network_baseline, sampled_rates = _network_rate_update(
-                network_baseline, sampled_network, now,
-            )
-            if sampled_rates is not None and sampled_rates != (net_down, net_up):
-                net_down, net_up = sampled_rates
-                descriptive_revision += 1
-            elif first_network_sample and (net_down is not None or net_up is not None):
-                net_down = net_up = None
-                descriptive_revision += 1
         battery_poller.tick(now, force_battery)
         sampled_battery, _battery_age, _battery_error = battery_poller.snapshot(now)
         if sampled_battery is not None and sampled_battery != battery:
@@ -7237,12 +7653,55 @@ def _hud_impl(
                 descriptive_revision += 1
             activity = candidate_activity
 
+        if config.layout_name in INVENTORY_COLLECTORS:
+            mode = config.layout_name
+            if mode not in inventory_pollers:
+                collector = INVENTORY_COLLECTORS[mode]
+                cancellation = threading.Event()
+                def inventory_runner(argv, *, timeout_s, max_output_bytes,
+                                     cancellation=cancellation):
+                    return _inventory_probe(argv, timeout_s=timeout_s,
+                                            max_output_bytes=max_output_bytes,
+                                            cancel_event=cancellation)
+                observation = [InventoryObservation()]
+                def collect_observation(collector=collector, runner=inventory_runner,
+                                        observation=observation):
+                    result = collector(runner)
+                    observation[0] = observe_inventory(observation[0], result, time.monotonic())
+                    return observation[0]
+                poller = AsyncPoller(
+                    10.0 if mode == "connections" else 30.0, collect_observation,
+                )
+                inventory_pollers[mode] = poller
+                inventory_jobs.append((poller, cancellation))
+            poller = inventory_pollers[mode]
+            poller.tick(now, force_inventory)
+            observed, _inventory_attempt_age, inventory_error = poller.snapshot(now)
+            inventory = None
+            inventory_age = 0.0
+            inventory_retained = False
+            if isinstance(observed, InventoryObservation):
+                latest = observed.latest
+                inventory = latest
+                if observed.last_valid is not None:
+                    inventory_age = max(0.0, now - observed.last_valid_completed_mono_s)
+                    inventory_retained = latest.status is not InventoryStatus.LIVE
+                    inventory = (replace(observed.last_valid, status=latest.status,
+                                         detail=latest.detail, complete=False)
+                                 if inventory_retained else observed.last_valid)
+            inventory_key = (mode, inventory, int(inventory_age), inventory_error, inventory_retained)
+            if inventory_key != inventory_render_key:
+                inventory_render_key = inventory_key
+                descriptive_revision += 1
+        force_inventory = False
+
         network_bps = (
             net_down + net_up
             if net_down is not None and net_up is not None
             and net_down >= 0.0 and net_up >= 0.0
             else 0.0
         )
+        previous_history_revision = last_history_cpu_revision
         last_history_cpu_revision = _record_history_frame(
             history,
             frame,
@@ -7252,6 +7711,12 @@ def _hud_impl(
             network_bps,
             disk,
         )
+        if (last_history_cpu_revision != previous_history_revision
+                and frame.cpu_percent is not None):
+            age = frame.source_views[SourceId.CPU_USAGE].age_s or 0.0
+            completed = max(0.0, frame.captured_mono_s - age)
+            if not cpu_samples or completed > cpu_samples[-1][0]:
+                cpu_samples.append((completed, frame.cpu_percent))
         force_live = False
         force_memory = False
         force_swap = False
@@ -7269,20 +7734,23 @@ def _hud_impl(
             set_message(config, resized_message)
             ui_changed = True
 
+        intro_active = config.intro_enabled and now - intro_started < 0.8
         active_message = (
             config.message if config.message and now < config.message_until else ""
         )
         render_state = (
             height, width, _frame_render_key(frame), descriptive_revision,
             config.theme_index, config.animation_mode, config.layout_index,
-            config.show_help, active_message, sort_mode, scroll,
+            config.show_help, config.show_menu, config.menu_index, config.visual_style, intro_active, active_message, sort_mode, scroll,
         )
         render_age_key = _render_age_key(frame, sensor, activity, now)
         should_render = (
             last_render_state is None or render_state != last_render_state
             or ui_changed
         )
-        if config.animation_mode == 0:
+        if intro_active:
+            should_render = should_render or now - last_render >= 0.08
+        elif config.animation_mode == 0:
             should_render = should_render or render_age_key != last_render_age_key
         else:
             should_render = (
@@ -7290,7 +7758,7 @@ def _hud_impl(
                 or now - last_render >= render_interval(config.animation_mode)
             )
         if not should_render:
-            time.sleep(0.03)
+            time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
             continue
         last_render = now
         last_render_state = render_state
@@ -7299,10 +7767,13 @@ def _hud_impl(
             screen.erase()
             draw_small_screen(screen, height, width)
             screen.refresh()
-            time.sleep(0.03)
+            time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
             continue
 
-        if config.animation_mode == 0:
+        if intro_active:
+            # A single shallow turn resolves to the exact motion-off rest pose.
+            phase = int((now - intro_started) / 0.8 * 96)
+        elif config.animation_mode == 0:
             phase = 0
         elif config.animation_mode == 2:
             phase = int(now * 16)
@@ -7325,8 +7796,12 @@ def _hud_impl(
                     screen, config.layout_name, header_h, height - 4, width, frame,
                     per_core, static, mem, battery, sensor, disk, activity, net_down,
                     net_up, history, body_rows, scroll, sort_mode, phase,
+                    config=config, vm_view=vm_view, cpu_samples=tuple(cpu_samples),
+                    inventory=inventory, inventory_age=inventory_age, inventory_error=inventory_error, inventory_retained=inventory_retained,
                 )
 
+                if config.show_menu:
+                    draw_explore_menu(screen, config)
                 if config.show_help:
                     draw_help_overlay(screen, config, sensor)
 
@@ -7340,7 +7815,7 @@ def _hud_impl(
             if screen.getmaxyx() == (height, width):
                 screen.refresh()
                 break
-        time.sleep(0.03)
+        time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
 
 
 def _snapshot_adapter_attempt(
@@ -7652,6 +8127,19 @@ def _snapshot_memory_projection(memory: Any) -> dict[str, Optional[float]]:
     return projected
 
 
+def _snapshot_vm_projection(memory: Any) -> dict[str, Any]:
+    try:
+        counters = vm_counters_from_mapping(memory)
+    except (TypeError, ValueError):
+        counters = None
+    return {
+        "source": "vm_stat", "counter_unit": "pages",
+        "status": "OBSERVED" if counters is not None else "UNAVAILABLE",
+        "cumulative": asdict(counters) if counters is not None else None,
+        "rates": None, "rate_status": "LIVE_ONLY",
+    }
+
+
 def _snapshot_activity_fallback() -> dict[str, Any]:
     return {
         "bytes_per_sec": None, "iops": None, "sample_age": None,
@@ -7798,6 +8286,7 @@ def collect_snapshot() -> dict[str, Any]:
                           if cpu_ready else []),
             },
             "memory": _snapshot_memory_projection(memory),
+            "memory_activity": _snapshot_vm_projection(memory),
             "battery": _snapshot_battery_projection(battery),
             "sensors": _snapshot_sensor_projection(sensor),
             "disk": {"capacity": capacity_projection, "activity": activity_projection},
@@ -7869,6 +8358,11 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
         print("Disk: unavailable")
     else:
         print(f"Disk: {human_bytes(activity['bytes_per_sec'])}/s, {activity['iops']:.0f} iops")
+    vm = snapshot.get("memory_activity") or {}
+    if vm.get("cumulative"):
+        counters = vm["cumulative"]
+        print("VM activity: cumulative pages · compressions %s / decompressions %s / swap in %s / out %s (rates require live sampling)" %
+              (counters["compressions"], counters["decompressions"], counters["swapins"], counters["swapouts"]))
     print("Top processes:")
     for row in snapshot["processes"][:8]:
         gpu = row.get("gpu")
@@ -7906,6 +8400,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="show whether passwordless advanced sensor sampling is ready",
     )
+    parser.add_argument("--theme", choices=[theme["name"].lower().replace(" ", "-")
+                                            for theme in THEMES],
+                        help="live palette (default: graphite)")
+    parser.add_argument("--style", choices=VISUAL_STYLES,
+                        help="mascot and wordmark style (default: sculpted)")
+    parser.add_argument("--motion", choices=("off", "calm", "vivid"),
+                        help="continuous live motion; explicit off also skips the intro (default: off)")
+    parser.add_argument("--mode", choices=("overview", "compute", "thermals", "io",
+                                         "processes", "insights", "devices", "network", "connections", "cinema"),
+                        help="initial dashboard view (default: overview)")
+    parser.add_argument("--inspect", choices=("devices", "network", "connections"),
+                        help="print one read-only inventory; combine with --json for structured output")
+    parser.add_argument("--no-intro", action="store_true",
+                        help="skip the brief launch flourish")
     args = parser.parse_args(argv)
     if args.setup_sensors:
         return install_sensor_access()
@@ -7913,6 +8421,19 @@ def main(argv: list[str] | None = None) -> int:
         return remove_sensor_access()
     if args.sensor_access_status:
         return print_sensor_access_status()
+    if args.inspect:
+        result = INVENTORY_COLLECTORS[args.inspect](_inventory_probe)
+        if args.json:
+            print(json.dumps(asdict(result), indent=2, sort_keys=True))
+        else:
+            print("PorkyHUD · %s · %s" % (args.inspect, result.status.value))
+            if result.detail:
+                print(result.detail)
+            for line in inventory_lines(args.inspect, result):
+                print(line)
+            if result.truncated:
+                print("TRUNCATED · record limit reached")
+        return 0 if result.status is InventoryStatus.LIVE else 1
     if args.json or args.snapshot:
         snapshot = collect_snapshot()
         if args.json:
@@ -7950,7 +8471,20 @@ def main(argv: list[str] | None = None) -> int:
 
         manage_terminal_colors = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
         enforce_dark_terminal()
-        curses.wrapper(hud)
+        if any((args.theme, args.style, args.motion, args.mode, args.no_intro)):
+            config = HudConfig(intro_enabled=not args.no_intro and args.motion != "off")
+            if args.theme:
+                config.theme_index = next(index for index, theme in enumerate(THEMES)
+                                          if theme["name"].lower().replace(" ", "-") == args.theme)
+            if args.style:
+                config.visual_style = args.style
+            if args.motion:
+                config.animation_mode = ("off", "calm", "vivid").index(args.motion)
+            if args.mode:
+                config.layout_index = LAYOUTS.index("balanced" if args.mode == "overview" else args.mode)
+            curses.wrapper(lambda screen: hud(screen, config))
+        else:
+            curses.wrapper(hud)
         return 0
     except KeyboardInterrupt:
         return 0

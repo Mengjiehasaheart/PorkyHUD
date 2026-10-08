@@ -35,6 +35,7 @@ EXPECTED_DIRECT_MODES = {
     "4": "io",
     "5": "processes",
     "6": "cinema",
+    "7": "insights", "8": "devices", "9": "network", "0": "connections",
 }
 
 
@@ -515,7 +516,7 @@ def validate_control_contract(root: Path) -> List[str]:
         errors.append(str(exc))
         handler = ast.parse("")
     controls = _ord_controls(handler)
-    for control in ("h", "l", "a", "m", "r"):
+    for control in ("h", "l", "a", "m", "r", "d", "s"):
         if control not in controls:
             errors.append("input handler missing semantic control: %s" % control)
     curses_attributes = _attribute_names(handler, "curses")
@@ -539,9 +540,11 @@ def validate_control_contract(root: Path) -> List[str]:
     )
     help_tokens = (
         "1–5           select operational mode",
+        "d / 7–9 / 0   Explore / insights, devices, network, TCP",
+        "s             sculpted / outline / ASCII style",
         "l             cycle supported modes",
         "a             motion: off / calm / vivid",
-        "PgUp/PgDn/Home/End  jump through processes",
+        "PgUp/PgDn/Home/End  page or jump to either end",
         "6  Cinema     select wide Cinema mode",
     )
     for token in help_tokens:

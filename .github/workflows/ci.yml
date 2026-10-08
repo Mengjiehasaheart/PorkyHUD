@@ -22,7 +22,7 @@ jobs:
       - name: Compile
         run: >-
           python -m py_compile
-          porkyhud.py porkyhud_core.py
+          porkyhud.py porkyhud_core.py porkyhud_insights.py porkyhud_visual.py porkyhud_inventory.py
           tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py
           tests/test_repository_tools.py
       - name: Test
@@ -48,7 +48,7 @@ jobs:
               raise SystemExit("expected exactly one wheel")
           with zipfile.ZipFile(wheels[0]) as archive:
               names = set(archive.namelist())
-          required = {"porkyhud.py", "porkyhud_core.py"}
+          required = {"porkyhud.py", "porkyhud_core.py", "porkyhud_insights.py", "porkyhud_visual.py", "porkyhud_inventory.py"}
           if not required.issubset(names):
               raise SystemExit("wheel is missing a production module")
           if any(name.startswith(("tools/", "tests/")) for name in names):
@@ -60,5 +60,5 @@ jobs:
           python -m pip install --no-deps --target "$package_target" dist/*.whl
           (
             cd "$outside_checkout"
-            PYTHONPATH="$package_target" python -c 'import porkyhud, porkyhud_core'
+            PYTHONPATH="$package_target" python -c 'import porkyhud, porkyhud_core, porkyhud_insights, porkyhud_visual, porkyhud_inventory'
           )

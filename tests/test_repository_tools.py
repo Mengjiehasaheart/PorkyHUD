@@ -788,7 +788,7 @@ class DemoRendererTests(unittest.TestCase):
         self.assertEqual(renderer.WIDTH, 960)
         source = (TOOLS / "render_demo_gif.py").read_text(encoding="utf-8")
         self.assertNotIn("--no-sandbox", source)
-        for frame in (0, 18, 35):
+        for frame in range(36):
             html_text = renderer.render_html(frame, 36)
             self.assertIn("ILLUSTRATIVE DEMO · SYNTHETIC DATA", html_text)
             self.assertIn("CHECKING", html_text)
@@ -796,8 +796,41 @@ class DemoRendererTests(unittest.TestCase):
             self.assertNotIn("NOMINAL", html_text)
             self.assertIn("CPU", html_text)
             self.assertIn("m sort", html_text)
+            self.assertIn("Graphite", html_text)
+            self.assertIn("EVIDENCE DETAIL", html_text)
+            self.assertIn("TOP PROCESSES · CPU", html_text)
+            self.assertIn("d</span> Explore", html_text)
+            self.assertIn("7 Insights · 8 Devices · 9 Network · 0 TCP connections", html_text)
+            self.assertNotIn("CPU 60s avg", html_text)
+            self.assertNotIn("swap I/O", html_text)
+            self.assertIn("Dashboard motion starts off", html_text)
             self.assertNotIn("/Users/", html_text)
             self.assertNotIn("Mac Studio", html_text)
+
+    def test_demo_uses_shared_artwork_and_includes_a_blink_phase(self) -> None:
+        renderer = self.renderer()
+        with mock.patch.object(
+                renderer, "render_mascot", wraps=renderer.render_mascot) as artwork:
+            for frame in (0, 9, 22, 35):
+                renderer.render_html(frame, 36)
+        self.assertEqual(
+            [call.args[0] for call in artwork.call_args_list],
+            [0, 24, 58, 93],
+        )
+        self.assertIn('class="ink-highlight"', renderer.render_html(0, 36))
+        self.assertIn('class="ink-shadow"', renderer.render_html(0, 36))
+
+    def test_demo_escapes_shared_artwork_text_and_role_attributes(self) -> None:
+        renderer = self.renderer()
+        artwork = mock.Mock(rows=((mock.Mock(
+            text='<script>"&</script>', role='brand" data-private="value',
+        ),),))
+        with mock.patch.object(renderer, "render_mascot", return_value=artwork):
+            projected = renderer._mascot_html(0)
+        self.assertNotIn("<script>", projected)
+        self.assertNotIn(' data-private="', projected)
+        self.assertIn("&lt;script&gt;&quot;&amp;&lt;/script&gt;", projected)
+        self.assertIn("brand&quot; data-private=&quot;value", projected)
 
     def test_demo_rejects_unsafe_paths_and_unbounded_frame_rates(self) -> None:
         renderer = self.renderer()

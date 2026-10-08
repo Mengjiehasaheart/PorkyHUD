@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Scope note (2026-10-08):** This is the completed Phase 1 execution contract and retains its fixed interfaces below. The subsequent user-authorized 0.2.0 artwork, descriptive insight, process-cache and read-only inventory extension is described in the companion design's subsequent-upgrade section and current `AGENTS.md` routes; it does not silently revise these historical tasks or rerun Task 15 measurement batches.
+
 **Goal:** Build Phase 1 of PorkyHUD's trusted decision cockpit: typed evidence provenance, conservative health policy, independent collectors, a responsive six-mode terminal experience, truthful one-shot output, reproducible validation, and accurate maintainer documentation.
 
 **Architecture:** Keep macOS effects, scheduling, curses, CLI, redaction, and the legacy snapshot projection in `porkyhud.py`. Add one dependency-free pure module, `porkyhud_core.py`, containing immutable source state, normalized policy facts, rolling latches, contributor selection, and deterministic assessment; effectful adapters translate native/command results into that boundary. Renderers consume an immutable `HealthFrame`, never run collection, and preserve the dependency direction documented in `AGENTS.md`.

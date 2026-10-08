@@ -1,6 +1,6 @@
 # PorkyHUD
 
-PorkyHUD is a dependency-free, terminal-first decision cockpit for Apple Silicon Macs. It keeps four decision inputs—CPU capacity, macOS memory pressure, macOS thermal warnings, and writable storage headroom—separate from descriptive telemetry, so an attractive graph or plausible zero can never manufacture a health conclusion.
+PorkyHUD is a dependency-free terminal cockpit and read-only exploration toolkit for Apple Silicon Macs. It keeps four decision inputs—CPU capacity, macOS memory pressure, macOS thermal warnings, and writable storage headroom—separate from descriptive telemetry, so an attractive graph or plausible zero can never manufacture a health conclusion.
 
 <p align="center">
   <img src="assets/porkyhud-demo.gif" alt="Fixed synthetic PorkyHUD decision-cockpit demo" width="960">
@@ -50,6 +50,46 @@ The launcher and live dashboard normally apply a dark terminal palette. To prese
 NO_COLOR=1 porkyhud
 ```
 
+## Make it yours
+
+Overview now pairs a shaded, gently sculpted pig with clear evidence and workload panels. The default Graphite palette is restrained; `t` cycles four palettes and `s` switches between sculpted, outline, and ASCII artwork. The mascot uses eight Braille dots per terminal cell for depth, light, and small facial details.
+
+A launch flourish lasts less than a second while collectors start independently. Any key skips it; `--no-intro` or explicit `--motion off` disables it. Continuous dashboard motion starts off. Enable calm motion with `a`, or choose a presentation when launching:
+
+```bash
+porkyhud --mode cinema --motion calm --theme graphite
+porkyhud --style outline
+porkyhud --style ascii --no-intro
+```
+
+Fonts and text size belong to your terminal profile. Use a monospace font with Braille support for the sculpted style; ASCII is available when its glyphs do not render well. PorkyHUD does not change your font preferences.
+
+## Explore your Mac
+
+Press `d` for the secondary Explore menu. Use arrows and Enter, or select a view directly:
+
+| Key | View | What it reports |
+| --- | --- | --- |
+| `7` | Insights | Fresh recent CPU sample mean, peak, count and observed span; compression, decompression, swap-in and swap-out page rates. |
+| `8` | Devices | Reported USB and Thunderbolt topology, device/vendor identifiers, speed and port/location where exposed, and connected displays. |
+| `9` | Network | Interface link state, hardware port, medium, MTU, IPv4/IPv6 and MAC addresses, IPv4 default route, and configured DNS server addresses. |
+| `0` | Connections | Observed numeric TCP listeners and peers, connection state, and receive/send queue sizes in bytes. |
+
+Scroll long inventories with arrows, PageUp/PageDown, or Home/End. `r` refreshes the selected view and live telemetry. Inventory probes run only while their view is selected: connections refresh every 10 seconds; devices and network every 30 seconds. The dashboard stays responsive during discovery.
+
+These are local, read-only observations. PorkyHUD does not scan remote hosts, identify a service from its port, test Internet reachability, or change devices, routes or firewall rules. Link speed and topology appear only when macOS exposes them. TCP visibility can be partial, especially for protected processes; lists cap at 128 records and explicitly show truncation. A displayed peer is an observed socket endpoint, not proof of a server's identity or availability.
+
+Use the same views from scripts or a terminal without curses:
+
+```bash
+porkyhud --inspect devices
+porkyhud --inspect network --json
+porkyhud --inspect connections --json
+porkyhud --mode insights
+```
+
+Inventory JSON is unversioned. `--inspect` chooses the report; `--json` chooses its format. Sensor setup/status/removal flags retain precedence over reports. Device serial numbers and process commands are omitted from inventories, but friendly device names, IP/MAC addresses and remote endpoints can be sensitive. Review reports before sharing them.
+
 ## Reading the cockpit
 
 The headline has two independent axes: severity (`NORMAL`, `WATCH`, `CRITICAL`, or `UNKNOWN`) and evidence readiness (`LIVE`, `DEGRADED`, `INCOMPLETE`, or `DELAYED`). `CHECKING` is the progressive-startup label while required evidence or the 15-second CPU baseline is still being collected.
@@ -88,17 +128,20 @@ Missing evidence prevents a `NORMAL` conclusion but cannot hide a supported warn
 | --- | --- |
 | `1`–`5` | Select Overview, Compute, Thermals, I/O, or Processes directly. |
 | `6` | Select Cinema when the terminal is at least 118×34. |
+| `d` | Open or close Explore; arrows and Enter select a view. |
+| `7` / `8` / `9` / `0` | Select Insights, Devices, Network, or Connections. |
 | `l` | Cycle only modes supported by the current terminal size. |
 | `h` or `?` | Show or hide current shortcut help. |
 | `t` | Cycle the visual theme. |
-| `a` | Cycle motion off → calm → vivid; every launch defaults to motion off. |
+| `s` | Cycle sculpted, outline, or ASCII artwork. |
+| `a` | Cycle continuous motion off → calm → vivid; it defaults to off. |
 | `u` | Attempt a temporary advanced-sensor credential unlock when that source is `LOCKED`. |
 | `m` | Cycle process sorting by CPU, memory, or GPU. |
-| `r` | Request an immediate live refresh and reset source retry backoff. |
-| `Up` / `Down` or `j` / `k` | Scroll processes. |
-| `PageUp` / `PageDown` | Scroll processes by a page. |
-| `Home` / `End` | Jump to the first or last process page. |
-| `Esc` | Close help, or quit when help is closed. |
+| `r` | Refresh live telemetry and the selected inventory; reset core retry backoff. |
+| `Up` / `Down` or `j` / `k` | Scroll processes or inventory; select an Explore item. |
+| `PageUp` / `PageDown` | Scroll processes or inventory by a page. |
+| `Home` / `End` | Jump to the first or last process or inventory page. |
+| `Esc` | Close help or Explore, or quit when both are closed. |
 | `q` | Quit. |
 
 Cinema is an optional wide presentation, not a different evidence policy. Resizing below its threshold returns to a supported operational mode.
@@ -114,7 +157,7 @@ For diagnostics and future adapters:
 
 The snapshot schema is currently unversioned and is not a stable external API. It includes the machine hostname, process IDs, and sanitized process commands. Known secret-bearing flag values are redacted, but arbitrary positional arguments and unknown flag conventions may remain: process commands are sanitized, not guaranteed private. Review output before sharing it.
 
-Snapshot collection is separate from the live HUD and cannot complete the sustained CPU history required for a global `NORMAL` conclusion. Raw command stderr and privileged command details are not included.
+Snapshot collection is separate from the live HUD and cannot complete the sustained CPU history required for a global `NORMAL` conclusion. Raw command stderr and privileged command details are not included. The `memory_activity` section contains recognized cumulative VM counters with explicit page units; rates are `null` with `LIVE_ONLY` status because a snapshot has no live delta window.
 
 ## Advanced sensor access
 
@@ -125,7 +168,7 @@ Inside the dashboard, `u` performs only a temporary sudo credential refresh; it 
 ## Compatibility and evidence
 
 - Target: Apple Silicon on macOS, with Python 3.9 through 3.14 tested in CI.
-- Current-host release-candidate record: deterministic hard gates, startup hard gates, snapshot/RSS/launch targets, timeout cleanup, a 30-minute no-growth soak, and the raw-PTY interaction matrix passed on one Mac17,6 / Apple M5 Max running macOS 26.6. Instrumented live CPU averaged 63.473% of one core and missed the scoped <=2% target. Physical Terminal.app visual/profile contrast, other terminal emulators, privileged sensors, and broad device coverage remain unverified.
+- Historical Phase 1 release-candidate record: deterministic hard gates, startup hard gates, snapshot/RSS/launch targets, timeout cleanup, a 30-minute no-growth soak, and the raw-PTY interaction matrix passed on one Mac17,6 / Apple M5 Max running macOS 26.6. Instrumented live CPU averaged 63.473% of one core and missed the scoped <=2% target. Physical Terminal.app visual/profile contrast, other terminal emulators, privileged sensors, and broad device coverage remain unverified.
 - Fixture-validated, hardware-unverified: deterministic tests cover the changed memory-pressure, thermal, CPU-window, disk, process-attribution, responsive-layout, terminal, battery-present, and affirmed batteryless boundaries.
 - Best effort: untested Apple Silicon devices and earlier macOS releases.
 - Outside verified support: Intel Macs remain unverified until Intel-specific fixtures and physical evidence exist.
@@ -134,8 +177,12 @@ A fixture can prevent a known regression; it cannot prove that a physical model 
 
 Python 3.9 is upstream end-of-life. PorkyHUD's compatibility tests do not restore Python security maintenance; prefer a currently supported Python release.
 
+The 0.2.0 update has focused current-host checks for VM rates and read-only device, network and TCP discovery. These checks do not replace the historical performance record or qualify other hardware and terminal profiles.
+
 ## Metric notes
 
+- Insights use actual collector completion times. VM page rates require two complete samples and reset after failures, counter/page-size changes, or collection gaps. Pages/s describes VM events, not physical disk bytes/s; CPU sample means are descriptive observations, separate from the policy’s time-weighted window. Apple documents [system VM statistics](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/VMPages.html) and the [compression/swap counter definitions](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h).
+- Network rates include measured idle zero and reset after counter reversal or a collection gap; failed probes do not manufacture idle readings.
 - RAM follows an Activity Monitor-style split: app + wired + compressed count as used, while file-backed cache remains available cache.
 - Disk capacity selects the writable APFS Data volume where discoverable; disk activity runs on its own bounded background cadence.
 - CPU workers come from macOS Mach counters; Apple Silicon cluster labels use reported IORegistry and `hw.perflevel*` topology.
@@ -144,7 +191,7 @@ Python 3.9 is upstream end-of-life. PorkyHUD's compatibility tests do not restor
 
 ## Reproducing the illustrative demo
 
-The tracked renderer accepts only fixed synthetic content and a repository-contained GIF output. It requires Chrome or Chromium and `ffmpeg` as development tools; neither is a PorkyHUD runtime dependency.
+The tracked renderer accepts only fixed synthetic content and a repository-contained GIF output. It requires Chrome or Chromium and `ffmpeg` as development tools, and reuses the pure mascot renderer; neither is a PorkyHUD runtime dependency.
 
 ```bash
 python3 tools/render_demo_gif.py --frames 36 --fps 12

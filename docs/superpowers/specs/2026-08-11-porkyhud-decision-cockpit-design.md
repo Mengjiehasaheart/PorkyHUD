@@ -4,6 +4,25 @@ Status: release-candidate validated for deterministic, current-host performance,
 
 Date: 2026-08-11
 
+## Subsequent 0.2.0 upgrade — 2026-10-08
+
+This document retains the scoped Phase 1 acceptance and historical measurements below. The user explicitly authorized a subsequent visual, insight and read-only inventory upgrade, including a brief launch animation; it is not a requalification of Phase 1 performance or broad hardware support.
+
+The extension keeps the same pure health policy and four decision domains. It extracts pure descriptive rate calculations and terminal artwork, adds an injected-runner device/network/TCP adapter, and keeps all presentation and scheduling in the app. Overview and Cinema share a seven-row geometric Braille pig and optional outline/ASCII styles; Graphite is the default palette. A skippable flourish lasts less than one second while independent collectors run; continuous motion defaults off, and explicit `--motion off` disables the flourish too.
+
+Explore (`d`) links observed CPU/VM insights, devices, network environment and numeric TCP connections. Inventories are lazy, read-only, bounded, minimized and explicitly partial/truncated where necessary. No active scans, device changes, service identification from ports, or connectivity claims are introduced. USB accepts old and macOS 26 host schemas; numeric lsof supplements missing TCP netstat output without projecting PID/process fields. VM rates use complete counter samples and completion times; recent CPU statistics describe observed samples, never replace the policy window. Inventory JSON and existing snapshots remain unversioned.
+
+A one-entry process-fact cache removes repeated parsing while validating mutable row content and preserving latest-attempt metadata. Inventory shutdown uses the existing structured-command cancellation/termination/reaping lifecycle. New focused tests cover artwork, insight deltas, inventory parsers/retention, navigation, output privacy and cache corruption. Packaging and CI now include five production modules. The historical Task 15 record below remains authoritative for its original scope.
+
+Final upgrade verification on 2026-10-08:
+
+- All 496 deterministic tests passed with warnings treated as errors on local Python 3.9 and 3.14. Compilation, documentation contracts, launcher syntax, CLI help/version and whitespace checks passed.
+- The 0.2.0 wheel contained all five production modules and excluded repository tools and tests. Fresh-target imports from outside the checkout passed on both tested interpreters. The user's Python 3.9 terminal installation was updated from that wheel; all five installed modules imported from outside the checkout and the installed command reported 0.2.0.
+- Current-host installed inventory commands returned 10 device records and 29 network interfaces. TCP returned 128 records with explicit partial/truncated coverage. These counts describe one host observation, not broad hardware or network-environment qualification. Live VM counter/rate checks used actual completion intervals.
+- Targeted raw macOS PTY checks exercised the initial checking shell, new views, Explore/Escape, Cinema/motion, resizing and clean quit. The installed Python 3.9 command separately rendered the device view and exited cleanly. The regenerated, visibly synthetic demo was inspected at representative center, yaw and blink frames.
+- A fixed synthetic 1,000-process, 40-frame profile improved from 2.036 s to 0.392 s after process-fact caching. This deterministic workload is not a physical live-CPU measurement or a replacement for the historical target miss. No Task 15 measurement batches, privileged sensor changes, Homebrew release, tag or publication were run.
+- Physical Terminal.app control remained unavailable under the computer-use authority. Terminal font rendering and emulator palette fidelity remain unverified; raw PTY protocol checks and synthetic artwork inspection do not establish those properties.
+
 ## Decision
 
 PorkyHUD remains a dependency-free, terminal-first macOS application. Phase 1 turns its default view into a trusted decision cockpit and introduces one pure health-policy boundary that future interfaces can reuse.

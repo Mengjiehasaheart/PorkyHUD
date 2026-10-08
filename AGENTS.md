@@ -12,7 +12,7 @@ This file is the canonical maintainer and agent navigation layer for PorkyHUD. U
 4. Check all callers and output surfaces when a shared model, collector, command, or schema changes.
 5. Run the focused tests during development, then run the complete validation set before claiming completion.
 
-PorkyHUD currently has an effects module (`porkyhud.py`) and a pure policy module (`porkyhud_core.py`). The remaining areas below are conceptual boundaries, not separate packages. Preserve their dependency direction until there is a justified, tested module extraction.
+PorkyHUD has an effects/orchestration module (`porkyhud.py`), pure health policy (`porkyhud_core.py`), pure descriptive calculations (`porkyhud_insights.py`), pure terminal artwork (`porkyhud_visual.py`), and an injected-runner inventory adapter (`porkyhud_inventory.py`). The remaining areas below are conceptual boundaries. Preserve their dependency direction.
 
 ## Canonical sources of truth
 
@@ -41,9 +41,17 @@ Keep this table exhaustive. Add, move, or remove a row in the same commit as the
 | `docs/superpowers/specs/2026-08-11-porkyhud-decision-cockpit-design.md` | Implemented Phase 1 design, acceptance contract, and scoped release-candidate validation record | Scope, architecture, UX, compatibility, performance, acceptance, or recorded validation changes |
 | `docs/superpowers/plans/2026-08-11-porkyhud-trusted-decision-cockpit.md` | Test-first Phase 1 execution contract and fixed cross-task interfaces | Task boundaries, interface names, validation sequence, or approved execution changes |
 | `porkyhud.py` | macOS effects: adapters, collectors, runtime dashboard, rendering, snapshots, and CLI | Focused tests plus every affected user or agent contract |
+| `porkyhud_insights.py` | Pure immutable VM counter/rate reducers and observed CPU summaries | Insight boundary tests and live/snapshot consumers |
+| `porkyhud_visual.py` | Pure immutable geometric mascot frames and wordmarks with bounded caches | Visual geometry tests, curses adapter, and synthetic demo |
+| `porkyhud_inventory.py` | Read-only device/network/TCP parsers and collectors over an injected bounded runner | Inventory fixtures, privacy/completeness contracts, CLI and live views |
 | `porkyhud_core.py` | Pure immutable source-state models, reducers, freshness, eligibility, and source views | Source contract tests and every consumer of telemetry evidence |
 | `PorkyHUD.command` | Double-click and shell launcher, terminal setup/restoration, source-versus-installed dispatch | Launcher, palette, executable discovery, or launch guidance changes |
 | `pyproject.toml` | Setuptools build and package metadata | Version, Python support, packaging, entry point, dependency, or project URL changes |
+| `tests/test_insights.py` | VM rates, CPU summaries and VM parser contracts | Every descriptive insight calculation/collector change |
+| `tests/test_visual.py` | Immutable artwork, bounded cache, glyph geometry and fallback contracts | Every visual renderer change |
+| `tests/test_inventory.py` | Inventory grammar, limits, partial coverage and output minimization | Every inventory adapter change |
+| `tests/test_performance.py` | Bounded process projection cache and corruption/metadata preservation | Every process caching change |
+| `tests/test_upgrade.py` | Explore navigation, presentation controls, atomic rates and inventory output contracts | Every new interaction or adapter projection change |
 | `tests/test_core.py` | Behavioral contract tests for pure immutable telemetry source state | Every `porkyhud_core.py` behavior change |
 | `tests/test_porkyhud.py` | Unit and contract tests for current application behavior | Every production behavior change |
 | `tests/test_repository_tools.py` | Repository validator, demo renderer, and release-measurement tool contracts | Every reproducible source-tree tool or repository-validation change |
@@ -90,6 +98,25 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 - Primary tests: `tests/test_core.py::CpuWindowTests`, `tests/test_core.py::RuleLatchTests`, `tests/test_core.py::ContributorTests`, and `tests/test_core.py::HealthPolicyTests`.
 - This module is the only authority for global severity. Descriptive metrics and rendering helpers must not reproduce or extend its rule logic.
 
+### `area:descriptive-insights`
+
+- Owns immutable VM page counters, gap-bounded live rates and recent observed CPU summaries. These never drive health severity.
+- Start at `porkyhud_insights.py::update_vm_rates`, `porkyhud_insights.py::summarize_cpu_samples`, and `porkyhud.py::parse_vm_counters`.
+- Tests: `tests/test_insights.py`. Completion time belongs to the collected sample, not its render-loop observation. Missing samples, reversals and long gaps reset baselines; measured unchanged counters are live zero.
+
+### `area:visual-identity`
+
+- Owns deterministic geometric artwork and bounded immutable frame caches. Clocks, preferences and curses remain in the application adapter.
+- Start at `porkyhud_visual.py::render_mascot`, `porkyhud_visual.py::wordmark_lines`, and `porkyhud.py::draw_signature`.
+- Tests: `tests/test_visual.py` and `tests/test_upgrade.py`. Keep decorative colors independent from health roles; preserve all seven mascot rows and ASCII fallback. Font preferences belong to the terminal.
+
+### `area:inventory`
+
+- Owns on-demand read-only device, interface, IPv4 route, DNS and TCP observations. It imports neither the app nor curses/policy/subprocess; the app injects `porkyhud.py::_inventory_probe` over the existing bounded command runner.
+- Start at `porkyhud_inventory.py::collect_devices`, `porkyhud_inventory.py::collect_network`, `porkyhud_inventory.py::collect_connections`, `porkyhud.py::inventory_lines`, and `porkyhud.py::draw_explore_menu`, and `porkyhud_inventory.py::observe_inventory`.
+- Tests: `tests/test_inventory.py` and `tests/test_upgrade.py`. Explicit completeness/truncation and supplementary-source states survive every projection. Serial numbers, PID/FD headers and process commands do not cross the output boundary; friendly names and addresses remain sensitive.
+- USB supports both legacy `SPUSBDataType` and macOS 26 `SPUSBHostDataType`. TCP uses numeric `netstat`, with numeric `lsof` fallback; protected sockets can be hidden. No scans, reverse DNS, connectivity tests or mutations.
+
 ### `area:configuration-models`
 
 - Owns refresh constants, themes, layout names, global caches, and shared dataclasses.
@@ -99,7 +126,7 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 ### `area:polling-state`
 
 - Owns bounded history and single-flight background collection.
-- Start at `porkyhud.py::MetricHistory` and `porkyhud.py::AsyncPoller`.
+- Start at `porkyhud.py::MetricHistory` and `porkyhud.py::AsyncPoller` (including its atomic `sample_snapshot`).
 - Primary tests: `tests/test_porkyhud.py::AsyncPollerTests`.
 - `AsyncPoller` keeps the last good value, measures cadence from collector completion, prevents overlapping runs for one source, and queues at most one forced follow-up while a collector is active.
 
@@ -155,8 +182,8 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 - Owns build metadata, executable entry points, compatibility matrix, version synchronization, tags, and downstream Homebrew coordination.
 - Start at `pyproject.toml`, `porkyhud.py::VERSION`, `.github/workflows/ci.yml`, and `PorkyHUD.command`.
 - The in-repository version declarations must match. A checkout version is not a published release until its tag and external Homebrew formula are also verified.
-- The wheel contains only `porkyhud.py` and `porkyhud_core.py` plus distribution metadata. Tests and repository tools stay outside the runtime package.
-- A downstream Homebrew formula must install both production modules and test an actual import and launch from the installed prefix. A version-only formula update that copies only `porkyhud.py` is incomplete.
+- The wheel contains only the five `porkyhud*.py` production modules plus distribution metadata. Tests and repository tools stay outside the runtime package.
+- A downstream Homebrew formula must install all five production modules and test an actual import and launch from the installed prefix. A version-only formula update that copies only `porkyhud.py` is incomplete.
 
 ### `area:repository-tools`
 
@@ -178,7 +205,8 @@ main
   → independent SourcePollers for CPU, memory pressure, OS thermal, disk capacity, and process evidence
   → pure reduce_health policy state and immutable HealthFrame
   → independent descriptive AsyncPollers for memory detail, swap, network, battery, optional sensors, and disk activity
-  → decision header, core-evidence ribbon, responsive mode body, and status/help output
+  → pure descriptive VM/CPU observations and independently selected inventory pollers
+  → decision header, core-evidence ribbon, optional brief launch flourish, responsive mode body, and status/help/Explore output
   → terminal and signal restoration on every exit path
 ```
 
@@ -197,6 +225,17 @@ main --json/--snapshot
 ```
 
 Treat snapshot changes as interface changes even while the schema remains formally unstable.
+
+### Read-only inventory reports
+
+```text
+main --inspect devices/network/connections [--json]
+  → selected inventory collector over bounded command adapter
+  → minimized immutable records and explicit completeness/truncation
+  → unversioned JSON or readable text
+```
+
+Live inventory uses the same collectors, started lazily only for the selected view. Devices/network use 30-second cadence; connections use 10 seconds. A TCP fallback can make two bounded child probes per refresh. Inventory never changes health severity or core readiness.
 
 ### Privileged sensor setup
 
@@ -230,6 +269,7 @@ main --setup-sensors
 | Add, move, or remove a tracked file | The file itself | Complete tracked-file map, relevant area/route, local links, CI if validation changes |
 | Introduce MCP or another machine consumer | `area:snapshot-interface` and collectors | Schema/versioning, privacy, read-only authority, evidence provenance, tests, new adapter map and routes |
 | Change repository navigation or documentation mechanics | `tools/validate_docs.py` and `AGENTS.md` | Repository-tool tests, CI validation, complete map, anchor/link/control contracts |
+| Add or change inventory | `area:inventory` | Pure parser fixtures, minimized output, source states/completeness, lazy polling, Explore/CLI controls, README privacy and semantics |
 | Change the illustrative demo | `tools/render_demo_gif.py` | Renderer safety tests, README labeling/dependencies, regenerated GIF, representative-frame inspection |
 | Record release measurements | `tools/measure_release.py` and Task 15 controller | Repository-tool tests, exact environment/sample counts, sanitized JSON, spec validation record; never sensor setup/removal |
 
@@ -250,7 +290,7 @@ main --setup-sensors
 - Responsive layout math keeps panels within their assigned rectangles and preserves panel borders and footers.
 - Snapshot output stays JSON-serializable. Any compatibility promise requires an explicit schema version and tests.
 - Snapshots include hostname, PIDs, and sanitized-but-not-guaranteed-private commands; known secret flags remain redacted at every output boundary.
-- Motion starts off; hue and animation never carry severity, freshness, or selection without text.
+- Continuous motion starts off. The user-requested launch flourish is shorter than one second, runs alongside collection, and is skipped by any key, `--no-intro`, or explicit `--motion off`; hue and animation never carry severity, freshness, or selection without text.
 - Demo frames are visibly fixed synthetic data. Repository tools are excluded from the wheel and may not broaden runtime dependencies.
 - User-facing claims distinguish verified behavior from hardware-dependent best effort.
 - Empty static-analysis results are not proof of no impact. Confirm dynamic, native, subprocess, string-based, and external relationships from a second source.
@@ -261,6 +301,7 @@ Run focused tests while editing, then run the same core checks as CI:
 
 ```bash
 python3 -m py_compile porkyhud.py porkyhud_core.py \
+  porkyhud_insights.py porkyhud_visual.py porkyhud_inventory.py \
   tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py \
   tests/test_repository_tools.py
 python3 -W error -m unittest discover -v
@@ -277,7 +318,7 @@ git diff --check
 ./porkyhud.py --version
 ```
 
-Inspect the wheel as a ZIP, require both production modules, reject `tools/` and `tests/`, install it to a fresh temporary target, and import both modules from outside the checkout. Use `tools/measure_release.py` only for the explicit Task 15 batches; passing mocked tests is not physical or performance evidence.
+Inspect the wheel as a ZIP, require all five production modules, reject `tools/` and `tests/`, install it to a fresh temporary target, and import all five modules from outside the checkout. Use `tools/measure_release.py` only for the explicit Task 15 batches; passing mocked tests is not physical or performance evidence.
 
 Do not claim live hardware coverage from mocked unit tests. Privileged sudoers mutations, full interactive curses behavior, palette fidelity, and telemetry correctness across Mac generations require explicit manual validation.
 

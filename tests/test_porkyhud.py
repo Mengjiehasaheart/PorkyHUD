@@ -2214,6 +2214,8 @@ class LiveOrchestrationTests(unittest.TestCase):
             return self.value
         def snapshot(self, _now=None):
             return self.value, 0.0, ""
+        def sample_snapshot(self, _now=None):
+            return porkyhud.DescriptiveSample(self.value, 0.0, "", 0, 0.0)
 
     def test_initial_health_frame_is_pristine_and_registry_ordered(self) -> None:
         frame = porkyhud.initial_health_frame(10.0)
@@ -2233,7 +2235,7 @@ class LiveOrchestrationTests(unittest.TestCase):
         self.assertEqual(frame.assessment.severity, core.HealthSeverity.UNKNOWN)
 
     def test_memory_detail_uses_cached_size_and_merge_does_not_mutate(self) -> None:
-        raw = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 2.\n"
+        raw = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 2.\nAnonymous pages: 0.\nPages wired down: 0.\nPages occupied by compressor: 0.\n"
         with mock.patch.object(porkyhud, "MEMORY_SIZE_BYTES", None), \
                 mock.patch.object(porkyhud, "sysctl_value", return_value="8192") as size, \
                 mock.patch.object(porkyhud, "run_command", return_value=raw):
@@ -2255,8 +2257,8 @@ class LiveOrchestrationTests(unittest.TestCase):
         unchanged, rates = porkyhud._network_rate_update(
             baseline, (1_000, 2_000), 10.5,
         )
-        self.assertEqual(unchanged, baseline)
-        self.assertIsNone(rates)
+        self.assertEqual(unchanged, ((1_000, 2_000), 10.5))
+        self.assertEqual(rates, (0.0, 0.0))
 
         baseline, rates = porkyhud._network_rate_update(
             baseline, (1_600, 2_300), 11.0,
@@ -2268,7 +2270,7 @@ class LiveOrchestrationTests(unittest.TestCase):
             baseline, (100, 2_500), 12.0,
         )
         self.assertEqual(baseline, ((100, 2_500), 12.0))
-        self.assertEqual(rates, (0.0, 0.0))
+        self.assertIsNone(rates)
 
         baseline, rates = porkyhud._network_rate_update(
             baseline, (300, 2_900), 14.0,
@@ -3920,6 +3922,10 @@ class LayoutAndRenderingTests(unittest.TestCase):
             poller.snapshot.return_value = (None, 0.0, "")
         else:
             poller.snapshot.side_effect = poller_snapshots
+        def sample_snapshot(now):
+            value, age, error = poller.snapshot(now)
+            return porkyhud.DescriptiveSample(value, age, error, 0, 0.0)
+        poller.sample_snapshot.side_effect = sample_snapshot
         unlock = mock.Mock(return_value=True)
         screen = screen or FakeScreen(height, width, keys=keys)
         if on_refresh is not None:
@@ -3942,7 +3948,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
                 mock.patch.object(porkyhud, "color_pair", return_value=0), \
                 clock, \
                 mock.patch.object(porkyhud.time, "sleep"):
-            porkyhud.hud(screen)
+            porkyhud.hud(screen, porkyhud.HudConfig(intro_enabled=False))
         return screen, coordinator, poller, unlock
 
     def test_help_escape_survives_resize_below_minimum(self) -> None:
@@ -4111,7 +4117,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in refreshed.tick.call_args_list],
                          [True, True])
         self.assertTrue(all(call.args[1] for call in poller.tick.call_args_list[:6]))
-        self.assertTrue(all(not call.args[1] for call in poller.tick.call_args_list[6:12]))
+        self.assertTrue(all(call.args[1] for call in poller.tick.call_args_list[6:12]))
 
         _small, small_coordinator, _poller, small_unlock = self.run_hud_fixture(
             [ord("u"), ord("r"), ord("q")], height=21, width=75,
@@ -4188,13 +4194,15 @@ class LayoutAndRenderingTests(unittest.TestCase):
         )
 
     def test_responsive_mode_contract_is_direct_bounded_and_non_mutating(self) -> None:
-        operational = ("balanced", "compute", "thermals", "io", "processes")
+        operational = ("balanced", "compute", "thermals", "io", "processes",
+                       "insights", "devices", "network", "connections")
         all_modes = operational + ("cinema",)
         self.assertEqual(porkyhud.LAYOUTS, list(all_modes))
         self.assertEqual(
             porkyhud.DIRECT_MODE_KEYS,
             {"1": "balanced", "2": "compute", "3": "thermals",
-             "4": "io", "5": "processes", "6": "cinema"},
+             "4": "io", "5": "processes", "6": "cinema", "7": "insights",
+             "8": "devices", "9": "network", "0": "connections"},
         )
         self.assertEqual(porkyhud.HudConfig().animation_mode, 0)
 
@@ -4208,7 +4216,8 @@ class LayoutAndRenderingTests(unittest.TestCase):
         labels = {
             "balanced": "Overview", "compute": "Compute",
             "thermals": "Thermals", "io": "I/O",
-            "processes": "Processes", "cinema": "Cinema",
+            "processes": "Processes", "insights": "Insights", "devices": "Devices",
+            "network": "Network", "connections": "Connections", "cinema": "Cinema",
         }
         config = porkyhud.HudConfig()
         for mode in operational:
@@ -4221,7 +4230,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         before = config.layout_index
         self.assertEqual(
             porkyhud.select_mode(config, "cinema", 33, 117),
-            "Cinema requires 118×34 · staying in Processes",
+            "Cinema requires 118×34 · staying in Connections",
         )
         self.assertEqual(config.layout_index, before)
         for unknown in ("compact", "unknown", None):
@@ -4237,21 +4246,23 @@ class LayoutAndRenderingTests(unittest.TestCase):
     def test_mode_cycles_resize_normalization_and_motion_are_independent(self) -> None:
         narrow = porkyhud.HudConfig()
         visited = []
-        for _ in range(7):
+        for _ in range(10):
             visited.append(narrow.layout_name)
             porkyhud.cycle_mode(narrow, 24, 80)
         self.assertEqual(set(visited),
-                         {"balanced", "compute", "thermals", "io", "processes"})
+                         {"balanced", "compute", "thermals", "io", "processes",
+                          "insights", "devices", "network", "connections"})
         self.assertNotIn("compact", visited)
         self.assertNotIn("cinema", visited)
 
         wide = porkyhud.HudConfig(animation_mode=2)
         visited = []
-        for _ in range(6):
+        for _ in range(10):
             visited.append(wide.layout_name)
             porkyhud.cycle_mode(wide, 34, 118)
         self.assertEqual(visited,
-                         ["balanced", "compute", "thermals", "io", "processes", "cinema"])
+                         ["balanced", "compute", "thermals", "io", "processes",
+                          "insights", "devices", "network", "connections", "cinema"])
         self.assertEqual(wide.animation_mode, 2)
         self.assertEqual(wide.layout_name, "balanced")
         self.assertEqual(porkyhud.select_mode(wide, "cinema", 34, 118),
@@ -5128,6 +5139,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         poller = mock.Mock()
         poller.tick.return_value = None
         poller.snapshot.return_value = (None, 0.0, "")
+        poller.sample_snapshot.return_value = porkyhud.DescriptiveSample(None, 0.0, "", 0, 0.0)
         screen = FakeScreen(24, 80, keys=[-1, ord("q")])
         with mock.patch.object(porkyhud, "LiveHealthCoordinator", return_value=coordinator), \
                 mock.patch.object(porkyhud, "AsyncPoller", return_value=poller), \
@@ -5149,11 +5161,11 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertIn("THERM CLEAR", screen.row(2))
         self.assertIn("DISK 50% FREE", screen.row(2))
         self.assertNotIn("Fresh core evidence", screen.row(22))
-        self.assertIn("EVIDENCE DETAIL", screen.row(3))
-        self.assertIn("TOP PROCESSES", screen.row(5))
+        self.assertIn("EVIDENCE DETAIL", screen.row(10))
+        self.assertIn("TOP PROCESSES", screen.row(10))
         self.assertEqual(
             screen.row(23).strip(),
-            "1-5 mode | h help | m sort | r refresh | q quit",
+            "1-5 mode | d explore | h help | t theme | a motion | q quit",
         )
 
     def test_pure_frame_projection_10k_mean_is_under_five_milliseconds(self) -> None:
@@ -5219,12 +5231,12 @@ class LayoutAndRenderingTests(unittest.TestCase):
         with mock.patch.object(porkyhud, "unicode_ok", return_value=True):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1–5 mode · h help · m sort · r refresh · q quit",
+                "1–5 mode · d explore · h help · t theme · a motion · q quit",
             )
         with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1-5 mode | h help | m sort | r refresh | q quit",
+                "1-5 mode | d explore | h help | t theme | a motion | q quit",
             )
         for total in range(6, 24):
             system_height, power_height = porkyhud.compact_top_heights(total)
@@ -5246,7 +5258,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
             porkyhud.draw_help_overlay(screen, config, sensor)
 
         overlay_width = 72
-        overlay_height = 16
+        overlay_height = 21
         overlay_y = (40 - overlay_height) // 2
         overlay_x = (120 - overlay_width) // 2
         for row in range(overlay_y, overlay_y + overlay_height):
@@ -5255,7 +5267,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
                 screen.row(row)[overlay_x : overlay_x + overlay_width],
             )
         self.assertEqual(screen.cells[overlay_y][overlay_x - 1], sentinel)
-        blank_content_row = overlay_y + 11
+        blank_content_row = overlay_y + 13
         self.assertEqual(
             screen.row(blank_content_row)[overlay_x + 1 : overlay_x + overlay_width - 1],
             " " * (overlay_width - 2),
@@ -6938,7 +6950,7 @@ Pages occupied by compressor: 0.
 
         self.assertEqual(
             set(snapshot),
-            {"generated_at", "read", "system", "cpu", "memory", "battery", "sensors", "disk", "processes"},
+            {"generated_at", "read", "system", "cpu", "memory", "memory_activity", "battery", "sensors", "disk", "processes"},
         )
         self.assertEqual(snapshot["cpu"]["average_percent"], 50.0)
         self.assertEqual(

@@ -70,7 +70,7 @@ echo "Advanced CPU/GPU power and residency counters require administrator access
 echo "One-time advanced setup: $cli_hint --setup-sensors"
 echo
 
-"${run_command[@]}"
+"${run_command[@]}" "$@"
 exit_code=$?
 echo
 if [[ $exit_code -ne 0 ]]; then

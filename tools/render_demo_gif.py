@@ -17,6 +17,16 @@ import time
 from typing import Optional, Sequence
 
 
+# Direct script execution starts on tools/, so select the reviewed pure artwork
+# module from this checkout rather than an unrelated installed package.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, os.fspath(_REPOSITORY_ROOT))
+try:
+    from porkyhud_visual import MASCOT_CYCLE, render_mascot
+finally:
+    sys.path.pop(0)
+
+
 WIDTH = 960
 HEIGHT = 600
 DEFAULT_FRAMES = 36
@@ -65,14 +75,21 @@ def safe_output_path(root: Path, output: str) -> Path:
     return lexical_candidate
 
 
-def _bar(percent: float, cells: int = 20) -> str:
-    filled = max(0, min(cells, round(percent / 100.0 * cells)))
-    return "█" * filled + "░" * (cells - filled)
-
-
 def _spark(values: Sequence[float]) -> str:
     glyphs = "▁▂▃▄▅▆▇█"
     return "".join(glyphs[max(0, min(7, round(value / 100.0 * 7)))] for value in values)
+
+
+def _mascot_html(phase: int) -> str:
+    """Project shared terminal artwork as escaped, semantic colored spans."""
+
+    frame = render_mascot(phase)
+    return "\n".join(
+        "".join('<span class="ink-%s">%s</span>' % (
+            html.escape(span.role, quote=True), html.escape(span.text),
+        ) for span in row)
+        for row in frame.rows
+    )
 
 
 def render_html(frame: int, frames: int) -> str:
@@ -83,129 +100,124 @@ def render_html(frame: int, frames: int) -> str:
         raise ValueError("frame must be inside the render sequence")
     phase = 2.0 * math.pi * frame / frames
     cpu = 38.0 + 4.0 * math.sin(phase)
-    memory = 57.0 + 1.5 * math.sin(phase * 0.5)
-    history = [35.0 + 7.0 * math.sin(phase + index * 0.46) for index in range(28)]
+    history = [38.0 + 6.0 * math.sin(phase + index * 0.46) for index in range(36)]
     history_text = _spark(history)
-    cpu_bar = _bar(cpu)
-    memory_bar = _bar(memory)
-    pulse = 0.50 + 0.14 * math.sin(phase)
-    elapsed = frame / DEFAULT_FPS
-    synthetic_time = "12:34:%02d" % int(elapsed)
-    return """<!doctype html>
+    # Sample a complete, bounded yaw/blink cycle, independent of host clocks.
+    mascot = _mascot_html(frame * MASCOT_CYCLE // frames)
+    return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  :root { --bg:#070a0f; --panel:#0c1119; --line:#263341; --text:#e8f2f4;
-    --muted:#82919c; --cyan:#69e7ef; --green:#82e4aa; --amber:#f2c56b;
-    --red:#ff746f; --pulse:%.3f; }
-  * { box-sizing:border-box; }
-  html, body { margin:0; width:%dpx; height:%dpx; overflow:hidden; background:var(--bg); }
-  body { color:var(--text); font-family:"SFMono-Regular",Menlo,Consolas,monospace;
-    font-size:14px; letter-spacing:.01em; }
-  .shell { width:100%%; height:100%%; padding:20px 22px 18px; display:grid;
-    grid-template-rows:auto auto 1fr auto; gap:11px;
-    background:radial-gradient(circle at 82%% 0,rgba(105,231,239,.07),transparent 34%%),var(--bg); }
-  .top { display:flex; align-items:flex-start; justify-content:space-between; }
-  .brand { color:var(--cyan); font-size:20px; font-weight:800; letter-spacing:.13em; }
-  .mode { color:var(--muted); margin-top:4px; font-size:12px; letter-spacing:.06em; }
-  .demo { color:#c8f4f6; border:1px solid #3a6870; border-radius:999px; padding:7px 11px;
-    font-size:11px; font-weight:700; letter-spacing:.055em; background:#0b1920; }
-  .ribbon { display:grid; grid-template-columns:1.18fr repeat(4,1fr); border:1px solid var(--line);
-    border-radius:9px; background:#0a0f16; overflow:hidden; }
-  .source { padding:10px 13px; border-right:1px solid var(--line); }
-  .source:last-child { border-right:0; }
-  .source .label { color:var(--muted); font-size:10px; letter-spacing:.11em; }
-  .source .value { margin-top:5px; color:var(--green); font-weight:700; }
-  .source.checking .value { color:var(--amber); }
-  .content { display:grid; grid-template-columns:1.25fr .92fr; gap:11px; min-height:0; }
-  .column { display:grid; gap:11px; min-height:0; }
-  .column.left { grid-template-rows:1.14fr .86fr; }
-  .column.right { grid-template-rows:1fr 1fr; }
-  .panel { border:1px solid var(--line); border-radius:9px; background:var(--panel);
-    padding:13px 15px; overflow:hidden; }
-  .panel-title { color:var(--cyan); font-size:11px; font-weight:800; letter-spacing:.12em;
-    display:flex; justify-content:space-between; margin-bottom:10px; }
-  .panel-title span { color:var(--muted); font-weight:500; letter-spacing:.02em; }
-  .decision { display:flex; align-items:center; gap:13px; margin:4px 0 10px; }
-  .decision .state { color:var(--green); font-size:30px; font-weight:800; letter-spacing:.04em;
-    text-shadow:0 0 18px rgba(130,228,170,var(--pulse)); }
-  .decision .copy { color:#b8c5ca; line-height:1.45; }
-  .metric-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 17px; }
-  .metric { white-space:pre; line-height:1.7; }
-  .metric .name { color:var(--muted); }
-  .metric .bar { color:var(--cyan); }
-  .metric .number { color:#fff; }
-  .spark { color:var(--cyan); font-size:17px; letter-spacing:.045em; white-space:nowrap; }
-  .muted { color:var(--muted); }
-  .facts { display:grid; grid-template-columns:auto 1fr auto; row-gap:8px; column-gap:11px; }
-  .facts .dot { color:var(--green); } .facts .value { color:#d6e2e5; text-align:right; }
-  .workloads { display:grid; grid-template-columns:1fr 48px 48px; row-gap:8px; column-gap:8px; }
-  .workloads .head { color:var(--muted); font-size:10px; letter-spacing:.08em; }
-  .workloads > div:nth-child(3n+2), .workloads > div:nth-child(3n+3) { text-align:right; }
-  .footer { color:var(--muted); display:flex; justify-content:space-between; font-size:11px; }
-  .footer .keys { color:#adc0c6; }
+  :root {{ --bg:#05070d; --text:#d0d0d0; --muted:#8a8a8a; --line:#474853;
+    --blue:#87afd7; --green:#afd7d7; --brand:#d7afff; }}
+  * {{ box-sizing:border-box; }}
+  html, body {{ margin:0; width:{WIDTH}px; height:{HEIGHT}px; overflow:hidden;
+    background:var(--bg); }}
+  body {{ color:var(--text); font-family:"SFMono-Regular",Menlo,Consolas,monospace;
+    font-size:14px; line-height:1.55; }}
+  .shell {{ width:100%; height:100%; padding:24px 26px 20px; display:grid;
+    grid-template-rows:68px 32px 146px 1fr 38px 21px; gap:10px; }}
+  .top {{ display:flex; justify-content:space-between; align-items:flex-start; }}
+  .headline {{ font-weight:700; color:var(--green); font-size:16px; white-space:nowrap; }}
+  .reason {{ margin-top:7px; color:var(--text); font-size:12px; }}
+  .demo {{ color:var(--muted); font-size:10px; white-space:nowrap;
+    border:1px solid var(--line); padding:4px 7px; }}
+  .ribbon {{ color:var(--blue); display:flex; gap:26px; font-size:12px;
+    border-bottom:1px solid var(--line); align-items:flex-start; font-weight:600; }}
+  .ribbon span {{ white-space:nowrap; }}
+  .signature {{ display:flex; align-items:flex-start; border-bottom:1px solid var(--line);
+    gap:32px; overflow:hidden; }}
+  .mascot {{ font-family:inherit; font-size:16px; line-height:19px; margin:0;
+    letter-spacing:0; font-weight:400; white-space:pre; flex-shrink:0; }}
+  .ink-brand {{ color:#ff87af; }} .ink-highlight {{ color:#ffd7d7; }}
+  .ink-shadow {{ color:#d787af; }} .ink-detail {{ color:#eeeeee; }}
+  .ink-structure {{ color:var(--muted); }}
+  .identity {{ padding-top:8px; }}
+  .wordmark {{ font-size:20px; font-weight:600; margin-bottom:17px; letter-spacing:.035em; }}
+  .tagline {{ color:var(--blue); font-size:12px; letter-spacing:.07em; }}
+  .machine {{ margin-top:5px; font-size:12px; }}
+  .profile {{ color:var(--muted); font-size:11px; margin-top:4px; }}
+  .content {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; min-height:0; }}
+  .panel {{ border:1px solid var(--line); border-radius:8px; padding:15px 15px 12px;
+    position:relative; min-height:0; }}
+  .title {{ position:absolute; top:-10px; left:14px; padding:0 7px;
+    background:var(--bg); color:var(--muted); font-size:12px; font-weight:700; }}
+  .facts {{ display:grid; grid-template-columns:65px 1fr; row-gap:5px;
+    color:var(--blue); font-size:13px; margin-top:3px; }}
+  .facts .label {{ font-weight:600; }}
+  .provenance {{ color:var(--muted); font-size:10px; margin-top:14px; }}
+  .spark {{ color:var(--blue); font-size:13px; white-space:nowrap; margin-top:8px; }}
+  .spark-label {{ color:var(--muted); font-size:10px; margin-right:5px; }}
+  .workloads {{ display:grid; grid-template-columns:1fr auto; row-gap:7px;
+    margin-top:2px; font-size:13px; }}
+  .workloads .value {{ color:var(--text); font-variant-numeric:tabular-nums; }}
+  .workload-note {{ margin-top:12px; color:var(--muted); font-size:10px; }}
+  .context {{ display:flex; align-items:center; gap:18px; color:var(--blue);
+    font-size:11px; border-top:1px solid var(--line); white-space:nowrap; }}
+  .context .label {{ color:var(--muted); font-size:10px; }}
+  .footer {{ display:flex; justify-content:space-between; align-items:flex-end;
+    color:var(--muted); font-size:11px; white-space:nowrap; }}
+  .footer .key {{ color:var(--text); }}
 </style>
 </head>
 <body>
 <main class="shell">
   <header class="top">
-    <div><div class="brand">PORKYHUD</div><div class="mode">1 OVERVIEW · %s · MOTION OFF DEFAULT</div></div>
-    <div class="demo">%s</div>
+    <div>
+      <div class="headline">PorkyHUD · 1 OVERVIEW · NORMAL · LIVE</div>
+      <div class="reason">No active CPU, memory, thermal, or storage pressure.</div>
+    </div>
+    <div class="demo">{MARKER}</div>
   </header>
-  <section class="ribbon">
-    <div class="source"><div class="label">DECISION INPUTS</div><div class="value">4 / 4 LIVE</div></div>
-    <div class="source"><div class="label">CPU</div><div class="value">LIVE · 0s</div></div>
-    <div class="source"><div class="label">MEMORY PRESSURE</div><div class="value">LIVE · NORMAL</div></div>
-    <div class="source"><div class="label">OS THERMAL</div><div class="value">LIVE · CLEAR</div></div>
-    <div class="source"><div class="label">STORAGE</div><div class="value">LIVE · 43 GiB</div></div>
+  <section class="ribbon" aria-label="Decision evidence">
+    <span>CPU {cpu:.1f}% · 0s</span><span>MEM NORMAL · 0s</span>
+    <span>THERM CLEAR · 0s</span><span>DISK 312 GiB FREE · 0s</span>
+  </section>
+  <section class="signature">
+    <pre class="mascot" aria-label="Shared sculpted PorkyHUD mascot">{mascot}</pre>
+    <div class="identity">
+      <div class="wordmark">P O R K Y H U D</div>
+      <div class="tagline">YOUR MAC, IN FOCUS</div>
+      <div class="machine">Synthetic Apple Silicon · 64 GiB</div>
+      <div class="profile">Graphite · sculpted · motion calm (optional)</div>
+    </div>
   </section>
   <section class="content">
-    <div class="column left">
-      <article class="panel">
-        <div class="panel-title">SYSTEM READ <span>evidence age 0s</span></div>
-        <div class="decision"><div class="state">NORMAL</div><div class="copy">No typed decision input currently indicates<br>resource or thermal pressure.</div></div>
-        <div class="metric-grid">
-          <div class="metric"><span class="name">CPU </span><span class="bar">%s</span> <span class="number">%2.0f%%</span></div>
-          <div class="metric"><span class="name">RAM </span><span class="bar">%s</span> <span class="number">%2.0f%%</span></div>
-        </div>
-      </article>
-      <article class="panel">
-        <div class="panel-title">60 SECOND CONTEXT <span>descriptive · not severity</span></div>
-        <div class="spark">%s</div>
-        <div class="muted" style="margin-top:12px">steady sampling · bounded collectors · last good values retained</div>
-      </article>
-    </div>
-    <div class="column right">
-      <article class="panel">
-        <div class="panel-title">EVIDENCE <span>typed inputs only</span></div>
-        <div class="facts">
-          <div class="dot">●</div><div>CPU window</div><div class="value">38%% · 15s</div>
-          <div class="dot">●</div><div>Memory pressure</div><div class="value">NORMAL</div>
-          <div class="dot">●</div><div>OS thermal state</div><div class="value">CLEAR</div>
-          <div class="dot">●</div><div>Storage headroom</div><div class="value">43 GiB</div>
-          <div class="muted">○</div><div class="muted">Advanced sensors</div><div class="muted value">CHECKING</div>
-        </div>
-      </article>
-      <article class="panel">
-        <div class="panel-title">WORKLOADS <span>synthetic categories</span></div>
-        <div class="workloads">
-          <div class="head">IDENTITY</div><div class="head">CPU</div><div class="head">MEM</div>
-          <div>creative workload</div><div>14%%</div><div>8%%</div>
-          <div>browser workload</div><div>9%%</div><div>12%%</div>
-          <div>background services</div><div>4%%</div><div>5%%</div>
-        </div>
-      </article>
-    </div>
+    <article class="panel">
+      <div class="title">EVIDENCE DETAIL</div>
+      <div class="facts">
+        <div class="label">CPU</div><div>{cpu:.1f}% · LIVE · 15s window</div>
+        <div class="label">MEM</div><div>NORMAL · LIVE</div>
+        <div class="label">THERM</div><div>CLEAR · LIVE</div>
+        <div class="label">DISK</div><div>312 GiB free · LIVE</div>
+      </div>
+      <div class="provenance">PROVENANCE · macOS core evidence</div>
+      <div class="spark"><span class="spark-label">CPU 60s</span>{history_text}</div>
+    </article>
+    <article class="panel">
+      <div class="title">TOP PROCESSES · CPU</div>
+      <div class="workloads">
+        <div>Creative workload</div><div class="value">14.2%</div>
+        <div>Browser workspace</div><div class="value">9.4%</div>
+        <div>Build workers</div><div class="value">6.8%</div>
+        <div>Background services</div><div class="value">4.1%</div>
+        <div>Terminal workspace</div><div class="value">1.3%</div>
+      </div>
+      <div class="workload-note">Identity only · m sort · advanced sensors CHECKING</div>
+    </article>
   </section>
-  <footer class="footer"><span class="keys">1–5 mode · m sort · h help · r refresh · q quit</span><span>SYNTHETIC SYSTEM · %s</span></footer>
+  <div class="context"><span class="label">EXPLORE ·</span>
+    <span>7 Insights · 8 Devices · 9 Network · 0 TCP connections</span>
+  </div>
+  <footer class="footer">
+    <span><span class="key">d</span> Explore · 1–5 / 7 modes · a motion · t theme · h help · q quit</span>
+    <span>Dashboard motion starts off</span>
+  </footer>
 </main>
 </body>
-</html>""" % (
-        pulse, WIDTH, HEIGHT, synthetic_time, MARKER, cpu_bar, cpu,
-        memory_bar, memory, history_text, synthetic_time,
-    )
+</html>"""
 
 
 def _find_executable(names: Sequence[str]) -> Optional[str]:
