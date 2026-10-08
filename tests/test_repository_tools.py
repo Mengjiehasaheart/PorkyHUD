@@ -703,7 +703,7 @@ class MeasurementHarnessTests(unittest.TestCase):
                 " p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
                 "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
                 " pathlib.Path(%r).write_text(str(p.pid),encoding='ascii')\n"
-                " sys.stdout.write('CHECKING 0/4 core sources\\r\\nWaiting for core evidence.\\r\\n'"
+                " sys.stdout.write('CHECKING 0/4 core sources\\r\\nLoading system readings.\\r\\n'"
                 "+'CPU CHECKING | MEM CHECKING | THERM CHECKING | DISK CHECKING\\r\\n'"
                 "+'CPU 1%% MEM NORMAL THERM CLEAR\\r\\n');sys.stdout.flush()\n"
                 " time.sleep(0.2)\n"
@@ -797,13 +797,22 @@ class DemoRendererTests(unittest.TestCase):
             self.assertIn("CPU", html_text)
             self.assertIn("m sort", html_text)
             self.assertIn("Graphite", html_text)
-            self.assertIn("EVIDENCE DETAIL", html_text)
+            self.assertIn("MEMORY", html_text)
+            self.assertIn("STORAGE + I/O", html_text)
+            for reading in ("RAM", "package power", "fans", "Battery", "Swap",
+                            "compressed", "Cache", "IOPS", "Network ↓", "CPU 60s"):
+                self.assertIn(reading, html_text)
             self.assertIn("TOP PROCESSES · CPU", html_text)
-            self.assertIn("d</span> Explore", html_text)
-            self.assertIn("7 Insights · 8 Devices · 9 Network · 0 TCP connections", html_text)
+            self.assertIn("1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit", html_text)
+            self.assertIn("Tab/Shift-Tab", html_text)
+            self.assertIn("/ search", html_text)
+            self.assertIn("refresh", html_text)
+            self.assertNotIn('class="navigation"', html_text)
+            self.assertNotIn("evidence", html_text.lower())
+            self.assertNotIn("provenance", html_text.lower())
             self.assertNotIn("CPU 60s avg", html_text)
             self.assertNotIn("swap I/O", html_text)
-            self.assertIn("Dashboard motion starts off", html_text)
+            self.assertIn("Graphite · calm optional", html_text)
             self.assertNotIn("/Users/", html_text)
             self.assertNotIn("Mac Studio", html_text)
 

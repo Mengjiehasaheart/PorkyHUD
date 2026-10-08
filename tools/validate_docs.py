@@ -36,6 +36,7 @@ EXPECTED_DIRECT_MODES = {
     "5": "processes",
     "6": "cinema",
     "7": "insights", "8": "devices", "9": "network", "0": "connections",
+    "i": "system",
 }
 
 
@@ -539,10 +540,11 @@ def validate_control_contract(root: Path) -> List[str]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     )
     help_tokens = (
-        "1–5           select operational mode",
-        "d / 7–9 / 0   Explore / insights, devices, network, TCP",
-        "s             sculpted / outline / ASCII style",
-        "l             cycle supported modes",
+        "1–0 / i       choose view · d all tools",
+        "t / s         theme / sculpted, outline, ASCII artwork",
+        "Tab/Shift-Tab next/previous view · l next",
+        "/             find processes or inventory",
+        "f             TCP: all / listeners / established / other",
         "a             motion: off / calm / vivid",
         "PgUp/PgDn/Home/End  page or jump to either end",
         "6  Cinema     select wide Cinema mode",

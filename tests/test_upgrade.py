@@ -1,7 +1,7 @@
 """User-flow contracts for the refined dashboard and on-demand exploration."""
 
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import io
 import json
 import os
@@ -25,7 +25,8 @@ from tests.test_porkyhud import FakeScreen, make_health_frame_for_test, settled_
 
 class DashboardHarness(unittest.TestCase):
     def run_dashboard(self, keys, *, config=None, height=22, width=76,
-                      unicode_enabled=False, advance=0.1, collect_inventory=False):
+                      unicode_enabled=False, advance=0.1, collect_inventory=False,
+                      process_rows=(), static=None, frame=None):
         config = config or porkyhud.HudConfig()
         screen = FakeScreen(height, width, keys=keys)
         captured = []
@@ -33,9 +34,9 @@ class DashboardHarness(unittest.TestCase):
                                                           for y in range(height)))
         coordinator = mock.Mock()
         coordinator.source_generation.return_value = 0
-        coordinator.tick.return_value = make_health_frame_for_test()
+        coordinator.tick.return_value = frame or make_health_frame_for_test()
         coordinator.per_core.return_value = (10.0, 20.0)
-        coordinator.process_rows.return_value = ()
+        coordinator.process_rows.return_value = tuple(process_rows)
         pollers = []
 
         class Poller:
@@ -60,7 +61,7 @@ class DashboardHarness(unittest.TestCase):
             def close(self, _timeout_s=1.0):
                 self.closed = True
 
-        static_poller = Poller(30, lambda: None)
+        static_poller = Poller(30, lambda: None, initial=static)
         clock = [21.0]
 
         def advance_clock(_duration):
@@ -146,16 +147,16 @@ class ExploreFlowTests(DashboardHarness):
 
     def test_menu_opens_selected_view_with_arrows_and_enter(self):
         for keys, expected in (
-            ([ord("d"), porkyhud.curses.KEY_DOWN, 10, ord("q")], "devices"),
-            ([ord("d"), porkyhud.curses.KEY_UP, 13, ord("q")], "connections"),
+            ([ord("d"), porkyhud.curses.KEY_DOWN, 10, ord("q")], "compute"),
+            ([ord("d"), porkyhud.curses.KEY_UP, 13, ord("q")], "system"),
         ):
             with self.subTest(mode=expected):
                 screen, config, coordinator, _pollers, captured, _body = self.run_dashboard(keys)
                 self.assertEqual(config.layout_name, expected)
                 self.assertFalse(config.show_menu)
-                self.assertTrue(any("EXPLORE YOUR MAC" in "\n".join(rows)
+                self.assertTrue(any("ALL TOOLS" in "\n".join(rows)
                                     for rows in captured))
-                self.assertNotIn("EXPLORE YOUR MAC", screen.text())
+                self.assertNotIn("ALL TOOLS", screen.text())
                 self.assertGreaterEqual(coordinator.tick.call_count, 3)
 
     def test_direct_inventory_keys_work_from_dashboard_and_menu(self):
@@ -177,7 +178,7 @@ class ExploreFlowTests(DashboardHarness):
         self.assertFalse(config.show_menu)
         self.assertEqual(config.layout_name, "balanced")
         self.assertEqual(coordinator.tick.call_count, 2)
-        self.assertNotIn("EXPLORE YOUR MAC", screen.text())
+        self.assertNotIn("ALL TOOLS", screen.text())
 
     def test_explore_is_lazy_and_reuses_collectors_on_revisit(self):
         _screen, _config, _coordinator, baseline, _captured, _body = self.run_dashboard(
@@ -202,7 +203,7 @@ class ExploreFlowTests(DashboardHarness):
                     self.assertIn("NORMAL", screen.row(0))
                     self.assertIn("CPU", screen.row(2))
                     self.assertIn("q quit", screen.row(height - 1))
-                    self.assertIn("EXPLORE YOUR MAC", screen.text())
+                    self.assertIn("ALL TOOLS", screen.text())
                     self.assertTrue(all(0 <= y < height and 0 <= x < width - 1
                                         for y, x, *_rest in screen.writes))
                     if not unicode_enabled:
@@ -647,6 +648,340 @@ class ExternalCommandCancellationTests(unittest.TestCase):
                                             "fixture", 1.0, 1024, 1024,
                                             cancel_event=object())
         spawn.assert_not_called()
+
+
+class NavigationAndSearchTests(DashboardHarness):
+    def test_tab_and_reverse_tab_cycle_every_supported_view(self):
+        for height, width, keys, expected in (
+            (22, 76, [9], "compute"),
+            (22, 76, [porkyhud.curses.KEY_BTAB], "system"),
+            (34, 118, [porkyhud.curses.KEY_BTAB], "cinema"),
+            (22, 76, [9, porkyhud.curses.KEY_BTAB], "balanced"),
+        ):
+            with self.subTest(size=(height, width), keys=keys):
+                _screen, config, *_rest = self.run_dashboard(keys + [ord("q")], height=height, width=width)
+                self.assertEqual(config.layout_name, expected)
+
+    def test_system_details_are_a_direct_view_with_no_inventory_probe(self):
+        screen, config, _coordinator, pollers, _captured, _body = self.run_dashboard(
+            [ord("i"), ord("q")],
+            static={"chip": "Fixture Chip", "model": "Fixture Mac", "model_id": "Mac0,0",
+                    "os": "Fixture macOS", "boot_seconds": 60},
+        )
+        self.assertEqual(config.layout_name, "system")
+        self.assertIn("THIS MAC", screen.text())
+        self.assertIn("Fixture Chip", screen.text())
+        self.assertIn("Fixture macOS", screen.text())
+        self.assertFalse(any(getattr(p.collector, "__name__", "") == "collect_observation" for p in pollers))
+
+    def test_search_consumes_shortcuts_and_escape_clears_before_quit(self):
+        screen, config, coordinator, _pollers, captured, _body = self.run_dashboard(
+            [ord("/"), ord("q"), ord("1"), 10, 27, ord("q")],
+        )
+        self.assertEqual(config.layout_name, "balanced")
+        self.assertEqual(config.search_query, "")
+        self.assertFalse(config.search_editing)
+        self.assertEqual(coordinator.tick.call_count, 5)
+        self.assertTrue(any("Find: q1" in "\n".join(frame) for frame in captured))
+        self.assertNotIn("Find:", screen.row(21))
+
+    def test_process_search_is_filtered_before_render_and_retained_per_view(self):
+        rows = (
+            porkyhud.ProcessRow(10, 50, 1, None, "R", "00:01", "/usr/bin/worker --token secret-value"),
+            porkyhud.ProcessRow(11, 5, 1, None, "S", "00:01", "/usr/bin/other"),
+        )
+        _screen, config, _coordinator, _pollers, _captured, calls = self.run_dashboard(
+            [ord("/"), *map(ord, "worker"), 10, ord("5"), ord("1"), ord("q")], process_rows=rows,
+        )
+        self.assertEqual(config.searches, {"balanced": "worker"})
+        final_rows = calls[-1].args[16]
+        self.assertEqual([row.pid for row in final_rows], [10])
+        process_call = next(call for call in calls if call.args[1] == "processes")
+        self.assertEqual(len(process_call.args[16]), 2)
+
+    def test_process_search_cannot_match_redacted_values(self):
+        rows = (porkyhud.ProcessRow(42, 1, 1, None, "S", "00:01",
+                                 "/usr/bin/worker --token private-secret"),)
+        self.assertEqual(porkyhud.filter_process_rows(rows, "private-secret"), ())
+        self.assertEqual(porkyhud.filter_process_rows(rows, "WORKER 42"), rows)
+        self.assertEqual(porkyhud.filter_process_rows(rows, "[.*]"), ())
+
+    def test_query_editing_is_bounded_and_can_erase(self):
+        config = porkyhud.HudConfig(search_editing=True)
+        for key in (ord("a"), ord("b"), 127, ord("c")):
+            self.assertTrue(porkyhud.edit_search(config, key))
+        self.assertEqual(config.search_query, "ac")
+        porkyhud.edit_search(config, 21)
+        self.assertEqual(config.search_query, "")
+        for _ in range(porkyhud.SEARCH_QUERY_LIMIT + 5):
+            porkyhud.edit_search(config, ord("x"))
+        self.assertEqual(len(config.search_query), porkyhud.SEARCH_QUERY_LIMIT)
+        porkyhud.edit_search(config, 27)
+        self.assertFalse(config.search_editing)
+        self.assertEqual(config.search_query, "")
+        with self.assertRaises(ValueError):
+            porkyhud.normalize_search_query("x" * (porkyhud.SEARCH_QUERY_LIMIT + 1))
+        self.assertEqual(porkyhud.normalize_search_query("a\x1b b\n c"), "a b c")
+
+    def test_connection_filter_and_search_work_together(self):
+        result = InventoryResult(InventoryStatus.LIVE, (
+            ConnectionRecord("tcp4", "127.0.0.1:8080", "*:*", "LISTEN"),
+            ConnectionRecord("tcp4", "127.0.0.1:443", "*:*", "LISTEN"),
+            ConnectionRecord("tcp4", "127.0.0.1:8080", "192.0.2.1:443", "ESTABLISHED"),
+        ), "partial fixture", False, False)
+        with mock.patch.dict(porkyhud.INVENTORY_COLLECTORS, {"connections": mock.Mock(return_value=result)}):
+            screen, config, *_rest = self.run_dashboard(
+                [ord("0"), ord("f"), ord("/"), *map(ord, "8080"), 10, ord("q")], collect_inventory=True,
+            )
+        self.assertEqual(config.connection_filter, "listeners")
+        self.assertEqual(config.search_query, "8080")
+        self.assertIn("127.0.0.1:8080", screen.text())
+        self.assertNotIn("192.0.2.1", screen.text())
+        self.assertIn("PARTIAL", screen.row(4))
+        self.assertIn("2 listeners", screen.row(5))
+        self.assertIn("1/3 matches", screen.row(5))
+
+    def test_wide_character_search_accepts_unicode_without_treating_arrows_as_text(self):
+        config = porkyhud.HudConfig(search_editing=True)
+        for key in ("é", "界", porkyhud.curses.KEY_DOWN, "\n"):
+            self.assertTrue(porkyhud.edit_search(config, key))
+        self.assertEqual(config.search_query, "é界")
+        self.assertFalse(config.search_editing)
+        screen = mock.Mock()
+        screen.get_wch.return_value = "界"
+        self.assertEqual(porkyhud.read_hud_key(screen, True), "界")
+        screen.get_wch.side_effect = porkyhud.curses.error()
+        self.assertEqual(porkyhud.read_hud_key(screen, True), -1)
+        screen.getch.return_value = ord("d")
+        self.assertEqual(porkyhud.read_hud_key(screen, False), ord("d"))
+
+    def test_no_matching_processes_is_distinct_from_loading(self):
+        config = porkyhud.HudConfig(searches={"balanced": "no-match"})
+        frame = make_health_frame_for_test()
+        view = core.SourceView(core.SourceId.PROCESS_TABLE, core.SourceViewStatus.LIVE,
+                               1.0, False, True, 1, None)
+        frame = replace(frame, source_views={**frame.source_views, core.SourceId.PROCESS_TABLE: view})
+        screen, *_rest = self.run_dashboard([-1, ord("q")], config=config, frame=frame)
+        self.assertIn("No matching processes", screen.text())
+        self.assertNotIn("collecting processes", screen.text())
+
+    def test_process_search_waits_for_a_valid_list_before_claiming_no_matches(self):
+        config = porkyhud.HudConfig(searches={"balanced": "no-match"})
+        screen, *_rest = self.run_dashboard([-1, ord("q")], config=config)
+        self.assertIn("Processes CHECKING", screen.text())
+        self.assertNotIn("No matching processes", screen.text())
+        self.assertNotIn("0 matches", screen.text())
+
+    def test_escape_resets_connection_filter_before_quitting(self):
+        _screen, config, coordinator, *_rest = self.run_dashboard(
+            [ord("0"), ord("f"), 27, ord("q")],
+        )
+        self.assertEqual(config.layout_name, "connections")
+        self.assertEqual(config.connection_filter, "all")
+        self.assertEqual(coordinator.tick.call_count, 3)
+
+    def test_long_query_keeps_apply_and_clear_hints_visible(self):
+        config = porkyhud.HudConfig(search_editing=True, searches={"balanced": "x" * 256})
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
+            text = porkyhud.shortcut_status(76, config)
+        self.assertIn("Enter apply", text)
+        self.assertIn("Esc clear", text)
+        self.assertLessEqual(porkyhud.display_cell_width(text), 74)
+
+    def test_all_tools_menu_contains_every_view_at_minimum_size(self):
+        screen, *_rest = self.run_dashboard([ord("d"), ord("q")])
+        for label in ("Overview", "CPU & memory", "Temperatures & fans", "Storage & traffic",
+                      "Processes", "Cinema", "Memory activity", "Connected devices", "Network",
+                      "TCP connections", "This Mac"):
+            self.assertIn(label, screen.text())
+        self.assertIn("ALL TOOLS", screen.text())
+
+    def test_unsupported_cinema_stays_in_menu_with_clear_size_message(self):
+        screen, config, *_rest = self.run_dashboard([ord("d"), ord("6"), ord("q")])
+        self.assertTrue(config.show_menu)
+        self.assertEqual(config.layout_name, "balanced")
+        self.assertIn("ALL TOOLS", screen.text())
+        self.assertIn("requires 118x34", screen.row(21))
+
+    def test_live_search_filters_do_not_collect_inventory_on_overview(self):
+        _screen, _config, _coordinator, pollers, _captured, _body = self.run_dashboard(
+            [ord("/"), ord("a"), 10, ord("q")],
+        )
+        self.assertFalse(any(getattr(p.collector, "__name__", "") == "collect_observation" for p in pollers))
+
+
+class SearchCliTests(unittest.TestCase):
+    def test_failed_filtered_text_report_has_no_match_count_claim(self):
+        result = InventoryResult(InventoryStatus.TIMEOUT, detail="Fixture timeout")
+        output = io.StringIO()
+        with mock.patch.dict(porkyhud.INVENTORY_COLLECTORS, {"connections": mock.Mock(return_value=result)}), \
+                redirect_stdout(output):
+            status = porkyhud.main(["--inspect", "connections", "--state", "listeners"])
+        self.assertEqual(status, 1)
+        self.assertIn("TIMEOUT", output.getvalue())
+        self.assertIn("Counts unavailable", output.getvalue())
+        self.assertNotIn("0 matches", output.getvalue())
+
+    def test_filtered_text_report_labels_matching_and_returned_counts(self):
+        result = InventoryResult(InventoryStatus.LIVE, (
+            DeviceRecord("USB", "Fixture keyboard"), DeviceRecord("USB", "Fixture mouse"),
+        ), complete=False)
+        output = io.StringIO()
+        with mock.patch.dict(porkyhud.INVENTORY_COLLECTORS, {"devices": mock.Mock(return_value=result)}), \
+                redirect_stdout(output):
+            status = porkyhud.main(["--inspect", "devices", "--search", "keyboard"])
+        self.assertEqual(status, 0)
+        self.assertIn("1 matches / 2 returned · PARTIAL", output.getvalue())
+        self.assertIn("Fixture keyboard", output.getvalue())
+        self.assertNotIn("Fixture mouse", output.getvalue())
+
+    def test_filtered_inventory_json_preserves_partial_coverage_and_totals(self):
+        result = InventoryResult(InventoryStatus.LIVE, (
+            ConnectionRecord("tcp4", "127.0.0.1:8080", "*:*", "LISTEN"),
+            ConnectionRecord("tcp4", "127.0.0.1:9000", "192.0.2.1:443", "ESTABLISHED"),
+        ), "partial fixture", True, False)
+        output = io.StringIO()
+        with mock.patch.dict(porkyhud.INVENTORY_COLLECTORS, {"connections": mock.Mock(return_value=result)}), redirect_stdout(output):
+            status = porkyhud.main(["--inspect", "connections", "--state", "listeners", "--search", "8080", "--json"])
+        data = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(len(data["items"]), 1)
+        self.assertTrue(data["truncated"])
+        self.assertFalse(data["complete"])
+        self.assertEqual(data["filter"]["returned_records"], 2)
+        self.assertEqual(data["filter"]["matched_records"], 1)
+        self.assertEqual(data["summary"]["listeners"], 1)
+
+    def test_state_flag_selects_connections_for_live_use(self):
+        captured = []
+        with mock.patch.object(porkyhud, "terminal_ui_problem", return_value=None), \
+                mock.patch.object(porkyhud, "enforce_dark_terminal"), \
+                mock.patch.object(porkyhud.curses, "wrapper", side_effect=lambda fn: fn(mock.Mock())), \
+                mock.patch.object(porkyhud, "hud", side_effect=lambda _screen, config: captured.append(config)):
+            self.assertEqual(porkyhud.main(["--state", "listeners", "--search", "443"]), 0)
+        self.assertEqual(captured[0].layout_name, "connections")
+        self.assertEqual(captured[0].connection_filter, "listeners")
+        self.assertEqual(captured[0].search_query, "443")
+
+    def test_invalid_state_combinations_reject_before_collection(self):
+        for argv in (["--inspect", "devices", "--state", "listeners"],
+                     ["--mode", "thermals", "--state", "listeners"],
+                     ["--snapshot", "--search", "worker"]):
+            with self.subTest(argv=argv), mock.patch.object(porkyhud, "collect_snapshot") as collector, \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                porkyhud.main(argv)
+            self.assertEqual(error.exception.code, 2)
+            collector.assert_not_called()
+
+
+class FullerDashboardTests(unittest.TestCase):
+    def test_empty_process_panels_preserve_failure_status_without_search(self):
+        frame = make_health_frame_for_test()
+        for status in (core.SourceViewStatus.ERROR, core.SourceViewStatus.STALE,
+                       core.SourceViewStatus.UNSUPPORTED):
+            view = core.SourceView(core.SourceId.PROCESS_TABLE, status, None,
+                                   False, False, None, None)
+            current = replace(frame, source_views={**frame.source_views, core.SourceId.PROCESS_TABLE: view})
+            screen = FakeScreen(22, 76)
+            with self.subTest(status=status), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                message = porkyhud.process_empty_message(current, None)
+                porkyhud.draw_process_panel(screen, 3, 1, 12, 74, (), 0, "CPU", empty_message=message)
+            self.assertIn(status.value, screen.text())
+            self.assertNotIn("collecting", screen.text())
+            self.assertNotIn("0 matches", screen.text())
+
+    def test_failed_first_inventory_has_no_socket_count_claim(self):
+        filtered = porkyhud.HudConfig(layout_index=porkyhud.LAYOUTS.index("connections"),
+                                      searches={"connections": "fixture"}, connection_filter="listeners")
+        for config in (None, filtered):
+            screen = FakeScreen(22, 76)
+            with self.subTest(filtered=config is not None), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_inventory_body(
+                    screen, "connections", 3, 18, 76,
+                    InventoryResult(InventoryStatus.TIMEOUT, detail="Fixture timeout"),
+                    0, "", 0, config=config,
+                )
+            self.assertIn("TIMEOUT", screen.row(4))
+            self.assertIn("Counts unavailable", screen.row(5))
+            self.assertNotIn("0 listeners", screen.text())
+            self.assertNotIn("0 connected", screen.text())
+            self.assertNotIn("No matches", screen.text())
+
+    def test_percent_bars_keep_full_numbers_and_units_in_narrow_panels(self):
+        with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
+            for label in ("total ", "active "):
+                for number in (0, 3.5, 100):
+                    text = porkyhud.fitted_percent_bar(number, 34, 0, label)
+                    self.assertLessEqual(porkyhud.display_cell_width(text), 34)
+                    self.assertTrue(text.endswith("%5.1f%%" % number))
+
+    def test_dense_overview_contains_metrics_and_processes_at_every_supported_size(self):
+        for height, width in ((22, 76), (24, 80), (34, 118), (42, 132), (42, 164)):
+            screen = FakeScreen(height, width, fill="~")
+            history = porkyhud.MetricHistory()
+            mem = {"total": 128 * 1024**3, "used": 64 * 1024**3, "swap_used": 1024**3,
+                   "swap_total": 2 * 1024**3, "compressed": 1024**3, "cached": 2 * 1024**3}
+            rows = [porkyhud.ProcessRow(42, 55, 1, None, "R", "00:01", "/usr/bin/fixture --token secret")]
+            with self.subTest(size=(height, width)), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_mode_body(
+                    screen, "balanced", 3, height - 4, width, make_health_frame_for_test(),
+                    [10, 20], {"chip": "Fixture Chip"}, mem, fixtures.make_battery(), settled_sensor(),
+                    porkyhud.DiskInfo("Data", "/", 100, 50, 50), porkyhud.DiskActivity(source="iostat"),
+                    1024, 2048, history, rows, 0, "CPU", 0,
+                )
+            for text in ("CPU", "RAM", "MEMORY", "Swap", "STORAGE + I/O", "Net", "TOP PROCESSES", "fixture"):
+                self.assertIn(text, screen.text())
+            self.assertNotIn("secret", screen.text())
+            self.assertEqual(screen.row(0), "~" * width)
+            self.assertEqual(screen.row(height - 1), "~" * width)
+            self.assertTrue(all(3 <= y < height - 1 and 1 <= x < width - 1 for y, x, *_rest in screen.writes))
+
+    def test_human_status_text_uses_plain_labels_in_every_health_state(self):
+        for case in ("checking", "normal", "incomplete", "delayed", "memory_critical"):
+            frame = make_health_frame_for_test(case)
+            for width in (76, 132):
+                text = " ".join(porkyhud.decision_header_lines(frame, "balanced", width, 20.0)).casefold()
+                self.assertNotIn("evidence", text)
+                self.assertNotIn("provenance", text)
+            text = porkyhud.legacy_read_projection(frame.assessment)["message"].casefold()
+            self.assertNotIn("evidence", text)
+            self.assertNotIn("provenance", text)
+
+    def test_plain_status_copy_preserves_volume_and_process_names(self):
+        storage = make_health_frame_for_test("storage_watch")
+        storage = replace(
+            storage, disk_capacity=replace(storage.disk_capacity, volume_name="Evidence"),
+            assessment=replace(storage.assessment,
+                               reason="Storage headroom is low: 8.0 GiB remains on Evidence."),
+        )
+        for width in (76, 132):
+            self.assertIn("Evidence", porkyhud.compact_reason(storage, width, 20.0))
+        self.assertIn("Evidence", porkyhud.legacy_read_projection(storage.assessment)["message"])
+        cpu = make_health_frame_for_test("cpu_watch")
+        cpu = replace(cpu, assessment=replace(cpu.assessment, contributor_name="provenance"))
+        self.assertIn("provenance", porkyhud.compact_reason(cpu, 200, 20.0))
+
+    def test_power_panels_do_not_invent_battery_absence_or_zero_charge(self):
+        for changes, expected in (({"present": False, "source": "Power", "state": "checking"}, "CHECKING"),
+                                  ({"present": False, "source": "Power", "state": "unknown"}, "UNAVAILABLE"),
+                                  ({"present": True, "percent": None}, "NOT EXPOSED")):
+            battery = fixtures.make_battery(**changes)
+            screen = FakeScreen(24, 80)
+            with self.subTest(changes=changes), \
+                    mock.patch.object(porkyhud, "unicode_ok", return_value=False), \
+                    mock.patch.object(porkyhud, "color_pair", return_value=0):
+                porkyhud.draw_battery_panel(screen, 3, 1, 10, 38, battery, 0)
+                porkyhud.draw_thermal_panel(screen, 3, 40, 18, 38, battery, settled_sensor(), 0)
+            self.assertIn(expected, screen.text())
+            self.assertNotIn("not installed", screen.text())
+            self.assertNotIn("not present", screen.text())
+            self.assertNotIn("0.0%", screen.text())
 
 
 if __name__ == "__main__":

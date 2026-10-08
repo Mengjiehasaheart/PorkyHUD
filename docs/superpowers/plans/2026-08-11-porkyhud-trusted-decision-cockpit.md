@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Scope note (2026-10-08):** This is the completed Phase 1 execution contract and retains its fixed interfaces below. The subsequent user-authorized 0.2.0 artwork, descriptive insight, process-cache and read-only inventory extension is described in the companion design's subsequent-upgrade section and current `AGENTS.md` routes; it does not silently revise these historical tasks or rerun Task 15 measurement batches.
+**Scope note (2026-10-08):** This is the completed Phase 1 execution contract and retains its fixed interfaces below. The subsequent user-authorized 0.2.0 artwork, descriptive insight, process-cache and read-only inventory extension, plus the 0.2.1 dense Overview and usability follow-up, are described in the companion design's subsequent-upgrade sections and current `AGENTS.md` routes. They do not silently revise these historical tasks or rerun Task 15 measurement batches.
 
 **Goal:** Build Phase 1 of PorkyHUD's trusted decision cockpit: typed evidence provenance, conservative health policy, independent collectors, a responsive six-mode terminal experience, truthful one-shot output, reproducible validation, and accurate maintainer documentation.
 

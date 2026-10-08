@@ -17,6 +17,8 @@ import unicodedata
 
 RECORD_LIMIT = 128
 NODE_LIMIT = 2048
+SEARCH_QUERY_LIMIT = 256
+CONNECTION_FILTERS = ("all", "listeners", "established", "other")
 T = TypeVar("T")
 
 
@@ -121,6 +123,131 @@ class NetworkInventory:
 
 
 InventoryValue = Union[InventoryResult, NetworkInventory]
+
+
+@dataclass(frozen=True)
+class InventorySummary:
+    """Counts of returned records, with their source coverage kept explicit."""
+
+    status: InventoryStatus = InventoryStatus.CHECKING
+    total_count: int = 0
+    kind_counts: Tuple[Tuple[str, int], ...] = ()
+    active_interfaces: int = 0
+    unknown_link_interfaces: int = 0
+    listeners: int = 0
+    established: int = 0
+    other_connections: int = 0
+    complete: bool = False
+    truncated: bool = False
+    detail: str = "counts describe returned records only"
+
+
+def _inventory_records(result: InventoryValue) -> tuple:
+    if not isinstance(result, (InventoryResult, NetworkInventory)):
+        raise ValueError("result must be a typed inventory result")
+    result.__post_init__()
+    if any(not isinstance(item, (DeviceRecord, NetworkInterface, ConnectionRecord))
+           for item in result.items):
+        raise ValueError("inventory contains an unsupported record type")
+    return result.items
+
+
+def _search_fields(item: Union[DeviceRecord, NetworkInterface, ConnectionRecord]) -> Tuple[str, ...]:
+    """Only fields available in a record table belong to the search index."""
+
+    if isinstance(item, DeviceRecord):
+        return (item.kind, item.name, item.vendor, item.product_id,
+                item.speed, item.parent, item.port)
+    if isinstance(item, NetworkInterface):
+        return (item.name, item.state, item.mac, item.medium, item.hardware_port,
+                "" if item.mtu is None else str(item.mtu)) + item.addresses
+    return (item.protocol, item.local, item.remote, item.state,
+            str(item.recv_queue), str(item.send_queue))
+
+
+def filter_inventory(
+    result: InventoryValue,
+    query: str = "",
+    *,
+    connection_state: str = "all",
+) -> InventoryValue:
+    """Select records using literal case-insensitive AND terms and TCP groups.
+
+    Search never examines raw command output, result status/detail, or network
+    supplements.  Source completeness and truncation describe the collection,
+    so they remain unchanged even when this selection returns no rows.  The
+    caller can summarize the original result to compare matches with returned
+    records.  This operation performs no collection, clocks, or side effects.
+    """
+
+    items = _inventory_records(result)
+    if type(query) is not str or len(query) > SEARCH_QUERY_LIMIT:
+        raise ValueError("search query must be text of at most %d characters" % SEARCH_QUERY_LIMIT)
+    if type(connection_state) is not str:
+        raise ValueError("connection filter must be a named TCP group")
+    group = connection_state.casefold()
+    if group not in CONNECTION_FILTERS:
+        raise ValueError("connection filter must be all, listeners, established, or other")
+    if group != "all" and (isinstance(result, NetworkInventory)
+                           or any(not isinstance(item, ConnectionRecord) for item in items)):
+        raise ValueError("connection filters require TCP records")
+    terms = query.casefold().split()
+    if not terms and group == "all":
+        return result
+    selected = []
+    for item in items:
+        if group != "all":
+            state = item.state.upper()
+            if ((group == "listeners" and state != "LISTEN")
+                    or (group == "established" and state != "ESTABLISHED")
+                    or (group == "other" and state in {"LISTEN", "ESTABLISHED"})):
+                continue
+        searchable = " ".join(_search_fields(item)).casefold()
+        if all(term in searchable for term in terms):
+            selected.append(item)
+    selected_items = tuple(selected)
+    return result if selected_items == items else replace(result, items=selected_items)
+
+
+def summarize_inventory(result: InventoryValue) -> InventorySummary:
+    """Summarize returned rows without claiming unseen devices or connections.
+
+    Only an explicitly ACTIVE interface counts as active.  Administrative UP
+    alone leaves link status unknown.  Every TCP state other than LISTEN and
+    ESTABLISHED belongs to the other group, including pending and closing
+    sockets.  Failed or partial results retain their original typed status.
+    """
+
+    items = _inventory_records(result)
+    kinds = {}
+    active = unknown = listeners = established = other = 0
+    for item in items:
+        if isinstance(item, DeviceRecord):
+            kinds[item.kind] = kinds.get(item.kind, 0) + 1
+        elif isinstance(item, NetworkInterface):
+            state = item.state.casefold()
+            active += state == "active"
+            unknown += "unknown" in state
+        elif item.state.upper() == "LISTEN":
+            listeners += 1
+        elif item.state.upper() == "ESTABLISHED":
+            established += 1
+        else:
+            other += 1
+    detail = "counts describe returned records only"
+    if result.status is not InventoryStatus.LIVE:
+        detail += "; latest collection " + result.status.value.lower()
+    elif result.truncated:
+        detail += "; source truncated"
+    elif not result.complete:
+        detail += "; source coverage partial"
+    return InventorySummary(
+        status=result.status, total_count=len(items),
+        kind_counts=tuple(sorted(kinds.items(), key=lambda pair: pair[0].casefold())),
+        active_interfaces=active, unknown_link_interfaces=unknown,
+        listeners=listeners, established=established, other_connections=other,
+        complete=result.complete, truncated=result.truncated, detail=detail,
+    )
 
 
 def _valid_completion(value: object) -> bool:
@@ -375,7 +502,7 @@ def parse_interfaces(raw: str) -> InventoryResult[NetworkInterface]:
     if current is not None:
         records.append(NetworkInterface(**current))
     if not records:
-        raise ValueError("interface response has no recognized evidence")
+        raise ValueError("interface response has no usable records")
     truncated = len(records) > RECORD_LIMIT or truncated_addresses
     return InventoryResult(InventoryStatus.LIVE, tuple(records[:RECORD_LIMIT]),
                            "observed interfaces; UP alone does not prove link", truncated, not truncated)
@@ -580,7 +707,7 @@ def parse_lsof_connections(raw: str) -> InventoryResult[ConnectionRecord]:
             raise ValueError("unselected lsof field")
     finish()
     if not items:
-        raise ValueError("lsof supplied no recognized TCP socket evidence")
+        raise ValueError("lsof supplied no usable TCP socket records")
     priority = {"LISTEN": 0, "ESTABLISHED": 1}
     items.sort(key=lambda item: (priority.get(item.state, 2), item.local, item.remote))
     return InventoryResult(InventoryStatus.LIVE, tuple(items[:RECORD_LIMIT]),
@@ -661,7 +788,7 @@ def collect_network(runner: Runner) -> NetworkInventory:
     complete = interfaces.complete and not truncated and all(status is InventoryStatus.LIVE for status in statuses)
     detail = "observed interface configuration; no connectivity test"
     if not complete:
-        detail += "; supplementary evidence incomplete"
+        detail += "; some network details unavailable"
     return NetworkInventory(InventoryStatus.LIVE, items, detail, truncated, complete,
                             gateway, default_interface, servers, *statuses)
 

@@ -1,14 +1,17 @@
 """Read-only inventory contracts, parser failure boundaries, and privacy."""
 
-from dataclasses import asdict, FrozenInstanceError
+from dataclasses import asdict, FrozenInstanceError, replace
 from math import inf, nan
 import json
 import unittest
 from unittest import mock
 
 from porkyhud_inventory import (
-    InventoryObservation, InventoryResult, InventoryStatus, NetworkInventory, ProbeResult,
+    CONNECTION_FILTERS, SEARCH_QUERY_LIMIT, ConnectionRecord, DeviceRecord,
+    InventoryObservation, InventoryResult, InventoryStatus, NetworkInterface,
+    NetworkInventory, ProbeResult,
     collect_connections, collect_devices, collect_network,
+    filter_inventory, summarize_inventory,
     parse_connections, parse_devices, parse_dns, parse_hardware_ports,
     parse_interfaces, parse_lsof_connections, parse_route, observe_inventory,
 )
@@ -486,6 +489,178 @@ class InventoryObservationTests(unittest.TestCase):
                                  (InventoryObservation(), {})):
             with self.subTest(previous=previous, result=result), self.assertRaises(ValueError):
                 observe_inventory(previous, result, 10.0)
+
+
+class InventoryToolsTests(unittest.TestCase):
+    def test_device_search_matches_casefolded_terms_across_visible_fields(self):
+        records = (
+            DeviceRecord("USB", "Straße keyboard", "Acme", "0x1234", "5 Gb/s",
+                         "Desk hub", "Port 2"),
+            DeviceRecord("Display", "Studio screen", "Acme", parent="Graphics"),
+        )
+        source = InventoryResult(InventoryStatus.LIVE, records, complete=True)
+        selected = filter_inventory(source, "STRASSE USB acme port 2")
+        self.assertEqual(selected.items, records[:1])
+        self.assertEqual(filter_inventory(source, "5 gb/s 0x1234 hub").items, records[:1])
+        self.assertEqual(filter_inventory(source, "screen graphics").items, records[1:])
+        self.assertEqual(source.items, records)
+
+    def test_search_is_literal_and_never_searches_status_or_detail(self):
+        source = InventoryResult(
+            InventoryStatus.LIVE, (DeviceRecord("USB", "Dock [A]*"),),
+            detail="PRIVATE_DIAGNOSTIC", complete=True,
+        )
+        self.assertIs(filter_inventory(source, "[a]*"), source)
+        for query in ("LIVE", "PRIVATE_DIAGNOSTIC", ".*", "$(touch /tmp/search)"):
+            with self.subTest(query=query):
+                self.assertEqual(filter_inventory(source, query).items, ())
+
+    def test_empty_or_whitespace_search_reuses_the_immutable_result(self):
+        source = parse_connections(TCP)
+        self.assertIs(filter_inventory(source), source)
+        self.assertIs(filter_inventory(source, " \t\n "), source)
+        self.assertIs(filter_inventory(source, "tcp"), source)
+        with self.assertRaises(FrozenInstanceError):
+            filter_inventory(source, "5000").complete = False
+
+    def test_network_search_covers_addresses_medium_hardware_port_and_mtu(self):
+        parsed = parse_interfaces(IFCONFIG)
+        source = NetworkInventory(
+            InventoryStatus.LIVE, parsed.items, gateway="192.0.2.254",
+            dns_servers=("192.0.2.53",), default_interface="en0",
+        )
+        source = replace(source, items=tuple(
+            replace(item, hardware_port="Wi-Fi") if item.name == "en0" else item
+            for item in source.items
+        ))
+        for query in ("EN0 ACTIVE", "192.0.2.10 1500", "fe80::1%en0",
+                      "02:AB:CD:EF:12:34", "wi-fi 1000baset"):
+            with self.subTest(query=query):
+                self.assertEqual(tuple(item.name for item in filter_inventory(source, query).items),
+                                 ("en0",))
+        # Supplements remain in the result but do not make interface rows match.
+        for query in ("192.0.2.53", "192.0.2.254", "CHECKING"):
+            with self.subTest(query=query):
+                self.assertEqual(filter_inventory(source, query).items, ())
+
+    def test_tcp_groups_partition_all_returned_states_including_pending_and_closing(self):
+        states = ("LISTEN", "ESTABLISHED", "SYN_SENT", "SYN_RCVD", "CLOSE_WAIT",
+                  "FIN_WAIT_1", "CLOSING", "LAST_ACK", "FIN_WAIT_2", "TIME_WAIT", "CLOSED")
+        source = InventoryResult(InventoryStatus.LIVE, tuple(
+            ConnectionRecord("tcp4", "192.0.2.1:%d" % (1000 + index), "*:*", state)
+            for index, state in enumerate(states)
+        ), complete=True)
+        self.assertEqual(CONNECTION_FILTERS, ("all", "listeners", "established", "other"))
+        partitions = tuple(filter_inventory(source, connection_state=group).items
+                           for group in CONNECTION_FILTERS[1:])
+        self.assertEqual(tuple(item.state for item in partitions[0]), ("LISTEN",))
+        self.assertEqual(tuple(item.state for item in partitions[1]), ("ESTABLISHED",))
+        self.assertEqual(tuple(item.state for item in partitions[2]), states[2:])
+        self.assertEqual(sum(map(len, partitions)), len(source.items))
+
+    def test_tcp_search_and_group_filter_combine_without_endpoint_resolution(self):
+        source = parse_connections(TCP)
+        selected = filter_inventory(source, "5000 TCP46", connection_state="LISTENERS")
+        self.assertEqual(len(selected.items), 1)
+        self.assertEqual(selected.items[0].local, "*:5000")
+        self.assertEqual(filter_inventory(source, "198.51.100.3:443",
+                                          connection_state="listeners").items, ())
+        self.assertEqual(filter_inventory(source, "2001:db8::2", connection_state="other").items[0].state,
+                         "TIME_WAIT")
+
+    def test_selection_preserves_source_coverage_and_all_network_supplements(self):
+        source = NetworkInventory(
+            InventoryStatus.LIVE, parse_interfaces(IFCONFIG).items,
+            detail="some network details unavailable", truncated=True,
+            gateway="192.0.2.1", default_interface="en0", dns_servers=("192.0.2.53",),
+            dns_status=InventoryStatus.LIVE, route_status=InventoryStatus.LIVE,
+            hardware_status=InventoryStatus.TIMEOUT,
+        )
+        selected = filter_inventory(source, "no-match")
+        self.assertIsInstance(selected, NetworkInventory)
+        self.assertEqual(asdict(selected), dict(asdict(source), items=()))
+        self.assertTrue(selected.truncated)
+        self.assertFalse(selected.complete)
+        complete_source = InventoryResult(InventoryStatus.LIVE, (), complete=True)
+        self.assertTrue(filter_inventory(complete_source, "missing").complete)
+
+    def test_selection_never_promotes_retained_failed_rows_to_live(self):
+        failed = InventoryResult(InventoryStatus.TIMEOUT, parse_connections(TCP).items,
+                                 detail="retained earlier records")
+        selected = filter_inventory(failed, "5000", connection_state="listeners")
+        self.assertEqual(selected.status, InventoryStatus.TIMEOUT)
+        self.assertFalse(selected.complete)
+        self.assertEqual(selected.detail, failed.detail)
+        summary = summarize_inventory(selected)
+        self.assertEqual(summary.status, InventoryStatus.TIMEOUT)
+        self.assertEqual(summary.total_count, 1)
+        self.assertIn("timeout", summary.detail)
+
+    def test_device_summary_counts_returned_kinds_in_predictable_order(self):
+        source = InventoryResult(InventoryStatus.LIVE, (
+            DeviceRecord("USB", "Keyboard"), DeviceRecord("Thunderbolt", "Storage"),
+            DeviceRecord("Display", "Screen"), DeviceRecord("USB", "Hub"),
+        ), truncated=True)
+        summary = summarize_inventory(source)
+        self.assertEqual(summary.kind_counts, (("Display", 1), ("Thunderbolt", 1), ("USB", 2)))
+        self.assertEqual(summary.total_count, 4)
+        self.assertTrue(summary.truncated)
+        self.assertFalse(summary.complete)
+        self.assertIn("returned records only", summary.detail)
+        self.assertIn("truncated", summary.detail)
+        self.assertEqual(summarize_inventory(filter_inventory(source, "USB")).total_count, 2)
+        with self.assertRaises(FrozenInstanceError):
+            summary.total_count = 100
+
+    def test_network_summary_never_equates_administrative_up_with_an_active_link(self):
+        source = NetworkInventory(InventoryStatus.LIVE, parse_interfaces(IFCONFIG).items + (
+            NetworkInterface("en2", "DOWN"),
+        ))
+        summary = summarize_inventory(source)
+        self.assertEqual(summary.total_count, 4)
+        self.assertEqual(summary.active_interfaces, 1)
+        self.assertEqual(summary.unknown_link_interfaces, 1)
+        self.assertFalse(summary.complete)
+        self.assertEqual(summary.listeners, 0)
+        self.assertEqual(summary.kind_counts, ())
+
+    def test_connection_summary_counts_returned_sockets_and_preserves_limited_visibility(self):
+        source = parse_lsof_connections(LSOF_TCP)
+        summary = summarize_inventory(source)
+        self.assertEqual((summary.total_count, summary.listeners, summary.established,
+                          summary.other_connections), (3, 2, 1, 0))
+        self.assertFalse(summary.complete)
+        self.assertIn("partial", summary.detail)
+        summary = summarize_inventory(parse_connections(TCP))
+        self.assertEqual((summary.total_count, summary.listeners, summary.established,
+                          summary.other_connections), (4, 2, 1, 1))
+
+    def test_empty_live_inventory_and_failed_initial_inventory_keep_different_statuses(self):
+        live = summarize_inventory(InventoryResult(InventoryStatus.LIVE, complete=True))
+        failed = summarize_inventory(InventoryResult(InventoryStatus.PERMISSION_DENIED))
+        checking = summarize_inventory(InventoryResult())
+        self.assertEqual(live.total_count, failed.total_count)
+        self.assertEqual(live.status, InventoryStatus.LIVE)
+        self.assertTrue(live.complete)
+        self.assertEqual(failed.status, InventoryStatus.PERMISSION_DENIED)
+        self.assertFalse(failed.complete)
+        self.assertEqual(checking.status, InventoryStatus.CHECKING)
+
+    def test_invalid_query_filter_and_record_inputs_are_rejected(self):
+        connections = parse_connections(TCP)
+        for kwargs in (dict(query=None), dict(query="x" * (SEARCH_QUERY_LIMIT + 1)),
+                       dict(connection_state="closing"), dict(connection_state=None)):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                filter_inventory(connections, **kwargs)
+        filter_inventory(connections, "x" * SEARCH_QUERY_LIMIT)
+        for source in (None, {}, InventoryResult(items=(object(),))):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                filter_inventory(source)
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                summarize_inventory(source)
+        for source in (NetworkInventory(), parse_devices(json.dumps(device_payload()))):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                filter_inventory(source, connection_state="listeners")
 
 
 if __name__ == "__main__":

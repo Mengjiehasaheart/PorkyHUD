@@ -56,7 +56,7 @@ _THREAD_PREFIXES = ("SourcePoller", "AsyncPoller", "PorkyHUD-command")
 _THREAD_EVENT_CATEGORIES = _THREAD_PREFIXES + ("Other",)
 STARTUP_MARKERS = (
     "CHECKING 0/4 core sources",
-    "Waiting for core evidence.",
+    "Loading system readings.",
     "CPU CHECKING",
     "MEM CHECKING",
     "THERM CHECKING",

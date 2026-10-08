@@ -28,7 +28,7 @@ finally:
 
 
 WIDTH = 960
-HEIGHT = 600
+HEIGHT = 640
 DEFAULT_FRAMES = 36
 DEFAULT_FPS = 12
 MAX_FRAMES = 120
@@ -116,50 +116,49 @@ def render_html(frame: int, frames: int) -> str:
   html, body {{ margin:0; width:{WIDTH}px; height:{HEIGHT}px; overflow:hidden;
     background:var(--bg); }}
   body {{ color:var(--text); font-family:"SFMono-Regular",Menlo,Consolas,monospace;
-    font-size:14px; line-height:1.55; }}
-  .shell {{ width:100%; height:100%; padding:24px 26px 20px; display:grid;
-    grid-template-rows:68px 32px 146px 1fr 38px 21px; gap:10px; }}
+    font-size:13px; line-height:18px; }}
+  .shell {{ width:100%; height:100%; padding:18px 24px; display:grid;
+    grid-template-rows:40px 24px 126px 114px 1fr 18px; gap:8px; }}
   .top {{ display:flex; justify-content:space-between; align-items:flex-start; }}
-  .headline {{ font-weight:700; color:var(--green); font-size:16px; white-space:nowrap; }}
-  .reason {{ margin-top:7px; color:var(--text); font-size:12px; }}
+  .headline {{ font-weight:700; color:var(--green); font-size:14px; white-space:nowrap; }}
+  .reason {{ margin-top:3px; color:var(--text); font-size:12px; }}
   .demo {{ color:var(--muted); font-size:10px; white-space:nowrap;
     border:1px solid var(--line); padding:4px 7px; }}
-  .ribbon {{ color:var(--blue); display:flex; gap:26px; font-size:12px;
+  .ribbon {{ color:var(--blue); display:flex; gap:24px; font-size:12px;
     border-bottom:1px solid var(--line); align-items:flex-start; font-weight:600; }}
   .ribbon span {{ white-space:nowrap; }}
-  .signature {{ display:flex; align-items:flex-start; border-bottom:1px solid var(--line);
-    gap:32px; overflow:hidden; }}
-  .mascot {{ font-family:inherit; font-size:16px; line-height:19px; margin:0;
+  .signature {{ display:flex; align-items:flex-start; gap:30px; overflow:hidden; }}
+  .mascot {{ font-family:inherit; font-size:16px; line-height:18px; margin:0;
     letter-spacing:0; font-weight:400; white-space:pre; flex-shrink:0; }}
   .ink-brand {{ color:#ff87af; }} .ink-highlight {{ color:#ffd7d7; }}
   .ink-shadow {{ color:#d787af; }} .ink-detail {{ color:#eeeeee; }}
   .ink-structure {{ color:var(--muted); }}
-  .identity {{ padding-top:8px; }}
-  .wordmark {{ font-size:20px; font-weight:600; margin-bottom:17px; letter-spacing:.035em; }}
-  .tagline {{ color:var(--blue); font-size:12px; letter-spacing:.07em; }}
-  .machine {{ margin-top:5px; font-size:12px; }}
-  .profile {{ color:var(--muted); font-size:11px; margin-top:4px; }}
+  .stats {{ flex:1; min-width:0; }}
+  .stats > div {{ height:18px; white-space:nowrap; }}
+  .stats .machine {{ color:var(--text); font-weight:600; }}
+  .label {{ color:var(--muted); }}
+  .value {{ color:var(--blue); }}
+  .profile {{ color:var(--muted); font-size:10px; margin-left:10px; }}
   .content {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; min-height:0; }}
-  .panel {{ border:1px solid var(--line); border-radius:8px; padding:15px 15px 12px;
+  .panel {{ border:1px solid var(--line); border-radius:7px; padding:12px 15px 10px;
     position:relative; min-height:0; }}
   .title {{ position:absolute; top:-10px; left:14px; padding:0 7px;
     background:var(--bg); color:var(--muted); font-size:12px; font-weight:700; }}
-  .facts {{ display:grid; grid-template-columns:65px 1fr; row-gap:5px;
-    color:var(--blue); font-size:13px; margin-top:3px; }}
-  .facts .label {{ font-weight:600; }}
-  .provenance {{ color:var(--muted); font-size:10px; margin-top:14px; }}
-  .spark {{ color:var(--blue); font-size:13px; white-space:nowrap; margin-top:8px; }}
-  .spark-label {{ color:var(--muted); font-size:10px; margin-right:5px; }}
-  .workloads {{ display:grid; grid-template-columns:1fr auto; row-gap:7px;
-    margin-top:2px; font-size:13px; }}
-  .workloads .value {{ color:var(--text); font-variant-numeric:tabular-nums; }}
-  .workload-note {{ margin-top:12px; color:var(--muted); font-size:10px; }}
-  .context {{ display:flex; align-items:center; gap:18px; color:var(--blue);
-    font-size:11px; border-top:1px solid var(--line); white-space:nowrap; }}
-  .context .label {{ color:var(--muted); font-size:10px; }}
+  .facts {{ color:var(--blue); font-size:12px; line-height:21px; }}
+  .facts > div {{ white-space:nowrap; }}
+  .bar {{ letter-spacing:.01em; }}
+  .spark {{ color:var(--blue); font-size:11px; white-space:nowrap; }}
+  .spark-label {{ color:var(--muted); font-size:11px; margin-right:8px; }}
+  .workloads {{ border-collapse:collapse; width:100%; font-size:12px;
+    font-variant-numeric:tabular-nums; line-height:18px; }}
+  .workloads th {{ color:var(--muted); font-weight:500; text-align:right;
+    border-bottom:1px solid var(--line); padding:0 12px 4px 0; }}
+  .workloads td {{ text-align:right; padding:0 12px 0 0; }}
+  .workloads th:last-child, .workloads td:last-child {{ text-align:left; width:47%; padding-right:0; }}
+  .workload-note {{ position:absolute; bottom:7px; left:15px;
+    color:var(--muted); font-size:10px; }}
   .footer {{ display:flex; justify-content:space-between; align-items:flex-end;
-    color:var(--muted); font-size:11px; white-space:nowrap; }}
-  .footer .key {{ color:var(--text); }}
+    color:var(--muted); font-size:10px; white-space:nowrap; }}
 </style>
 </head>
 <body>
@@ -171,49 +170,63 @@ def render_html(frame: int, frames: int) -> str:
     </div>
     <div class="demo">{MARKER}</div>
   </header>
-  <section class="ribbon" aria-label="Decision evidence">
+  <section class="ribbon" aria-label="Current health checks">
     <span>CPU {cpu:.1f}% · 0s</span><span>MEM NORMAL · 0s</span>
     <span>THERM CLEAR · 0s</span><span>DISK 312 GiB FREE · 0s</span>
   </section>
   <section class="signature">
     <pre class="mascot" aria-label="Shared sculpted PorkyHUD mascot">{mascot}</pre>
-    <div class="identity">
-      <div class="wordmark">P O R K Y H U D</div>
-      <div class="tagline">YOUR MAC, IN FOCUS</div>
-      <div class="machine">Synthetic Apple Silicon · 64 GiB</div>
-      <div class="profile">Graphite · sculpted · motion calm (optional)</div>
+    <div class="stats">
+      <div class="machine">Synthetic Apple Silicon · 64 GiB · 12 CPU cores</div>
+      <div><span class="label">CPU</span> <span class="value">{cpu:.1f}% capacity</span> · <span class="label">RAM</span> <span class="value">26.8 / 64 GiB · 41.9%</span></div>
+      <div><span class="label">GPU</span> CHECKING · <span class="label">package power</span> CHECKING</div>
+      <div><span class="label">CPU / GPU</span> <span class="value">42.6°C / 37.9°C</span> · <span class="label">fans</span> <span class="value">1400 RPM</span></div>
+      <div><span class="label">Battery</span> NOT APPLICABLE · <span class="label">power</span> AC</div>
+      <div><span class="label">macOS</span> synthetic fixture · <span class="label">uptime</span> 6h 12m</div>
+      <div class="spark"><span class="spark-label">CPU 60s</span>{history_text}<span class="profile">Graphite · calm optional</span></div>
     </div>
   </section>
   <section class="content">
     <article class="panel">
-      <div class="title">EVIDENCE DETAIL</div>
+      <div class="title">MEMORY</div>
       <div class="facts">
-        <div class="label">CPU</div><div>{cpu:.1f}% · LIVE · 15s window</div>
-        <div class="label">MEM</div><div>NORMAL · LIVE</div>
-        <div class="label">THERM</div><div>CLEAR · LIVE</div>
-        <div class="label">DISK</div><div>312 GiB free · LIVE</div>
+        <div>26.8 GiB used / 64 GiB <span class="label">· 41.9%</span></div>
+        <div class="bar">█████████████<span class="label">░░░░░░░░░░░░░░░░░░</span></div>
+        <div><span class="label">Swap</span> 1.5 GiB · <span class="label">compressed</span> 5.2 GiB</div>
+        <div><span class="label">Cache</span> 12.3 GiB · <span class="label">pressure</span> NORMAL</div>
       </div>
-      <div class="provenance">PROVENANCE · macOS core evidence</div>
-      <div class="spark"><span class="spark-label">CPU 60s</span>{history_text}</div>
     </article>
     <article class="panel">
-      <div class="title">TOP PROCESSES · CPU</div>
-      <div class="workloads">
-        <div>Creative workload</div><div class="value">14.2%</div>
-        <div>Browser workspace</div><div class="value">9.4%</div>
-        <div>Build workers</div><div class="value">6.8%</div>
-        <div>Background services</div><div class="value">4.1%</div>
-        <div>Terminal workspace</div><div class="value">1.3%</div>
+      <div class="title">STORAGE + I/O</div>
+      <div class="facts">
+        <div><span class="label">Storage</span> 312 GiB free / 1 TiB</div>
+        <div><span class="label">Disk</span> 8.4 MiB/s · 140 IOPS <span class="label">· LIVE</span></div>
+        <div><span class="label">Network ↓</span> 1.6 MiB/s <span class="label">↑</span> 248 KiB/s</div>
+        <div><span class="label">Rates</span> LIVE · <span class="label">r</span> refresh</div>
       </div>
-      <div class="workload-note">Identity only · m sort · advanced sensors CHECKING</div>
     </article>
   </section>
-  <div class="context"><span class="label">EXPLORE ·</span>
-    <span>7 Insights · 8 Devices · 9 Network · 0 TCP connections</span>
-  </div>
+  <section class="panel">
+    <div class="title">TOP PROCESSES · CPU</div>
+    <table class="workloads" aria-label="Fixed synthetic process list">
+      <thead><tr><th>PID</th><th>CPU%</th><th>MEM%</th><th>ST</th><th>ELAPSED</th><th>IDENTITY</th></tr></thead>
+      <tbody>
+        <tr><td>8001</td><td>14.2</td><td>3.8</td><td>S</td><td>01:24:12</td><td>Creative workload</td></tr>
+        <tr><td>8002</td><td>9.4</td><td>2.6</td><td>S</td><td>00:42:08</td><td>Browser workspace</td></tr>
+        <tr><td>8003</td><td>6.8</td><td>1.1</td><td>R</td><td>00:03:41</td><td>Build workers</td></tr>
+        <tr><td>8004</td><td>4.1</td><td>0.8</td><td>S</td><td>06:10:32</td><td>Background services</td></tr>
+        <tr><td>8005</td><td>1.3</td><td>0.5</td><td>S</td><td>00:18:26</td><td>Terminal workspace</td></tr>
+        <tr><td>8006</td><td>0.8</td><td>0.4</td><td>S</td><td>00:27:19</td><td>Notes workspace</td></tr>
+        <tr><td>8007</td><td>0.3</td><td>0.2</td><td>S</td><td>00:09:54</td><td>Local helper</td></tr>
+        <tr><td>8008</td><td>0.2</td><td>0.2</td><td>S</td><td>00:41:27</td><td>Audio service</td></tr>
+        <tr><td>8009</td><td>0.1</td><td>0.1</td><td>S</td><td>01:08:43</td><td>Window helper</td></tr>
+        <tr><td>8010</td><td>0.0</td><td>0.1</td><td>S</td><td>00:24:10</td><td>Idle helper</td></tr>
+      </tbody>
+    </table>
+    <div class="workload-note">10 processes · 1–10 · ↑↓/Pg scroll · m sort · / search</div>
+  </section>
   <footer class="footer">
-    <span><span class="key">d</span> Explore · 1–5 / 7 modes · a motion · t theme · h help · q quit</span>
-    <span>Dashboard motion starts off</span>
+    <span>1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit</span>
   </footer>
 </main>
 </body>

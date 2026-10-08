@@ -4,6 +4,24 @@ Status: release-candidate validated for deterministic, current-host performance,
 
 Date: 2026-08-11
 
+## Subsequent 0.2.1 usability upgrade — 2026-10-08
+
+The user requested a fuller default dashboard, direct system details, simpler wording, and easier access to all available tools. This follow-up supersedes the sparse Overview presentation while retaining the original health rules, collector lifecycles, and historical performance record below.
+
+Overview now shows hardware, CPU, RAM, GPU, temperatures, fans, power, uptime, memory, storage, network traffic, and top processes together. The layout adapts from 76×22 through wider terminals; missing readings stay explicit, numeric percentages retain their units, and the process table keeps its identity-first privacy boundary. The existing pig remains compact beside the useful readings. Fonts continue to belong to the terminal profile.
+
+The All Tools menu includes every view. Tab and Shift+Tab traverse supported views, and `i` opens This Mac using already collected details. Literal Unicode searches are bounded, remember a separate query for each view, consume shortcut characters while editing, and respect process-command redaction. Connections adds explicit all/listener/established/other groups. Escape clears a query or TCP group before quitting. Inventory summaries distinguish matches from returned-record totals and retain collection status, age, completeness, and truncation. Failed initial inventories cannot claim zero counts or no matches; process searches show source status until a current list is available. `--search` and `--state` provide the same selections in live and inventory CLI workflows; invalid combinations fail before collection. The package adds `porkhud` as an alias for `porkyhud`.
+
+Human status copy uses plain system labels without rewriting volume or process names. UI filtering never changes health facts or starts an unrelated collector. Process search results are cached by query and source-row identity between refreshes; a bounded per-HUD field cache reuses sanitized search text across queries and metric updates while detecting exact PID/state/command changes. It returns current rows and discards removed keys. Inventory lists remain bounded at 128 records. No runtime dependency, privileged mutation, new collector command, or snapshot-schema promise is added.
+
+Final follow-up verification on 2026-10-08:
+
+- All 542 deterministic tests passed with warnings treated as errors on local Python 3.9 and 3.14. Compilation, documentation contracts, launcher syntax, source CLI help/version and whitespace checks passed.
+- The 0.2.1 wheel contained exactly the five production modules, both console commands and distribution metadata, with no tools or tests. Module contents matched the checkout; fresh-target imports outside the checkout passed on both tested interpreters. The local Python 3.9 terminal installation was updated from this wheel.
+- Current-host filtered inventory checks preserved matching/returned counts, listener selection and partial coverage. Source raw macOS PTY checks exercised the dense default, All Tools, an exact Unicode search with shortcut characters, query clearing, TCP filter/reset, This Mac, resizing, Tab and clean quit with the PTY child reaped. The installed alias separately rendered the default and system views and exited cleanly.
+- On 3,036 current-host process rows, 66 incremental queries returned identical results through the direct and cached paths. Mean matching time changed from 143.56 ms to 1.074 ms; initial field preparation took 152.20 ms. This isolates search preparation and matching; it does not measure overall live CPU, broad hardware support, or the historical performance target.
+- The synthetic Overview previews at 80×24 and 132×42 and regenerated demo were inspected. Terminal.app font/palette qualification remains unavailable. No Task 15 measurement batches, privileged sensor changes, Homebrew publication or release tag were performed; the original performance and compatibility limits below remain in force.
+
 ## Subsequent 0.2.0 upgrade — 2026-10-08
 
 This document retains the scoped Phase 1 acceptance and historical measurements below. The user explicitly authorized a subsequent visual, insight and read-only inventory upgrade, including a brief launch animation; it is not a requalification of Phase 1 performance or broad hardware support.

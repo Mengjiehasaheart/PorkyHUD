@@ -4,6 +4,14 @@ This file is the canonical maintainer and agent navigation layer for PorkyHUD. U
 
 `README.md` remains the end-user guide. Do not turn it into an internal architecture manual.
 
+## Product preferences
+
+The default Overview should be dense with useful, accurate readings: show the Mac's key measurements together and keep common tools easy to discover. The pig adds character and polish; it must share space with the information people opened the app to see. Adapt spacing and panel detail to terminal size without hiding navigation or clipping status labels.
+
+Use plain language in the dashboard and user guide. Prefer concrete names such as CPU, memory, temperature, storage, connections, and status. Avoid user-facing “evidence,” “provenance,” “decision-ready,” and similar internal terminology. Existing model names, policy contracts, symbol anchors, and historical design records retain their technical names.
+
+Keep view selection and tool workflows predictable: visible navigation, forward/backward traversal, per-view searches, explicit connection filters, and clear empty results. Search and display filters must not change the underlying health checks, collected readings, completeness, or freshness. New tools should reuse collector results or bounded read-only adapters rather than duplicate collection or couple presentation to native commands.
+
 ## Start here
 
 1. Read `README.md` for the user-visible product contract.
@@ -20,7 +28,7 @@ PorkyHUD has an effects/orchestration module (`porkyhud.py`), pure health policy
 | --- | --- |
 | User installation, supported workflows, permissions, privacy summary, and metric semantics | `README.md` |
 | Agent routing, architecture, invariants, and documentation maintenance | `AGENTS.md` |
-| Package name, Python floor, dependencies, entry point, and project URLs | `pyproject.toml` |
+| Package name, Python floor, dependencies, entry points, and project URLs | `pyproject.toml` |
 | Pure health/source contracts and rule behavior | `porkyhud_core.py` plus `tests/test_core.py` |
 | CLI flags and precedence | `porkyhud.py::main` and its argparse declarations |
 | Keyboard behavior | `porkyhud.py::hud`; `porkyhud.py::draw_help_overlay` is the user-facing projection |
@@ -49,15 +57,15 @@ Keep this table exhaustive. Add, move, or remove a row in the same commit as the
 | `pyproject.toml` | Setuptools build and package metadata | Version, Python support, packaging, entry point, dependency, or project URL changes |
 | `tests/test_insights.py` | VM rates, CPU summaries and VM parser contracts | Every descriptive insight calculation/collector change |
 | `tests/test_visual.py` | Immutable artwork, bounded cache, glyph geometry and fallback contracts | Every visual renderer change |
-| `tests/test_inventory.py` | Inventory grammar, limits, partial coverage and output minimization | Every inventory adapter change |
-| `tests/test_performance.py` | Bounded process projection cache and corruption/metadata preservation | Every process caching change |
-| `tests/test_upgrade.py` | Explore navigation, presentation controls, atomic rates and inventory output contracts | Every new interaction or adapter projection change |
+| `tests/test_inventory.py` | Inventory grammar, limits, partial coverage, search/summary projections and output minimization | Every inventory adapter change |
+| `tests/test_performance.py` | Bounded process projection/search caches, mutation safety, redaction and current-row preservation | Every process caching change |
+| `tests/test_upgrade.py` | View navigation, search/filter controls, presentation controls, atomic rates and inventory output contracts | Every new interaction or adapter projection change |
 | `tests/test_core.py` | Behavioral contract tests for pure immutable telemetry source state | Every `porkyhud_core.py` behavior change |
 | `tests/test_porkyhud.py` | Unit and contract tests for current application behavior | Every production behavior change |
 | `tests/test_repository_tools.py` | Repository validator, demo renderer, and release-measurement tool contracts | Every reproducible source-tree tool or repository-validation change |
 | `tests/__init__.py` | Test package and `unittest` discovery marker | Test layout changes |
 | `tools/validate_docs.py` | Standard-library tracked-map, AST-anchor, local-link, and controls validator | Tracked paths, anchor syntax, documentation links, control projections, or validation policy |
-| `tools/render_demo_gif.py` | Fixed synthetic README-demo renderer with bounded Chrome/ffmpeg development subprocesses | Demo design, provenance label, dimensions, limits, dependencies, or asset generation |
+| `tools/render_demo_gif.py` | Fixed synthetic README-demo renderer with bounded Chrome/ffmpeg development subprocesses | Demo design, synthetic-data label, dimensions, limits, dependencies, or asset generation |
 | `tools/measure_release.py` | Bounded, privacy-minimized Task 15 measurement harness and JSON projection | Release measurement procedures, statistics, lifecycle probes, privacy, or timeout cleanup |
 | `.github/workflows/ci.yml` | macOS build and validation matrix | Supported Python versions or validation contract changes |
 | `.gitignore` | Generated, cached, local-only, and build-output boundaries | Any new reproducible source or generated artifact policy |
@@ -113,9 +121,11 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 ### `area:inventory`
 
 - Owns on-demand read-only device, interface, IPv4 route, DNS and TCP observations. It imports neither the app nor curses/policy/subprocess; the app injects `porkyhud.py::_inventory_probe` over the existing bounded command runner.
-- Start at `porkyhud_inventory.py::collect_devices`, `porkyhud_inventory.py::collect_network`, `porkyhud_inventory.py::collect_connections`, `porkyhud.py::inventory_lines`, and `porkyhud.py::draw_explore_menu`, and `porkyhud_inventory.py::observe_inventory`.
+- Start at `porkyhud_inventory.py::collect_devices`, `porkyhud_inventory.py::collect_network`, `porkyhud_inventory.py::collect_connections`, `porkyhud_inventory.py::filter_inventory`, `porkyhud_inventory.py::summarize_inventory`, `porkyhud_inventory.py::observe_inventory`, `porkyhud.py::inventory_lines`, and `porkyhud.py::draw_explore_menu`.
 - Tests: `tests/test_inventory.py` and `tests/test_upgrade.py`. Explicit completeness/truncation and supplementary-source states survive every projection. Serial numbers, PID/FD headers and process commands do not cross the output boundary; friendly names and addresses remain sensitive.
 - USB supports both legacy `SPUSBDataType` and macOS 26 `SPUSBHostDataType`. TCP uses numeric `netstat`, with numeric `lsof` fallback; protected sockets can be hidden. No scans, reverse DNS, connectivity tests or mutations.
+- Search and TCP state filters are pure projections of collected rows. Preserve collection status, total counts and truncation separately from the matching rows. Live and `--inspect` views must use the same matching semantics.
+- `--inspect --json` retains typed inventory fields and adds `summary` over the original returned records plus `filter` (`query`, `connection_state`, `matched_records`, `returned_records`). `items` contains matching records; completeness/truncation describes collection, not search. This projection is unversioned. Ordinary snapshots reject search/state filters rather than silently ignoring them.
 
 ### `area:configuration-models`
 
@@ -169,6 +179,8 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 - Start at `porkyhud.py::safe_add`, `porkyhud.py::decision_header_lines`, `porkyhud.py::evidence_ribbon_lines`, `porkyhud.py::draw_initial_shell`, `porkyhud.py::draw_decision_header`, `porkyhud.py::draw_evidence_ribbon`, `porkyhud.py::draw_mode_body`, `porkyhud.py::draw_help_overlay`, and `porkyhud.py::hud`.
 - Primary tests: `tests/test_porkyhud.py::LayoutAndRenderingTests`.
 - `porkyhud.py::hud` is the cross-area wiring hotspot. Inspect it whenever polling cadence, shared state, keyboard behavior, or panel inputs change.
+- Navigation traverses only supported modes in both directions. Search queries belong to individual views; while editing, text keys take precedence over shortcuts. Escape closes overlays first, then clears a query or TCP filter before quitting. System uses existing static/runtime/battery data and starts no new probes.
+- `porkyhud.py::filter_process_rows` and `porkyhud.py::_ProcessSearchCache` share literal matching. The per-HUD cache retains only current-table sanitized text, invalidates on exact PID/state/command changes, and returns current rows when numeric metrics change. Test both paths in `tests/test_performance.py::ProcessSearchCacheTests`.
 
 ### `area:snapshot-interface`
 
@@ -182,6 +194,7 @@ Effects orchestration may depend on both the pure policy module and collectors/a
 - Owns build metadata, executable entry points, compatibility matrix, version synchronization, tags, and downstream Homebrew coordination.
 - Start at `pyproject.toml`, `porkyhud.py::VERSION`, `.github/workflows/ci.yml`, and `PorkyHUD.command`.
 - The in-repository version declarations must match. A checkout version is not a published release until its tag and external Homebrew formula are also verified.
+- Installed `porkyhud` and `porkhud` console scripts share `porkyhud.py::main`; the latter is an alias, not a second application or configuration path.
 - The wheel contains only the five `porkyhud*.py` production modules plus distribution metadata. Tests and repository tools stay outside the runtime package.
 - A downstream Homebrew formula must install all five production modules and test an actual import and launch from the installed prefix. A version-only formula update that copies only `porkyhud.py` is incomplete.
 
@@ -262,6 +275,7 @@ main --setup-sensors
 | Change a health threshold, precedence, or recovery rule | `porkyhud_core.py::reduce_health` and the owning latch/window reducer | Core boundary/overlap tests, presentation reason/evidence tests, README health semantics, approved spec |
 | Add or change a decision-driving command source | `porkyhud.py::run_structured_command`, typed parser/adapter, and `SourcePoller` registry | Pure source/fact contract, failure matrix, privacy/cleanup tests, live and snapshot wiring, README source semantics |
 | Add or change a layout/panel | `LAYOUTS`, sizing helpers, `draw_*`, and `hud` | In-app help, README shortcuts, narrow and wide layout tests |
+| Change search, navigation, or connection filters | `porkyhud.py::hud`, `porkyhud.py::main`, and `area:inventory` | Shared matching semantics, per-view state, help/footer hints, CLI precedence, README controls, empty-result and resize tests |
 | Change process output | `collect_process_rows`, sorting, and `draw_process_panel` | `sanitize_command`, snapshot projection, privacy tests, README privacy statement |
 | Change snapshot JSON | Models and `porkyhud.py::collect_snapshot` | Serialization/redaction, schema assertions, text projection, README integration wording, compatibility decision |
 | Change palette, terminal, or signal behavior | `PorkyHUD.command` and `area:terminal-lifecycle` | `NO_COLOR`, all exit paths, signal tests, README launch guidance |

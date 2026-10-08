@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PorkyHUD: a dependency-free Apple Silicon decision cockpit for macOS.
+"""PorkyHUD: a dependency-free macOS system monitor and tools.
 
 Press h for current shortcuts.
 """
@@ -46,6 +46,7 @@ from porkyhud_inventory import (
     InventoryResult, NetworkInventory, InventoryStatus, ProbeResult,
     InventoryObservation, observe_inventory,
     collect_devices, collect_network, collect_connections,
+    CONNECTION_FILTERS, SEARCH_QUERY_LIMIT, filter_inventory, summarize_inventory,
 )
 
 from porkyhud_core import (
@@ -107,15 +108,18 @@ STEADY_STATE_COMMAND_ALLOWANCES: Mapping[str, int] = MappingProxyType({
     "powermetrics": 4,
 })
 RETRY_LAUNCH_RESERVE = 12
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
-LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections", "cinema"]
-OPERATIONAL_MODES = ("balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections")
+LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections", "system", "cinema"]
+OPERATIONAL_MODES = tuple(mode for mode in LAYOUTS if mode != "cinema")
 DIRECT_MODE_KEYS = {
     "1": "balanced", "2": "compute", "3": "thermals",
     "4": "io", "5": "processes", "6": "cinema", "7": "insights", "8": "devices", "9": "network", "0": "connections",
+    "i": "system",
 }
+SEARCHABLE_MODES = frozenset(("balanced", "compute", "processes", "cinema",
+                             "devices", "network", "connections"))
 DARK_BG_RGB = "#05070d"
 DARK_FG_RGB = "#e6f7ff"
 DARK_CURSOR_RGB = "#5df2ff"
@@ -246,6 +250,9 @@ class HudConfig:
     intro_enabled: bool = True
     show_menu: bool = False
     menu_index: int = 0
+    search_editing: bool = False
+    searches: dict[str, str] = field(default_factory=dict)
+    connection_filter: str = "all"
     message: str = ""
     message_until: float = 0.0
 
@@ -256,6 +263,10 @@ class HudConfig:
     @property
     def layout_name(self) -> str:
         return LAYOUTS[self.layout_index % len(LAYOUTS)]
+
+    @property
+    def search_query(self) -> str:
+        return self.searches.get(self.layout_name, "")
 
 
 def _validate_viewport(height: int, width: int) -> tuple[int, int]:
@@ -279,6 +290,7 @@ def _mode_copy_name(mode: str) -> str:
             "thermals": "Thermals", "io": "I/O",
             "processes": "Processes", "insights": "Insights", "devices": "Devices", "network": "Network",
             "connections": "Connections", "cinema": "Cinema",
+            "system": "This Mac",
         }[mode]
     except (KeyError, TypeError):
         raise ValueError("unknown display mode")
@@ -297,18 +309,132 @@ def select_mode(config: HudConfig, mode: str, height: int, width: int) -> str:
             config.layout_name,
         )
     config.layout_index = LAYOUTS.index(mode)
+    config.search_editing = False
     return "%s selected" % _mode_copy_name(mode)
 
 
-def cycle_mode(config: HudConfig, height: int, width: int) -> str:
+def cycle_mode(config: HudConfig, height: int, width: int, direction: int = 1) -> str:
     """Select the next mode supported by the current viewport."""
 
     modes = supported_modes(height, width)
     if not isinstance(config, HudConfig):
         raise ValueError("config must be a HudConfig")
     current = config.layout_name
-    next_index = 0 if current not in modes else (modes.index(current) + 1) % len(modes)
+    if direction not in (-1, 1):
+        raise ValueError("mode direction must be -1 or 1")
+    next_index = 0 if current not in modes else (modes.index(current) + direction) % len(modes)
     return select_mode(config, modes[next_index], height, width)
+
+
+def normalize_search_query(query: str) -> str:
+    """Bound a literal query and prevent terminal controls in its display."""
+
+    if not isinstance(query, str) or len(query) > SEARCH_QUERY_LIMIT:
+        raise ValueError("search must be text of at most %d characters" % SEARCH_QUERY_LIMIT)
+    return "".join(character for character in " ".join(query.split()) if character.isprintable())
+
+
+def edit_search(config: HudConfig, key: int | str) -> bool:
+    """Consume editing keys before dashboard shortcuts, including q and digits."""
+
+    if not config.search_editing or key == -1:
+        return False
+    character = key if isinstance(key, str) and len(key) == 1 else None
+    code = ord(character) if character is not None else key
+    query = config.search_query
+    if code == 27:
+        config.searches.pop(config.layout_name, None)
+        config.search_editing = False
+    elif code in (10, 13, curses.KEY_ENTER):
+        config.search_editing = False
+    elif code in (8, 127, curses.KEY_BACKSPACE):
+        config.searches[config.layout_name] = query[:-1]
+    elif code == 21:
+        config.searches.pop(config.layout_name, None)
+    elif len(query) < SEARCH_QUERY_LIMIT:
+        if character is not None and character.isprintable():
+            config.searches[config.layout_name] = query + character
+        elif type(code) is int and 32 <= code <= 126:
+            config.searches[config.layout_name] = query + chr(code)
+    return True
+
+
+def read_hud_key(screen: curses.window, search_editing: bool) -> int | str:
+    """Use wide-character input for query editing, retaining integer shortcuts."""
+
+    if search_editing and hasattr(screen, "get_wch"):
+        try:
+            return screen.get_wch()
+        except curses.error:
+            return -1
+    return screen.getch()
+
+
+def _process_search_text(row: ProcessRow) -> str:
+    """Build the same privacy-safe fields used by direct and cached searches."""
+
+    return ("%s %s %s %s" % (row.pid, process_identity(row.command), row.stat,
+                              visible_command(row.command, 4096))).casefold()
+
+
+def _matching_process_rows(
+    rows: Sequence[ProcessRow], terms: Sequence[str],
+    text_for_row: Callable[[ProcessRow], str],
+) -> tuple[ProcessRow, ...]:
+    """Keep literal AND matching and current source-row selection in one place."""
+
+    if not terms:
+        return tuple(rows)
+    matched = []
+    for row in rows:
+        text = text_for_row(row)
+        if all(term in text for term in terms):
+            matched.append(row)
+    return tuple(matched)
+
+
+def filter_process_rows(rows: Sequence[ProcessRow], query: str) -> tuple[ProcessRow, ...]:
+    """Search process identity, sanitized arguments, PID and state literally."""
+
+    terms = normalize_search_query(query).casefold().split()
+    return _matching_process_rows(rows, terms, _process_search_text)
+
+
+class _ProcessSearchCache:
+    """Reuse sanitized search fields for only the current table, never its rows."""
+
+    def __init__(self) -> None:
+        self._texts: dict[tuple[Any, ...], str] = {}
+
+    @staticmethod
+    def _key(row: ProcessRow) -> tuple[Any, ...]:
+        # Keys are private source content, not output. Exact values and types
+        # prevent mutable fields or bool/int equality from hiding a change.
+        return (type(row.pid), row.pid, type(row.stat), row.stat,
+                type(row.command), row.command)
+
+    def filter(self, rows: Sequence[ProcessRow], query: str) -> tuple[ProcessRow, ...]:
+        terms = normalize_search_query(query).casefold().split()
+        previous = self._texts
+        current: dict[tuple[Any, ...], str] = {}
+
+        def text_for_row(row: ProcessRow) -> str:
+            key = self._key(row)
+            text = current.get(key, previous.get(key))
+            if text is None:
+                text = _process_search_text(row)
+            current[key] = text
+            return text
+
+        matched = _matching_process_rows(rows, terms, text_for_row)
+        if not terms:
+            # An empty query needs no parsing, but still releases removed rows.
+            for row in rows:
+                key = self._key(row)
+                if key in previous:
+                    current[key] = previous[key]
+        self._texts = current
+        return matched
 
 
 def normalize_mode_for_viewport(
@@ -5250,6 +5376,17 @@ def pulse_bar(percent: float, width: int, phase: int, label: str = "") -> str:
     return f"{label}[{''.join(body)}] {percent:5.1f}%"
 
 
+def fitted_percent_bar(percent: float, budget: int, phase: int, label: str = "") -> str:
+    """Reserve the numeric reading and its unit before allocating bar cells."""
+
+    number = "%5.1f%%" % percent
+    bar_width = budget - display_cell_width(label) - display_cell_width(number) - 3
+    if bar_width >= 4:
+        return pulse_bar(percent, bar_width, phase, label)
+    prefix = truncate_display_cells(label, max(0, budget - display_cell_width(number)))
+    return prefix + number
+
+
 def spark_chars() -> list[str]:
     encoding = locale.getpreferredencoding(False).upper()
     if "UTF" not in encoding:
@@ -5410,7 +5547,7 @@ def legacy_read_projection(assessment: HealthAssessment) -> dict[str, str]:
     """Project the pure health assessment into the established snapshot shape."""
 
     return {
-        "message": f"read: {assessment.reason}",
+        "message": "read: " + plain_reading_text(assessment.reason),
         "level": READ_LEVELS[assessment.severity],
     }
 
@@ -5454,6 +5591,7 @@ def display_mode_name(mode: str) -> str:
         "devices": "8 DEVICES",
         "network": "9 NETWORK",
         "connections": "0 CONNECTIONS",
+        "system": "i THIS MAC",
     }
     try:
         return names[mode]
@@ -5530,6 +5668,17 @@ def format_evidence_age(age_s: float) -> str:
     return "%dd %02dh" % (days, remaining // 3600)
 
 
+def plain_reading_text(text: str) -> str:
+    """Translate fixed policy copy while preserving user and system names."""
+
+    return {
+        "Fresh core evidence shows no active CPU, memory, thermal, or storage pressure.":
+            "No active CPU, memory, thermal, or storage pressure.",
+        "No recommendation is available from incomplete evidence.":
+            "System readings are incomplete.",
+    }.get(text, text)
+
+
 def source_view_text(view: SourceView, elapsed_s: float = 0.0) -> str:
     """Render a complete source status without exposing a retained value as live."""
 
@@ -5581,6 +5730,8 @@ def compact_reason(frame: HealthFrame, width: int, now_mono_s: float) -> str:
     _frame_elapsed(frame, now_mono_s)
     assessment = frame.assessment
     reason = assessment.reason
+    if assessment.severity is HealthSeverity.NORMAL:
+        reason = "No active CPU, memory, thermal, or storage pressure."
     recovering = frame.decisive_triggered_mono_s is not None
     recovery_copy = {
         "macOS memory pressure is now normal; recovery confirmation is in progress.":
@@ -5638,10 +5789,10 @@ def compact_reason(frame: HealthFrame, width: int, now_mono_s: float) -> str:
         if _fits_semantic_projections(reason + addition + trigger_suffix, budget):
             reason += addition
     if assessment.evidence_state is EvidenceState.DEGRADED and width >= 90:
-        addition = " Other core evidence is incomplete."
+        addition = " Other readings are incomplete."
         if _fits_semantic_projections(reason + addition + trigger_suffix, budget):
             reason += addition
-    reason += trigger_suffix
+    reason = plain_reading_text(reason) + trigger_suffix
     if not _fits_semantic_projections(reason, budget):
         if assessment.active_rules and assessment.active_rules[0] is RuleId.STORAGE_WATCH:
             reason = "Storage headroom is low." + _trigger_suffix(frame, now_mono_s)
@@ -5708,14 +5859,14 @@ def decision_header_lines(
         state = "UNKNOWN · %s" % frame.assessment.evidence_state.value.upper()
     if (frame.assessment.evidence_age_s is not None
             and frame.assessment.severity is not HealthSeverity.UNKNOWN):
-        state += " · evidence %s" % format_evidence_age(
+        state += " · updated %s" % format_evidence_age(
             frame.assessment.evidence_age_s + elapsed,
         )
     first = prefix + state
     if _is_cpu_baseline(frame):
         second = "Building the 15-second CPU baseline."
     elif _is_bootstrap_checking(frame):
-        second = "Waiting for core evidence."
+        second = "Loading system readings."
     else:
         second = compact_reason(frame, width, now_mono_s)
     if (not _fits_semantic_projections(first, budget)
@@ -6008,7 +6159,7 @@ def render_interval(animation_mode: int) -> float:
 
 def cpu_lane_text(label: str, index: int, percent: float, width: int, phase: int) -> str:
     if width >= 20:
-        return pulse_bar(percent, max(4, width - 13), phase + index, f"{label} ")[: max(0, width)]
+        return fitted_percent_bar(percent, width, phase + index, f"{label} ")
     if width >= 11:
         percentage = f"{int(round(clamp(percent))):3d}"
         prefix = f"{label} ["
@@ -6035,17 +6186,7 @@ def draw_signature(
 ) -> int:
     """Seven rows of branding; all health information remains above this band."""
 
-    mascot = render_mascot(phase, style=config.visual_style,
-                          unicode_enabled=unicode_ok())
-    roles = {"brand": PAIR_PIG_BODY, "highlight": PAIR_PIG_LIT,
-             "shadow": PAIR_PIG_SHADOW, "detail": PAIR_PIG_DETAIL,
-             "structure": PAIR_STRUCTURE}
-    for row_index, spans in enumerate(mascot.rows):
-        x = 2
-        for span in spans:
-            _rect_add(screen, y + row_index, x, span.text, max(0, 30 - x),
-                      color_pair(roles[span.role]))
-            x += display_cell_width(span.text)
+    draw_mascot_art(screen, y, 2, phase, config)
     x = 33
     budget = width - x - 2
     mark = wordmark_lines("compact" if config.visual_style == "sculpted" else "outline",
@@ -6107,7 +6248,7 @@ def draw_cpu_panel(
     _rect_add(screen, y + 2, x + 2, f"cores: {core_line}", w - 4,
               color_pair(PAIR_PRIMARY))
     _rect_add(screen, y + 3, x + 2,
-              pulse_bar(total, max(8, w - 18), phase, "total "), w - 4,
+              fitted_percent_bar(total, w - 4, phase, "total "), w - 4,
               color_for_percent(total))
     _rect_add(screen, y + 4, x + 2,
               f"60s  {sparkline(history.cpu, max(8, w - 10), 100.0)}",
@@ -6220,6 +6361,16 @@ def draw_memory_panel(
         _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
+def battery_display_notice(battery: BatteryInfo) -> Optional[str]:
+    """Distinguish pending/unknown power data from a confirmed batteryless Mac."""
+
+    if battery.state in ("checking", "pending"):
+        return "Power CHECKING"
+    if not battery.present and battery.source == "Power":
+        return "Power UNAVAILABLE"
+    return None
+
+
 def draw_battery_panel(
     screen: curses.window,
     y: int,
@@ -6230,6 +6381,10 @@ def draw_battery_panel(
     phase: int,
 ) -> None:
     draw_box(screen, y, x, h, w, "POWER CELL", color_pair(PAIR_STRUCTURE))
+    notice = battery_display_notice(battery)
+    if notice:
+        _rect_add(screen, y + 1, x + 2, notice, w - 4, color_pair(PAIR_SECONDARY))
+        return
     if not battery.present:
         desktop_lines = [
             ("desktop power", color_pair(PAIR_INFO) | curses.A_BOLD),
@@ -6239,7 +6394,7 @@ def draw_battery_panel(
         for index, (line, line_attr) in enumerate(desktop_lines[: h - 2], start=1):
             _rect_add(screen, y + index, x + 2, line, w - 4, line_attr)
         return
-    pct = float(battery.percent if battery.percent is not None else 0)
+    pct = float(battery.percent) if battery.percent is not None else None
     attr = color_pair(PAIR_INFO) | curses.A_BOLD
     if battery.percent is not None and battery.percent <= 30:
         attr = color_pair(PAIR_INFO) | curses.A_BOLD
@@ -6256,7 +6411,7 @@ def draw_battery_panel(
             charger_label = f"{watts_prefix} {battery.charger_name}"
 
     lines: list[tuple[str, int]] = [
-        (pulse_bar(pct, max(8, w - 18), phase, "cell "), attr),
+        (fitted_percent_bar(pct, w - 4, phase, "cell ") if pct is not None else "Charge NOT EXPOSED", attr),
         (f"state {flow_text(phase, battery.is_charging, battery.external_connected)} {state}", color_pair(PAIR_STRUCTURE) | curses.A_BOLD),
         (f"source: {battery.source}", color_pair(PAIR_PRIMARY)),
         (f"charger: {charger_label}".strip(), color_pair(PAIR_PRIMARY)),
@@ -6316,7 +6471,10 @@ def draw_thermal_panel(
         status_line("pressure", sensor.thermal_warning),
         status_line("performance", sensor.performance_warning),
     ]
-    if battery.present:
+    notice = battery_display_notice(battery)
+    if notice:
+        lines.append((notice, color_pair(PAIR_SECONDARY)))
+    elif battery.present:
         lines.extend(
             [
                 (f"battery skin: {format_temp(battery.temp_c)}", temp_attr(battery.temp_c)),
@@ -6511,9 +6669,9 @@ def draw_gpu_panel(
         line_y += 1
         if line_y < y + h - 1:
             if sensor.gpu_active_percent is not None:
-                activity_text = pulse_bar(
+                activity_text = fitted_percent_bar(
                     sensor.gpu_active_percent,
-                    max(8, w - 18),
+                    w - 4,
                     phase,
                     "active ",
                 )
@@ -6650,6 +6808,18 @@ def draw_io_panel(
         _rect_add(screen, y + index, x + 2, line, w - 4, attr)
 
 
+def process_empty_message(frame: HealthFrame, config: Optional[HudConfig]) -> str:
+    """Keep unavailable process lists distinct from valid empty selections."""
+
+    has_query = config is not None and bool(config.search_query)
+    view = frame.source_views[SourceId.PROCESS_TABLE]
+    if view.status is not SourceViewStatus.LIVE:
+        if view.status is SourceViewStatus.CHECKING and not has_query:
+            return "collecting processes..."
+        return "Processes " + source_view_text(view)
+    return "No matching processes · / edit · Esc clear" if has_query else "No processes reported"
+
+
 def draw_process_panel(
     screen: curses.window,
     y: int,
@@ -6660,6 +6830,7 @@ def draw_process_panel(
     scroll: int,
     sort_mode: str,
     title: Optional[str] = None,
+    *, empty_message: str = "collecting processes...", identity_only: bool = False,
 ) -> None:
     panel_title = title or "PROCESS GRID sort=%s" % sort_mode
     draw_box(screen, y, x, h, w, panel_title, color_pair(PAIR_STRUCTURE))
@@ -6682,10 +6853,11 @@ def draw_process_panel(
               color_pair(PAIR_STRUCTURE))
 
     if not rows and body_height > 0:
-        _rect_add(screen, y + 3, x + 2, "collecting processes...", w - 4,
+        _rect_add(screen, y + 3, x + 2, empty_message, w - 4,
                   color_pair(PAIR_PRIMARY))
     for index, row in enumerate(visible_rows):
         line_y = y + 3 + index
+        command = process_identity(row.command) if identity_only else row.command
         if compact:
             fixed_width = 13 + (5 if show_gpu else 0)
             command_width = max(8, w - fixed_width - 2)
@@ -6693,7 +6865,7 @@ def draw_process_panel(
             if show_gpu:
                 gpu = "%5s" % ("--" if row.gpu is None else "%.1f" % row.gpu)
             line = "%5.1f %4.1f%s %s" % (
-                row.cpu, row.mem, gpu, visible_command(row.command, command_width),
+                row.cpu, row.mem, gpu, visible_command(command, command_width),
             )
         else:
             fixed_width = 31 + (6 if show_gpu else 0)
@@ -6703,7 +6875,7 @@ def draw_process_panel(
                 gpu = "%6s" % ("--" if row.gpu is None else "%.1f" % row.gpu)
             line = "%6d %5.1f %4.1f%s %-2.2s %8.8s  %s" % (
                 row.pid, row.cpu, row.mem, gpu, row.stat, row.etime,
-                visible_command(row.command, command_width),
+                visible_command(command, command_width),
             )
         attr = color_pair(PAIR_PRIMARY)
         _rect_add(screen, line_y, x + 1, line, w - 2, attr)
@@ -6712,7 +6884,10 @@ def draw_process_panel(
     last = min(len(rows), scroll + body_height)
     keys = "↑↓/Pg" if unicode_ok() else "j/k/Pg"
     if not rows:
-        footer = f"collecting · m {sort_mode}" if unicode_ok() else f"collecting | m {sort_mode}"
+        state = ("collecting" if empty_message == "collecting processes..." else
+                 "0 matches" if empty_message.startswith("No matching processes") else
+                 "0 processes" if empty_message == "No processes reported" else "list unavailable")
+        footer = f"{state} · m {sort_mode}" if unicode_ok() else f"{state} | m {sort_mode}"
     elif w < 58:
         footer = f"{len(rows)} · {first}-{last} · {keys} · m {sort_mode}"
     else:
@@ -6732,57 +6907,261 @@ def _clamped_process_scroll(rows: Sequence[ProcessRow], panel_h: int, scroll: in
     return max(0, min(scroll, max(0, len(rows) - process_body_height(panel_h))))
 
 
+def draw_mascot_art(
+    screen: curses.window, y: int, x: int, phase: int, config: HudConfig,
+) -> None:
+    """Draw the shared fixed-size artwork without owning surrounding geometry."""
+
+    mascot = render_mascot(phase, style=config.visual_style,
+                          unicode_enabled=unicode_ok())
+    roles = {"brand": PAIR_PIG_BODY, "highlight": PAIR_PIG_LIT,
+             "shadow": PAIR_PIG_SHADOW, "detail": PAIR_PIG_DETAIL,
+             "structure": PAIR_STRUCTURE}
+    for row_index, spans in enumerate(mascot.rows):
+        column = x
+        for span in spans:
+            _rect_add(screen, y + row_index, column, span.text,
+                      max(0, x + mascot.width - column), color_pair(roles[span.role]))
+            column += display_cell_width(span.text)
+
+
+def _overview_memory_known(mem: Mapping[str, float]) -> bool:
+    return all(type(mem.get(key)) in (int, float)
+               and math.isfinite(mem[key]) and mem[key] >= 0
+               for key in ("used", "total")) and mem["total"] > 0
+
+
+def _overview_memory_bytes(mem: Mapping[str, float], key: str) -> str:
+    value = mem.get(key)
+    return (human_bytes(value) if type(value) in (int, float)
+            and math.isfinite(value) and value >= 0 else "--")
+
+
+def _draw_overview_quick_stats(
+    screen: curses.window, y: int, width: int, frame: HealthFrame,
+    history: MetricHistory, static: Mapping[str, Any], mem: Mapping[str, float],
+    battery: Optional[BatteryInfo], sensor: SensorInfo, config: HudConfig,
+    phase: int, wide: bool,
+) -> None:
+    """Trade decorative branding space for seven immediately useful readouts."""
+
+    draw_mascot_art(screen, y, 2, phase, config)
+    x, budget = 33, min(44, width - 35) if wide else width - 35
+    chip = str(static.get("chip") or "Discovering your Mac")
+    memory_size = str(static.get("memory") or "")
+    cpu = ("%.1f%%" % frame.cpu_percent if frame.cpu_percent is not None else
+           frame.source_views[SourceId.CPU_USAGE].status.value)
+    ram = "%.1f%%" % ram_percent(dict(mem)) if _overview_memory_known(mem) else "CHECKING"
+    missing_sensor = ("CHECKING" if sensor.thermal_warning in ("checking", "pending")
+                      else "LOCKED" if sensor.privileged_locked else "NOT EXPOSED")
+    gpu = ("%.1f%%" % sensor.gpu_active_percent
+           if sensor.gpu_active_percent is not None else missing_sensor)
+    power = (" · package " + format_watts(sensor.package_power_w).strip()
+             if sensor.package_power_w is not None else "")
+    cpu_temp = format_temp(sensor.cpu_temp_c).strip() if sensor.cpu_temp_c is not None else "--"
+    gpu_temp = format_temp(sensor.gpu_temp_c).strip() if sensor.gpu_temp_c is not None else "--"
+    if sensor.fans:
+        fans = "/".join(str(fan.rpm) for fan in sensor.fans[:2])
+        fans += "+" if len(sensor.fans) > 2 else ""
+    else:
+        fans = str(sensor.fan_rpm) if sensor.fan_rpm is not None else "--"
+    temperatures = "CPU %s · GPU %s · fan %s rpm" % (cpu_temp, gpu_temp, fans)
+    if display_cell_width(temperatures) > budget:
+        temperatures = "CPU %s GPU %s fan %s rpm" % (cpu_temp, gpu_temp, fans)
+    battery_line = "Battery CHECKING"
+    if battery is not None and battery.state not in ("checking", "pending"):
+        if battery.present:
+            percent = "--" if battery.percent is None else "%s%%" % battery.percent
+            state = "charging" if battery.is_charging else "AC" if battery.external_connected else "battery"
+            battery_line = "Battery %s · %s" % (percent, state)
+            if battery.remaining and battery.remaining not in ("not charging", "unknown"):
+                battery_line += " · " + battery.remaining
+        elif battery.source != "Power":
+            battery_line = "%s · no internal battery" % battery.source
+        else:
+            battery_line = "Battery UNAVAILABLE"
+    os_line = str(static.get("os") or "macOS CHECKING")
+    uptime = static.get("uptime_seconds", static.get("boot_seconds"))
+    if type(uptime) is int and uptime >= 0:
+        os_line += " · up " + format_uptime(uptime)
+    if sensor.sensor_sample_age_s > SENSOR_REFRESH_SECONDS * 2:
+        last_line = "Sensors STALE · %.0fs old" % sensor.sensor_sample_age_s
+    elif sensor.privileged_locked:
+        last_line = "LOCKED · u: temporary unlock"
+    else:
+        last_line = "CPU 60s " + sparkline(history.cpu, max(1, budget - 8))
+    lines = (
+        chip + (" · " + memory_size if memory_size else ""),
+        "CPU %s · RAM %s" % (cpu, ram), "GPU " + gpu + power,
+        temperatures,
+        battery_line, os_line, last_line,
+    )
+    for index, line in enumerate(lines):
+        _body_add(screen, y + index, x, line, budget,
+                  color_pair(PAIR_PRIMARY if index in (0, 4, 5) else PAIR_INFO)
+                  | (curses.A_BOLD if index in (0, 1) else 0))
+    if wide:
+        gpu_width = 36 if width >= 156 else width - 80
+        draw_gpu_panel(screen, y, 79, 7, gpu_width, dict(static), sensor, 0)
+        if width >= 156:
+            if (battery is not None and battery.state not in ("checking", "pending")
+                    and (battery.present or battery.source != "Power")):
+                draw_battery_panel(screen, y, 116, 7, width - 117, battery, 0)
+            else:
+                draw_box(screen, y, 116, 7, width - 117, "POWER CELL", color_pair(PAIR_STRUCTURE))
+                _body_add(screen, y + 1, 118, battery_line, width - 121,
+                          color_pair(PAIR_SECONDARY))
+
+
+def _draw_overview_memory(
+    screen: curses.window, y: int, x: int, h: int, w: int,
+    mem: Mapping[str, float], history: MetricHistory,
+) -> None:
+    """Compact memory fields keep unobserved values distinct from measured zero."""
+
+    draw_box(screen, y, x, h, w, "MEMORY", color_pair(PAIR_STRUCTURE))
+    known = _overview_memory_known(mem)
+    lines = [
+        ("Used %s / %s · %.1f%%" % (human_bytes(mem["used"]), human_bytes(mem["total"]),
+                                   ram_percent(dict(mem))) if known else "RAM CHECKING"),
+        "Swap %s / %s" % (_overview_memory_bytes(mem, "swap_used"),
+                          _overview_memory_bytes(mem, "swap_total")),
+        "Comp %s · cache %s" % (_overview_memory_bytes(mem, "compressed"),
+                               _overview_memory_bytes(mem, "cached")),
+        "App %s · wired %s" % (_overview_memory_bytes(mem, "app"),
+                              _overview_memory_bytes(mem, "wired")),
+        "Available " + _overview_memory_bytes(mem, "available"),
+        "RAM 60s " + sparkline(history.ram, max(1, w - 12)),
+    ]
+    for index, line in enumerate(lines[:max(0, h - 2)]):
+        _body_add(screen, y + 1 + index, x + 2, line, w - 4,
+                  color_pair(PAIR_INFO if index == 0 and known else PAIR_PRIMARY))
+
+
+def _draw_overview_io(
+    screen: curses.window, y: int, x: int, h: int, w: int,
+    frame: HealthFrame, disk: Optional[DiskInfo], activity: Optional[DiskActivity],
+    net_down: Optional[float], net_up: Optional[float], history: MetricHistory,
+) -> None:
+    """Always show capacity, transfer activity, and both network directions."""
+
+    draw_box(screen, y, x, h, w, "STORAGE + I/O", color_pair(PAIR_STRUCTURE))
+    storage_view = frame.source_views[SourceId.DISK_CAPACITY]
+    capacity = frame.disk_capacity
+    if capacity is not None:
+        free, total, label = capacity.free_bytes, capacity.total_bytes, capacity.volume_name
+    elif (disk is not None and disk.label not in ("checking", "pending")
+          and storage_view.last_valid_revision is not None):
+        free, total, label = disk.free, disk.total, disk.label
+    else:
+        free = total = None
+        label = ""
+    storage_line = ("Free %s / %s" % (human_bytes(free), human_bytes(total))
+                    if free is not None and storage_view.status is SourceViewStatus.LIVE
+                    else "Storage " + source_view_text(storage_view))
+    if activity is None or activity.source in ("checking", "pending"):
+        disk_line = "Disk I/O CHECKING"
+    elif activity.source == "unavailable":
+        disk_line = "Disk I/O UNAVAILABLE"
+    elif activity.sample_age > DISK_ACTIVITY_REFRESH_SECONDS * 2:
+        disk_line = "Disk I/O STALE · %.0fs old" % activity.sample_age
+    else:
+        disk_line = "Disk %s/s · %.0f IOPS" % (human_bytes(activity.bytes_per_sec), activity.iops)
+    network_ready = net_down is not None and net_up is not None and net_down >= 0 and net_up >= 0
+    if network_ready:
+        network_line = "Net %s/s down · %s/s up" % (human_bytes(net_down), human_bytes(net_up))
+    elif net_down is not None and net_up is not None and (net_down < 0 or net_up < 0):
+        network_line = "Net UNAVAILABLE"
+    else:
+        network_line = "Net CHECKING"
+    detail = ("%s · %.1f%% used" % (label, (total - free) / total * 100.0)
+              if total is not None and total > 0 else "Capacity awaiting a sample")
+    if storage_view.status is not SourceViewStatus.LIVE and free is not None:
+        detail = "Last good: %s free" % human_bytes(free)
+    lines = [storage_line, disk_line, network_line, detail,
+             "Net 60s " + sparkline(history.net, max(1, w - 12), None),
+             "Used% 60s " + sparkline(history.disk, max(1, w - 14))]
+    for index, line in enumerate(lines[:max(0, h - 2)]):
+        _body_add(screen, y + 1 + index, x + 2, line, w - 4,
+                  color_pair(PAIR_INFO if index in (1, 2) else PAIR_PRIMARY))
+
+
 def draw_overview_body(
     screen: curses.window, body_y: int, body_h: int, width: int,
     frame: HealthFrame, history: MetricHistory, rows: Sequence[ProcessRow],
     sort_mode: str, sensor: Optional[SensorInfo] = None,
     *, static: Optional[Mapping[str, Any]] = None,
     config: Optional[HudConfig] = None, phase: int = 0,
+    per_core: Sequence[float] = (), mem: Optional[Mapping[str, float]] = None,
+    battery: Optional[BatteryInfo] = None, disk: Optional[DiskInfo] = None,
+    activity: Optional[DiskActivity] = None, net_down: Optional[float] = None,
+    net_up: Optional[float] = None, scroll: int = 0,
 ) -> int:
-    """A calm visual identity above explicit evidence and identity-only workloads."""
+    """The complete daily dashboard, with compact summaries and richer wide panels."""
 
     config = config or HudConfig()
-    y = draw_signature(screen, body_y, width, static or {}, config, phase)
-    h = body_h - 7
-    left_w = (width - 3) // 2
-    right_x = left_w + 2
-    right_w = width - right_x - 1
-    draw_box(screen, y, 1, h, left_w, "EVIDENCE DETAIL", color_pair(PAIR_STRUCTURE))
-    draw_box(screen, y, right_x, h, right_w, "TOP PROCESSES · " + sort_mode,
-             color_pair(PAIR_STRUCTURE))
-    for index, (source_id, label) in enumerate(_CORE_SOURCE_LABELS.items()):
-        view = frame.source_views[source_id]
-        value = (_live_ribbon_value(frame, source_id)
-                 if view.status is SourceViewStatus.LIVE else source_view_text(view))
-        _body_add(screen, y + 1 + index, 3, "%s  %s" % (label, value),
-                  left_w - 4, color_pair(PAIR_INFO if view.status is SourceViewStatus.LIVE
-                                           else PAIR_SECONDARY))
-    _body_add(screen, y + 6, 3, "PROVENANCE · macOS core evidence", left_w - 4,
-              color_pair(PAIR_SECONDARY))
-    if h >= 10:
-        _body_add(screen, y + 7, 3, "CPU 60s · " + sparkline(history.cpu, max(1, left_w - 14)),
-                  left_w - 4, color_pair(PAIR_INFO))
-    exceptional = []
-    if frame.decisive_triggered_mono_s is not None:
-        exceptional.append("recovery confirmation")
-    if sensor is not None and sensor.privileged_locked:
-        exceptional.append("LOCKED · u: temporary unlock")
-    if exceptional:
-        _body_add(screen, y + h - 2, 3, " · ".join(exceptional), left_w - 4,
-                  color_pair(PAIR_PRIMARY) | curses.A_BOLD)
-    visible = max(0, min(8, h - 3))
-    for index, row in enumerate(rows[:visible]):
-        metric = row.mem if sort_mode == "MEM" else row.gpu if sort_mode == "GPU" else row.cpu
-        metric_text = "--" if metric is None else "%.1f%%" % metric
-        identity_width = max(4, right_w - 14)
-        identity = truncate_display_cells(process_identity(row.command), identity_width)
-        identity += " " * max(0, identity_width - display_cell_width(identity))
-        _body_add(screen, y + 1 + index, right_x + 2,
-                  "%s %s" % (identity, metric_text), right_w - 4, color_pair(PAIR_PRIMARY))
-    if not rows:
-        _body_add(screen, y + 1, right_x + 2, "Waiting for process evidence", right_w - 4,
+    static, mem = static or {}, mem or {}
+    sensor = sensor or default_sensor_info()
+    wide = width >= 118 and body_y + body_h + 1 >= 34
+    _draw_overview_quick_stats(screen, body_y, width, frame, history, static,
+                             mem, battery, sensor, config, phase, wide)
+    y, remaining = body_y + 7, body_h - 7
+    empty_message = process_empty_message(frame, config)
+    title = "TOP PROCESSES · " + sort_mode
+    if not wide:
+        left_w = (width - 3) // 2
+        right_x, right_w = left_w + 2, width - left_w - 3
+        metric_h = min(9, max(5, remaining // 2))
+        _draw_overview_memory(screen, y, 1, metric_h, left_w, mem, history)
+        _draw_overview_io(screen, y, right_x, metric_h, right_w, frame, disk,
+                          activity, net_down, net_up, history)
+        process_h = remaining - metric_h
+        effective = _clamped_process_scroll(rows, process_h, scroll)
+        draw_process_panel(screen, y + metric_h, 1, process_h, width - 2,
+                           rows, effective, sort_mode, title, empty_message=empty_message,
+                           identity_only=True)
+        return effective
+    available = width - 4
+    left_w, center_w = available // 3, available // 3
+    right_w = available - left_w - center_w
+    center_x, right_x = left_w + 2, left_w + center_w + 3
+    cpu_h = max(13, remaining * 3 // 5)
+    memory_h = max(10, min(12, remaining // 2))
+    if per_core and frame.source_views[SourceId.CPU_USAGE].status is SourceViewStatus.LIVE:
+        draw_cpu_panel(screen, y, 1, cpu_h, left_w, list(per_core), dict(static), history, 0)
+    else:
+        draw_box(screen, y, 1, cpu_h, left_w, "CPU WORKER CORES", color_pair(PAIR_STRUCTURE))
+        _body_add(screen, y + 1, 3,
+                  "CPU " + frame.source_views[SourceId.CPU_USAGE].status.value,
+                  left_w - 4, color_pair(PAIR_SECONDARY))
+        _body_add(screen, y + 2, 3, "Per-core readings unavailable", left_w - 4,
                   color_pair(PAIR_SECONDARY))
-    return 0
+    _draw_overview_io(screen, y + cpu_h, 1, remaining - cpu_h, left_w,
+                      frame, disk, activity, net_down, net_up, history)
+    if (_overview_memory_known(mem)
+            and all(_overview_memory_bytes(mem, key) != "--" for key in
+                    ("available", "cached", "app", "wired", "compressed",
+                     "swap_used", "swap_total"))):
+        draw_memory_panel(screen, y, center_x, memory_h, center_w, dict(mem), history, 0)
+    else:
+        _draw_overview_memory(screen, y, center_x, memory_h, center_w, mem, history)
+    if battery is not None:
+        draw_thermal_panel(screen, y + memory_h, center_x, remaining - memory_h,
+                           center_w, battery, sensor, 0, frame.thermal)
+    else:
+        draw_box(screen, y + memory_h, center_x, remaining - memory_h, center_w,
+                 "THERMAL", color_pair(PAIR_STRUCTURE))
+        _body_add(screen, y + memory_h + 1, center_x + 2,
+                  "CPU %s · GPU %s" % (format_temp(sensor.cpu_temp_c).strip()
+                                       if sensor.cpu_temp_c is not None else "--",
+                                       format_temp(sensor.gpu_temp_c).strip()
+                                       if sensor.gpu_temp_c is not None else "--"),
+                  center_w - 4, color_pair(PAIR_PRIMARY))
+    effective = _clamped_process_scroll(rows, remaining, scroll)
+    draw_process_panel(screen, y, right_x, remaining, right_w,
+                       rows, effective, sort_mode, title, empty_message=empty_message,
+                       identity_only=True)
+    return effective
 
 
 def draw_insights_body(
@@ -6836,10 +7215,17 @@ def draw_insights_body(
 
 
 EXPLORE_OPTIONS = (
-    ("insights", "7", "Measured insights", "CPU observations, compression and swap activity"),
-    ("devices", "8", "Connected devices", "USB, Thunderbolt and display topology"),
-    ("network", "9", "Network environment", "Interfaces, addresses, default route and DNS"),
-    ("connections", "0", "TCP connections", "Observed listeners and established peers"),
+    ("balanced", "1", "Overview", "All key readings and top processes"),
+    ("compute", "2", "CPU & memory", "Worker cores, RAM and busy processes"),
+    ("thermals", "3", "Temperatures & fans", "Sensors, fan speed and power"),
+    ("io", "4", "Storage & traffic", "Free space, disk activity and network rates"),
+    ("processes", "5", "Processes", "Search, sort and scroll running processes"),
+    ("cinema", "6", "Cinema", "Wide dashboard · needs 118×34"),
+    ("insights", "7", "Memory activity", "CPU trends, compression and swap rates"),
+    ("devices", "8", "Connected devices", "USB, Thunderbolt and displays"),
+    ("network", "9", "Network", "Interfaces, addresses, route and DNS"),
+    ("connections", "0", "TCP connections", "Listeners, peers and connection states"),
+    ("system", "i", "This Mac", "Hardware, macOS and battery details"),
 )
 def _inventory_probe(argv: Sequence[str], *, timeout_s: float,
                      max_output_bytes: int,
@@ -6911,7 +7297,8 @@ def inventory_lines(mode: str, result: Any) -> list[str]:
 
 def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
                         width: int, result: Any, age_s: float, error: str,
-                        scroll: int, retained: bool = False) -> int:
+                        scroll: int, retained: bool = False,
+                        *, config: Optional[HudConfig] = None) -> int:
     title = {"devices": "CONNECTED DEVICES", "network": "NETWORK ENVIRONMENT",
              "connections": "TCP CONNECTIONS"}[mode]
     draw_box(screen, y, 1, h, width - 2, title, color_pair(PAIR_STRUCTURE))
@@ -6919,13 +7306,34 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
         lines = ["ERROR · collection unavailable" if error else "CHECKING · collecting bounded macOS inventory"]
         status = "ERROR" if error else "CHECKING"
     else:
+        query = config.search_query if config is not None else ""
+        connection_state = config.connection_filter if config is not None and mode == "connections" else "all"
+        filtered = filter_inventory(result, query, connection_state=connection_state)
+        summary = summarize_inventory(result)
         status = "ERROR" if error else ("STALE" if age_s > 30.0 and
                  result.status is InventoryStatus.LIVE else result.status.value)
-        lines = inventory_lines(mode, result)
+        lines = inventory_lines(mode, filtered)
         if not lines:
-            lines = [result.detail or "No matching records reported"]
+            if result.status is not InventoryStatus.LIVE and not retained:
+                lines = []
+            else:
+                lines = ["No matches · / edit search · Esc clear" if query or connection_state != "all"
+                         else result.detail or "No matching records reported"]
         if result.status is not InventoryStatus.LIVE:
             lines.insert(0, result.detail or "Inventory unavailable")
+        if mode == "connections":
+            totals = "%d/%d matches · totals: %d listeners · %d connected · %d other" % (
+                len(filtered.items), summary.total_count, summary.listeners,
+                summary.established, summary.other_connections)
+        elif mode == "network":
+            totals = "%d active · %d link unknown · %d/%d interfaces" % (
+                summary.active_interfaces, summary.unknown_link_interfaces,
+                len(filtered.items), summary.total_count)
+        else:
+            totals = "%d/%d devices · %s" % (len(filtered.items), summary.total_count,
+                      " · ".join("%s %d" % pair for pair in summary.kind_counts))
+        if result.status is not InventoryStatus.LIVE and not retained:
+            totals = "Counts unavailable · no valid list"
     if result is not None and status == "LIVE" and not result.complete:
         status = "PARTIAL"
     _body_add(screen, y + 1, 3,
@@ -6934,6 +7342,8 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
                (retained or result.status is InventoryStatus.LIVE and (error or age_s > 30.0))
                else "read-only"),
               width - 6, color_pair(PAIR_INFO if status == "LIVE" else PAIR_SECONDARY))
+    _body_add(screen, y + 2, 3, totals if result is not None else "Discovery runs in the background",
+              width - 6, color_pair(PAIR_INFO))
     # Wrap at display-cell boundaries so narrow viewports retain every field.
     wrapped = []
     for line in lines:
@@ -6946,10 +7356,10 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
             projected = "  " + projected[len(segment):]
         wrapped.append(projected)
     lines = wrapped
-    available = max(0, h - 5)
+    available = max(0, h - 6)
     effective = max(0, min(scroll, max(0, len(lines) - available)))
     for index, line in enumerate(lines[effective:effective + available]):
-        _body_add(screen, y + 2 + index, 3, line, width - 6, color_pair(PAIR_PRIMARY))
+        _body_add(screen, y + 3 + index, 3, line, width - 6, color_pair(PAIR_PRIMARY))
     note = ("Protected sockets may be hidden" if mode == "connections" else
             "No connectivity test or network changes" if mode == "network" else
             "Reported topology · serial numbers omitted")
@@ -6962,20 +7372,51 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
 
 def draw_explore_menu(screen: curses.window, config: HudConfig) -> None:
     height, width = screen.getmaxyx()
-    w, h = min(70, width - 6), 14
+    w, h = min(70, width - 6), len(EXPLORE_OPTIONS) + 5
     y, x = max(3, (height - h) // 2), (width - w) // 2
     fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
-    draw_box(screen, y, x, h, w, "EXPLORE YOUR MAC", color_pair(PAIR_STRUCTURE))
+    draw_box(screen, y, x, h, w, "ALL TOOLS", color_pair(PAIR_STRUCTURE))
     for index, (_mode, key, label, description) in enumerate(EXPLORE_OPTIONS):
         selected = index == config.menu_index
-        _rect_add(screen, y + 2 + index * 2, x + 3,
-                  (("› " if unicode_ok() else "> ") if selected else "  ") + key + "  " + label, w - 6,
+        _rect_add(screen, y + 2 + index, x + 3,
+                  (("› " if unicode_ok() else "> ") if selected else "  ") + key + "  " +
+                  "%-21s %s" % (label, description), w - 6,
                   color_pair(PAIR_INFO if selected else PAIR_PRIMARY) |
                   (curses.A_BOLD if selected else 0))
-        _rect_add(screen, y + 3 + index * 2, x + 7, description, w - 10,
-                  color_pair(PAIR_SECONDARY))
-    _rect_add(screen, y + h - 2, x + 3, "↑/↓ select · Enter open · d/Esc close", w - 6,
+    _rect_add(screen, y + h - 2, x + 3, "↑/↓ select · Enter open · 1–0/i jump · Esc close", w - 6,
               color_pair(PAIR_SECONDARY))
+
+
+def draw_system_details_body(screen: curses.window, y: int, h: int, width: int,
+                             static: Mapping[str, Any], mem: Mapping[str, float],
+                             battery: BatteryInfo, sensor: SensorInfo) -> None:
+    """Present already collected Mac details without starting another probe."""
+
+    left_w = (width - 3) // 2
+    right_x = left_w + 2
+    right_w = width - right_x - 1
+    draw_box(screen, y, 1, h, left_w, "THIS MAC", color_pair(PAIR_STRUCTURE))
+    uptime = static.get("uptime_seconds")
+    total = mem.get("total")
+    lines = [
+        str(static.get("chip") or "Hardware CHECKING"),
+        "Model: " + str(static.get("model") or "CHECKING"),
+        "Identifier: " + str(static.get("model_id") or "not reported"),
+        "System: " + str(static.get("os") or "CHECKING"),
+        "Build: " + str(static.get("build") or "not reported"),
+        "Kernel: Darwin " + str(static.get("kernel") or "CHECKING"),
+        "CPU cores: " + str(static.get("cpu_cores") or static.get("logical_cpu") or "CHECKING"),
+        "Memory: " + (human_bytes(total) if total is not None else str(static.get("memory") or "CHECKING")),
+        "GPU cores: " + str(static.get("gpu_core_count") or "not reported"),
+        "Uptime: " + (format_uptime(int(uptime)) if uptime is not None else "CHECKING"),
+        "", "8 Devices · 9 Network · 0 Connections",
+    ]
+    for index, line in enumerate(lines[:h - 2], 1):
+        _body_add(screen, y + index, 3, line, left_w - 4, color_pair(PAIR_PRIMARY))
+    power_h = min(11, max(6, h // 2))
+    draw_battery_panel(screen, y, right_x, power_h, right_w, battery, 0)
+    draw_gpu_panel(screen, y + power_h, right_x, h - power_h, right_w,
+                   dict(static), sensor, 0)
 
 
 def draw_mode_body(
@@ -7004,19 +7445,27 @@ def draw_mode_body(
     static_values = dict(static)
     memory_values = dict(mem)
     row_values = rows
+    empty_processes = process_empty_message(frame, config)
     operational_phase = 0
     if mode == "balanced":
         return draw_overview_body(
             screen, body_y, body_h, width, frame, history, row_values, sort_mode,
             sensor, static=static_values, config=config, phase=phase,
+            per_core=per_core_values, mem=memory_values, battery=battery, disk=disk,
+            activity=activity, net_down=net_down, net_up=net_up, scroll=scroll,
         )
+    if mode == "system":
+        draw_system_details_body(screen, body_y, body_h, width, static_values,
+                                 memory_values, battery, sensor)
+        return 0
     if mode == "insights":
         draw_insights_body(screen, body_y, body_h, width, frame, memory_values,
                            vm_view, cpu_samples, history)
         return 0
     if mode in INVENTORY_COLLECTORS:
         return draw_inventory_body(screen, mode, body_y, body_h, width,
-                                   inventory, inventory_age, inventory_error, scroll, inventory_retained)
+                                   inventory, inventory_age, inventory_error, scroll, inventory_retained,
+                                   config=config)
     if mode == "cinema":
         if width < 118 or body_y + body_h + 1 < 34 or body_h < 7:
             raise ValueError("Cinema requires 118×34")
@@ -7041,7 +7490,8 @@ def draw_mode_body(
                           history, phase)
         effective = _clamped_process_scroll(row_values, operational_h, scroll)
         draw_process_panel(screen, operational_y, right_x, operational_h,
-                           right_w, row_values, effective, sort_mode)
+                           right_w, row_values, effective, sort_mode,
+                           empty_message=empty_processes)
         return effective
 
     gap = 1
@@ -7061,9 +7511,10 @@ def draw_mode_body(
         )
         draw_memory_panel(screen, body_y + cpu_h, left_x, memory_h, left_w,
                           memory_values, history, operational_phase)
+        effective = _clamped_process_scroll(row_values, body_h, scroll)
         draw_process_panel(screen, body_y, right_x, body_h, right_w, row_values,
-                           0, "CPU", "TOP CPU")
-        return 0
+                           effective, "CPU", "TOP CPU", empty_message=empty_processes)
+        return effective
     if mode == "thermals":
         draw_thermal_panel(screen, body_y, left_x, body_h, left_w,
                            battery, sensor, operational_phase, frame.thermal)
@@ -7076,7 +7527,7 @@ def draw_mode_body(
         return 0
     effective = _clamped_process_scroll(row_values, body_h, scroll)
     draw_process_panel(screen, body_y, 1, body_h, body_w, row_values,
-                       effective, sort_mode)
+                       effective, sort_mode, empty_message=empty_processes)
     return effective
 
 
@@ -7085,11 +7536,17 @@ def set_message(config: HudConfig, text: str, ttl: float = 3.0) -> None:
     config.message_until = time.monotonic() + ttl
 
 
-def shortcut_status(width: int) -> str:
+def shortcut_status(width: int, config: Optional[HudConfig] = None) -> str:
     _projection_width(width)
-    return semantic_text(
-        "1–5 mode · d explore · h help · t theme · a motion · q quit", unicode_ok(),
-    )
+    if config is not None and config.search_editing:
+        text = "Find: %s_ · Enter apply · Esc clear" % truncate_display_cells(config.search_query, width - 40)
+    elif config is not None and config.search_query:
+        text = "Find: %s · / edit · Esc clear · Tab · d tools · q quit" % truncate_display_cells(config.search_query, width - 56)
+    elif config is not None and config.layout_name == "connections":
+        text = "Tab · d tools · / find · f %s · Esc clear · r refresh · q quit" % config.connection_filter
+    else:
+        text = "1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit"
+    return semantic_text(text, unicode_ok())
 
 
 def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorInfo) -> None:
@@ -7109,19 +7566,19 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
     else:
         unlock_state = "locked"
     lines = [
-        "q             quit",
-        "Esc / h / ?   close this panel",
-        "1–5           select operational mode",
-        "d / 7–9 / 0   Explore / insights, devices, network, TCP",
-        "t             cycle theme",
-        "s             sculpted / outline / ASCII style",
-        "l             cycle supported modes",
-        "a             motion: off / calm / vivid",
-        "m             sort process grid by CPU, memory, or GPU",
-        "r             refresh telemetry and selected inventory",
+        "Tab/Shift-Tab next/previous view · l next",
+        "1–0 / i       choose view · d all tools",
+        "/             find processes or inventory",
+        "Enter / Esc   apply / clear search",
+        "Backspace/Ctrl-U edit / erase query",
+        "f             TCP: all / listeners / established / other",
         "arrows/j/k    scroll processes or inventory",
         "PgUp/PgDn/Home/End  page or jump to either end",
-        "",
+        "m             sort CPU / memory / GPU",
+        "r             refresh telemetry and selected inventory",
+        "t / s         theme / sculpted, outline, ASCII artwork",
+        "a             motion: off / calm / vivid",
+        "Esc / h / ?   close this panel · q quit",
     ]
     if width >= 118 and height >= 34:
         lines.append("6  Cinema     select wide Cinema mode")
@@ -7247,7 +7704,7 @@ def draw_initial_shell(screen: curses.window, config: HudConfig) -> int:
     unicode_enabled = unicode_ok()
     lines = (
         "PorkyHUD · 1 OVERVIEW · CHECKING 0/4 core sources",
-        "Waiting for core evidence.",
+        "Loading system readings.",
         "CPU CHECKING · MEM CHECKING · THERM CHECKING · DISK CHECKING",
     )
     projected = tuple(semantic_text(line, unicode_enabled) for line in lines)
@@ -7421,6 +7878,10 @@ def _hud_impl(
     inventory_retained = False
     inventory_render_key = None
     force_inventory = False
+    searched_rows: Optional[Sequence[ProcessRow]] = None
+    searched_query: Optional[str] = None
+    matching_rows: tuple[ProcessRow, ...] = ()
+    process_search_cache = _ProcessSearchCache()
 
     def quit_hud() -> None:
         # The outer hud() finally owns the single aggregate close.
@@ -7429,8 +7890,24 @@ def _hud_impl(
     while True:
         now = time.monotonic()
         height, width = screen.getmaxyx()
-        key = screen.getch()
+        key = read_hud_key(screen, config.search_editing)
         ui_changed = False
+        if edit_search(config, key):
+            scroll = 0
+            ui_changed = True
+            key = -1
+        elif (key == 27 and config.search_query
+              and not config.show_help and not config.show_menu):
+            config.searches.pop(config.layout_name, None)
+            scroll = 0
+            ui_changed = True
+            key = -1
+        elif (key == 27 and config.layout_name == "connections" and config.connection_filter != "all"
+              and not config.show_help and not config.show_menu):
+            config.connection_filter = "all"
+            scroll = 0
+            ui_changed = True
+            key = -1
         if key in (ord("q"), ord("Q")) or (
                 key == 27 and not config.show_help and not config.show_menu):
             quit_hud()
@@ -7448,13 +7925,17 @@ def _hud_impl(
             elif key in (curses.KEY_UP, ord("k")):
                 config.menu_index = (config.menu_index - 1) % len(EXPLORE_OPTIONS)
             elif key in (10, 13, curses.KEY_ENTER):
-                set_message(config, select_mode(config, EXPLORE_OPTIONS[config.menu_index][0], height, width))
-                config.show_menu = False
-                scroll = 0
-            elif key >= 0 and chr(key) in ("7", "8", "9", "0"):
-                set_message(config, select_mode(config, DIRECT_MODE_KEYS[chr(key)], height, width))
-                config.show_menu = False
-                scroll = 0
+                message = select_mode(config, EXPLORE_OPTIONS[config.menu_index][0], height, width)
+                set_message(config, message)
+                if message.endswith(" selected"):
+                    config.show_menu = False
+                    scroll = 0
+            elif key >= 0 and chr(key).lower() in DIRECT_MODE_KEYS:
+                message = select_mode(config, DIRECT_MODE_KEYS[chr(key).lower()], height, width)
+                set_message(config, message)
+                if message.endswith(" selected"):
+                    config.show_menu = False
+                    scroll = 0
             if key != -1:
                 ui_changed = True
             key = -1
@@ -7465,14 +7946,16 @@ def _hud_impl(
                 ui_changed = True
         elif key in (ord("d"), ord("D")):
             config.show_menu = True
+            config.menu_index = next(index for index, option in enumerate(EXPLORE_OPTIONS)
+                                     if option[0] == config.layout_name)
             ui_changed = True
         elif key in (ord("h"), ord("H"), ord("?")):
             config.show_help = True
             set_message(config, "shortcut panel opened")
             ui_changed = True
-        elif key in tuple(ord(value) for value in DIRECT_MODE_KEYS):
+        elif key in tuple(ord(value) for value in DIRECT_MODE_KEYS) + (ord("I"),):
             message = select_mode(
-                config, DIRECT_MODE_KEYS[chr(key)], height, width,
+                config, DIRECT_MODE_KEYS[chr(key).lower()], height, width,
             )
             if message.endswith(" selected"):
                 scroll = 0
@@ -7489,9 +7972,21 @@ def _hud_impl(
                                                 % len(VISUAL_STYLES)]
             set_message(config, "visual style: " + config.visual_style)
             ui_changed = True
-        elif key in (ord("l"), ord("L")):
-            set_message(config, cycle_mode(config, height, width))
+        elif key in (ord("l"), ord("L"), 9, curses.KEY_BTAB):
+            set_message(config, cycle_mode(config, height, width, -1 if key == curses.KEY_BTAB else 1))
             scroll = 0
+            ui_changed = True
+        elif key == ord("/"):
+            if config.layout_name in SEARCHABLE_MODES:
+                config.search_editing = True
+            else:
+                set_message(config, "Search is available in Processes, Devices, Network and TCP")
+            ui_changed = True
+        elif key in (ord("f"), ord("F")) and config.layout_name == "connections":
+            config.connection_filter = CONNECTION_FILTERS[(CONNECTION_FILTERS.index(config.connection_filter) + 1)
+                                                         % len(CONNECTION_FILTERS)]
+            scroll = 0
+            set_message(config, "TCP filter: " + config.connection_filter)
             ui_changed = True
         elif key in (ord("a"), ord("A")):
             config.animation_mode = (config.animation_mode + 1) % 3
@@ -7574,6 +8069,7 @@ def _hud_impl(
         if sampled_static and sampled_static != static:
             static = sampled_static
             uptime_at_start = int(static.get("boot_seconds", uptime_at_start) or 0)
+            uptime_clock_start = now - max(0.0, _static_age)
             descriptive_revision += 1
         memory_poller.tick(now, force_memory)
         memory_sample = memory_poller.sample_snapshot(now)
@@ -7742,6 +8238,7 @@ def _hud_impl(
             height, width, _frame_render_key(frame), descriptive_revision,
             config.theme_index, config.animation_mode, config.layout_index,
             config.show_help, config.show_menu, config.menu_index, config.visual_style, intro_active, active_message, sort_mode, scroll,
+            config.search_editing, config.search_query, config.connection_filter,
         )
         render_age_key = _render_age_key(frame, sensor, activity, now)
         should_render = (
@@ -7757,8 +8254,10 @@ def _hud_impl(
                 should_render
                 or now - last_render >= render_interval(config.animation_mode)
             )
+        idle_delay = (0.01 if config.search_editing else
+                      0.04 if intro_active or config.animation_mode == 2 else 0.10)
         if not should_render:
-            time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
+            time.sleep(idle_delay)
             continue
         last_render = now
         last_render_state = render_state
@@ -7767,7 +8266,7 @@ def _hud_impl(
             screen.erase()
             draw_small_screen(screen, height, width)
             screen.refresh()
-            time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
+            time.sleep(idle_delay)
             continue
 
         if intro_active:
@@ -7792,10 +8291,16 @@ def _hud_impl(
                 header_h = draw_decision_header(screen, frame, config, now)
                 header_h = draw_evidence_ribbon(screen, header_h, frame, now)
                 body_rows = cpu_rows if config.layout_name == "compute" else rows
+                if body_rows is not searched_rows or config.search_query != searched_query:
+                    searched_rows, searched_query = body_rows, config.search_query
+                    matching_rows = process_search_cache.filter(body_rows, searched_query)
+                render_static = dict(static)
+                if "boot_seconds" in static:
+                    render_static["uptime_seconds"] = uptime_at_start + max(0, int(now - uptime_clock_start))
                 scroll = draw_mode_body(
                     screen, config.layout_name, header_h, height - 4, width, frame,
-                    per_core, static, mem, battery, sensor, disk, activity, net_down,
-                    net_up, history, body_rows, scroll, sort_mode, phase,
+                    per_core, render_static, mem, battery, sensor, disk, activity, net_down,
+                    net_up, history, matching_rows, scroll, sort_mode, phase,
                     config=config, vm_view=vm_view, cpu_samples=tuple(cpu_samples),
                     inventory=inventory, inventory_age=inventory_age, inventory_error=inventory_error, inventory_retained=inventory_retained,
                 )
@@ -7805,8 +8310,8 @@ def _hud_impl(
                 if config.show_help:
                     draw_help_overlay(screen, config, sensor)
 
-                status = shortcut_status(width)
-                if config.message and now < config.message_until:
+                status = shortcut_status(width, config)
+                if config.message and now < config.message_until and not config.search_editing and not config.search_query:
                     status = semantic_text(config.message + " · q quit", unicode_ok())
                 safe_add(
                     screen, height - 1, 1,
@@ -7815,7 +8320,7 @@ def _hud_impl(
             if screen.getmaxyx() == (height, width):
                 screen.refresh()
                 break
-        time.sleep(0.04 if intro_active or config.animation_mode == 2 else 0.10)
+        time.sleep(idle_delay)
 
 
 def _snapshot_adapter_attempt(
@@ -8372,7 +8877,7 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="PorkyHUD Apple Silicon decision cockpit for macOS.",
+        description="PorkyHUD macOS system monitor and tools.",
     )
     parser.add_argument("--version", action="version", version=f"PorkyHUD {VERSION}")
     parser.add_argument(
@@ -8408,10 +8913,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--motion", choices=("off", "calm", "vivid"),
                         help="continuous live motion; explicit off also skips the intro (default: off)")
     parser.add_argument("--mode", choices=("overview", "compute", "thermals", "io",
-                                         "processes", "insights", "devices", "network", "connections", "cinema"),
+                                         "processes", "insights", "devices", "network", "connections", "system", "cinema"),
                         help="initial dashboard view (default: overview)")
     parser.add_argument("--inspect", choices=("devices", "network", "connections"),
                         help="print one read-only inventory; combine with --json for structured output")
+    parser.add_argument("--search", type=normalize_search_query, default="",
+                        help="find matching processes or inventory records")
+    parser.add_argument("--state", choices=CONNECTION_FILTERS,
+                        help="TCP state filter; selects Connections unless a mode is specified")
     parser.add_argument("--no-intro", action="store_true",
                         help="skip the brief launch flourish")
     args = parser.parse_args(argv)
@@ -8421,12 +8930,34 @@ def main(argv: list[str] | None = None) -> int:
         return remove_sensor_access()
     if args.sensor_access_status:
         return print_sensor_access_status()
+    if args.state is not None:
+        if args.inspect and args.inspect != "connections":
+            parser.error("--state applies to --inspect connections")
+        if not args.inspect and args.mode not in (None, "connections"):
+            parser.error("--state applies to --mode connections")
+    if (args.search or args.state is not None) and (args.json or args.snapshot) and not args.inspect:
+        parser.error("search and TCP filters need --inspect or a live view")
+    if args.search and not args.inspect:
+        requested = args.mode or ("connections" if args.state is not None else "overview")
+        if ("balanced" if requested == "overview" else requested) not in SEARCHABLE_MODES:
+            parser.error("--search needs Overview, Compute, Processes, Cinema or an inventory view")
     if args.inspect:
-        result = INVENTORY_COLLECTORS[args.inspect](_inventory_probe)
+        original = INVENTORY_COLLECTORS[args.inspect](_inventory_probe)
+        summary = summarize_inventory(original)
+        result = filter_inventory(original, args.search, connection_state=args.state or "all")
         if args.json:
-            print(json.dumps(asdict(result), indent=2, sort_keys=True))
+            payload = asdict(result)
+            payload["summary"] = asdict(summary)
+            payload["filter"] = {"query": args.search, "connection_state": args.state or "all",
+                                 "matched_records": len(result.items), "returned_records": summary.total_count}
+            print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print("PorkyHUD · %s · %s" % (args.inspect, result.status.value))
+            if result.status is InventoryStatus.LIVE:
+                print("%d matches / %d returned%s" % (len(result.items), summary.total_count,
+                                                    " · PARTIAL" if not original.complete else ""))
+            else:
+                print("Counts unavailable · no valid list")
             if result.detail:
                 print(result.detail)
             for line in inventory_lines(args.inspect, result):
@@ -8471,7 +9002,7 @@ def main(argv: list[str] | None = None) -> int:
 
         manage_terminal_colors = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
         enforce_dark_terminal()
-        if any((args.theme, args.style, args.motion, args.mode, args.no_intro)):
+        if any((args.theme, args.style, args.motion, args.mode, args.no_intro, args.search, args.state)):
             config = HudConfig(intro_enabled=not args.no_intro and args.motion != "off")
             if args.theme:
                 config.theme_index = next(index for index, theme in enumerate(THEMES)
@@ -8482,6 +9013,12 @@ def main(argv: list[str] | None = None) -> int:
                 config.animation_mode = ("off", "calm", "vivid").index(args.motion)
             if args.mode:
                 config.layout_index = LAYOUTS.index("balanced" if args.mode == "overview" else args.mode)
+            elif args.state is not None:
+                config.layout_index = LAYOUTS.index("connections")
+            if args.search:
+                config.searches[config.layout_name] = args.search
+            if args.state is not None:
+                config.connection_filter = args.state
             curses.wrapper(lambda screen: hud(screen, config))
         else:
             curses.wrapper(hud)
@@ -8491,7 +9028,7 @@ def main(argv: list[str] | None = None) -> int:
     except TerminationSignal as exc:
         return 128 + exc.signum
     except Exception as exc:
-        print(f"PorkyHUD crashed: {exc}")
+        print("PorkyHUD crashed: " + plain_reading_text(str(exc)))
         return 1
     finally:
         if manage_terminal_colors:

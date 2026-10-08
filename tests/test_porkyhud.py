@@ -3984,7 +3984,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         )
 
         self.assertIn("1 OVERVIEW", screen.row(0))
-        self.assertIn("EVIDENCE DETAIL", screen.text())
+        self.assertIn("MEMORY", screen.text())
         self.assertEqual(
             screen.row(32).strip(),
             "Cinema requires 118x34 | returned to Overview | q quit",
@@ -4071,7 +4071,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
 
     def test_hud_direct_keys_change_mode_label_and_body_at_minimum_view(self) -> None:
         expected = {
-            "1": ("1 OVERVIEW", "EVIDENCE DETAIL", "Overview"),
+            "1": ("1 OVERVIEW", "MEMORY", "Overview"),
             "2": ("2 COMPUTE", "TOP CPU", "Compute"),
             "3": ("3 THERMALS", "FANS + TEMP SENSORS", "Thermals"),
             "4": ("4 I/O", "disk live", "I/O"),
@@ -4195,14 +4195,14 @@ class LayoutAndRenderingTests(unittest.TestCase):
 
     def test_responsive_mode_contract_is_direct_bounded_and_non_mutating(self) -> None:
         operational = ("balanced", "compute", "thermals", "io", "processes",
-                       "insights", "devices", "network", "connections")
+                       "insights", "devices", "network", "connections", "system")
         all_modes = operational + ("cinema",)
         self.assertEqual(porkyhud.LAYOUTS, list(all_modes))
         self.assertEqual(
             porkyhud.DIRECT_MODE_KEYS,
             {"1": "balanced", "2": "compute", "3": "thermals",
              "4": "io", "5": "processes", "6": "cinema", "7": "insights",
-             "8": "devices", "9": "network", "0": "connections"},
+             "8": "devices", "9": "network", "0": "connections", "i": "system"},
         )
         self.assertEqual(porkyhud.HudConfig().animation_mode, 0)
 
@@ -4217,7 +4217,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
             "balanced": "Overview", "compute": "Compute",
             "thermals": "Thermals", "io": "I/O",
             "processes": "Processes", "insights": "Insights", "devices": "Devices",
-            "network": "Network", "connections": "Connections", "cinema": "Cinema",
+            "network": "Network", "connections": "Connections", "system": "This Mac", "cinema": "Cinema",
         }
         config = porkyhud.HudConfig()
         for mode in operational:
@@ -4230,7 +4230,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         before = config.layout_index
         self.assertEqual(
             porkyhud.select_mode(config, "cinema", 33, 117),
-            "Cinema requires 118×34 · staying in Connections",
+            "Cinema requires 118×34 · staying in This Mac",
         )
         self.assertEqual(config.layout_index, before)
         for unknown in ("compact", "unknown", None):
@@ -4251,18 +4251,18 @@ class LayoutAndRenderingTests(unittest.TestCase):
             porkyhud.cycle_mode(narrow, 24, 80)
         self.assertEqual(set(visited),
                          {"balanced", "compute", "thermals", "io", "processes",
-                          "insights", "devices", "network", "connections"})
+                          "insights", "devices", "network", "connections", "system"})
         self.assertNotIn("compact", visited)
         self.assertNotIn("cinema", visited)
 
         wide = porkyhud.HudConfig(animation_mode=2)
         visited = []
-        for _ in range(10):
+        for _ in range(11):
             visited.append(wide.layout_name)
             porkyhud.cycle_mode(wide, 34, 118)
         self.assertEqual(visited,
                          ["balanced", "compute", "thermals", "io", "processes",
-                          "insights", "devices", "network", "connections", "cinema"])
+                          "insights", "devices", "network", "connections", "system", "cinema"])
         self.assertEqual(wide.animation_mode, 2)
         self.assertEqual(wide.layout_name, "balanced")
         self.assertEqual(porkyhud.select_mode(wide, "cinema", 34, 118),
@@ -4295,7 +4295,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         disk = porkyhud.DiskInfo("Data", "/System/Volumes/Data", 100, 50, 50)
         activity = porkyhud.DiskActivity(1024.0, 2.0, 0.0, "iostat")
         signatures = {
-            "balanced": ("EVIDENCE DETAIL", "TOP PROCESSES"),
+            "balanced": ("MEMORY", "TOP PROCESSES"),
             "compute": ("CPU WORKER CORES", "15s", "MEMORY", "TOP CPU"),
             "thermals": ("THERMAL", "FANS + TEMP SENSORS"),
             "io": ("I/O", "disk live", "net d"),
@@ -4706,7 +4706,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             porkyhud.decision_header_lines(frame, "balanced", 80, 21.0),
             (
-                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · evidence 2s",
+                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · updated 2s",
                 "No active CPU, memory, thermal, or storage pressure.",
             ),
         )
@@ -4735,7 +4735,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
                     (
                         "PorkyHUD · 1 OVERVIEW · CHECKING %d/4 core sources"
                         % ready_count,
-                        "Waiting for core evidence.",
+                        "Loading system readings.",
                     ),
                 )
 
@@ -4949,7 +4949,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
             tuple(screen.row(row).rstrip() for row in range(3)),
             (
                 "PorkyHUD · 1 OVERVIEW · CHECKING 0/4 core sources",
-                "Waiting for core evidence.",
+                "Loading system readings.",
                 "CPU CHECKING · MEM CHECKING · THERM CHECKING · DISK CHECKING",
             ),
         )
@@ -5119,7 +5119,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
                 mock.patch.object(porkyhud.time, "time", side_effect=AssertionError):
             self.assertEqual(
                 porkyhud.decision_header_lines(frame, "balanced", 80, 20.0)[0],
-                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · evidence 1s",
+                "PorkyHUD · 1 OVERVIEW · NORMAL · LIVE · updated 1s",
             )
             porkyhud.evidence_ribbon_lines(frame, 80, 20.0)
             next_y = porkyhud.draw_decision_header(
@@ -5153,7 +5153,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
             porkyhud.hud(screen)
         coordinator.close.assert_called_once_with()
         self.assertTrue(screen.row(0).startswith(
-            "PorkyHUD | 1 OVERVIEW | NORMAL | LIVE | evidence 2s"
+            "PorkyHUD | 1 OVERVIEW | NORMAL | LIVE | updated 2s"
         ))
         self.assertIn("No active CPU", screen.row(1))
         self.assertIn("CPU 10%", screen.row(2))
@@ -5161,11 +5161,12 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertIn("THERM CLEAR", screen.row(2))
         self.assertIn("DISK 50% FREE", screen.row(2))
         self.assertNotIn("Fresh core evidence", screen.row(22))
-        self.assertIn("EVIDENCE DETAIL", screen.row(10))
-        self.assertIn("TOP PROCESSES", screen.row(10))
+        self.assertIn("MEMORY", screen.row(10))
+        self.assertIn("STORAGE + I/O", screen.row(10))
+        self.assertIn("TOP PROCESSES", screen.text())
         self.assertEqual(
             screen.row(23).strip(),
-            "1-5 mode | d explore | h help | t theme | a motion | q quit",
+            "1-5 views | d all tools | Tab/Shift-Tab | / find | h help | q quit",
         )
 
     def test_pure_frame_projection_10k_mean_is_under_five_milliseconds(self) -> None:
@@ -5231,12 +5232,12 @@ class LayoutAndRenderingTests(unittest.TestCase):
         with mock.patch.object(porkyhud, "unicode_ok", return_value=True):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1–5 mode · d explore · h help · t theme · a motion · q quit",
+                "1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit",
             )
         with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1-5 mode | d explore | h help | t theme | a motion | q quit",
+                "1-5 views | d all tools | Tab/Shift-Tab | / find | h help | q quit",
             )
         for total in range(6, 24):
             system_height, power_height = porkyhud.compact_top_heights(total)
@@ -5267,7 +5268,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
                 screen.row(row)[overlay_x : overlay_x + overlay_width],
             )
         self.assertEqual(screen.cells[overlay_y][overlay_x - 1], sentinel)
-        blank_content_row = overlay_y + 13
+        blank_content_row = overlay_y + overlay_height - 2
         self.assertEqual(
             screen.row(blank_content_row)[overlay_x + 1 : overlay_x + overlay_width - 1],
             " " * (overlay_width - 2),

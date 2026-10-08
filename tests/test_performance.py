@@ -168,5 +168,95 @@ class ProcessProjectionCacheTests(unittest.TestCase):
         self.assertIsNone(coordinator._process_facts_cache._sample)
 
 
+class ProcessSearchCacheTests(unittest.TestCase):
+    def row(self, pid=42, *, state="S", command=None):
+        return porkyhud.ProcessRow(
+            pid, 30.0, 1.0, None, state, "01:00",
+            command or "/usr/bin/worker --token fixture-secret --mode café",
+        )
+
+    def test_incremental_queries_prepare_each_row_once_with_identical_results(self):
+        rows = tuple(self.row(pid) for pid in range(1, 1001))
+        queries = ("w", "wo", "worker", "WORKER 42", "--mode café",
+                   "[.*]", "fixture-secret", "", "café")
+        cache = porkyhud._ProcessSearchCache()
+        with mock.patch.object(
+                porkyhud, "_process_search_text", wraps=porkyhud._process_search_text) as prepare:
+            cached = tuple(cache.filter(rows, query) for query in queries)
+            self.assertEqual(prepare.call_count, len(rows))
+        expected = tuple(porkyhud.filter_process_rows(rows, query) for query in queries)
+        self.assertEqual(cached, expected)
+        self.assertEqual(cached[6], ())
+        self.assertNotIn("fixture-secret", repr(tuple(cache._texts.values())))
+
+    def test_metric_updates_reuse_fields_but_return_current_rows_in_current_order(self):
+        first, second = self.row(42), self.row(43)
+        cache = porkyhud._ProcessSearchCache()
+        with mock.patch.object(
+                porkyhud, "_process_search_text", wraps=porkyhud._process_search_text) as prepare:
+            cache.filter((first, second), "worker")
+            updated = replace(first, cpu=99.0, mem=8.0, gpu=12.0, etime="02:30")
+            matches = cache.filter((second, updated, second), "worker")
+            self.assertEqual(prepare.call_count, 2)
+        self.assertEqual(matches, (second, updated, second))
+        self.assertIs(matches[1], updated)
+        self.assertEqual((matches[1].cpu, matches[1].mem, matches[1].gpu,
+                          matches[1].etime), (99.0, 8.0, 12.0, "02:30"))
+        self.assertEqual(len(cache._texts), 2)
+
+    def test_mutable_search_fields_are_rebuilt_including_bool_integer_difference(self):
+        for field, before, after, old_query, new_query in (
+            ("pid", 1, True, "1", "true"),
+            ("stat", "@before", "@after", "@before", "@after"),
+            ("command", "/usr/bin/oldname", "/usr/bin/newname",
+             "oldname", "newname"),
+        ):
+            with self.subTest(field=field):
+                row = self.row()
+                setattr(row, field, before)
+                cache = porkyhud._ProcessSearchCache()
+                with mock.patch.object(
+                        porkyhud, "_process_search_text",
+                        wraps=porkyhud._process_search_text) as prepare:
+                    self.assertEqual(cache.filter((row,), old_query), (row,))
+                    setattr(row, field, after)
+                    self.assertEqual(cache.filter((row,), old_query), ())
+                    self.assertEqual(cache.filter((row,), new_query), (row,))
+                    self.assertEqual(prepare.call_count, 2)
+
+    def test_changed_command_cannot_match_old_or_new_secret_values(self):
+        row = self.row(command="/usr/bin/worker --token first-private-value")
+        cache = porkyhud._ProcessSearchCache()
+        self.assertEqual(cache.filter((row,), "first-private-value"), ())
+        row.command = "/usr/bin/worker --token second-private-value --mode revised"
+        for query in ("first-private-value", "second-private-value"):
+            self.assertEqual(cache.filter((row,), query), ())
+        self.assertEqual(cache.filter((row,), "revised"), (row,))
+        self.assertNotIn("private-value", repr(tuple(cache._texts.values())))
+
+    def test_removed_rows_are_released_even_when_query_is_empty(self):
+        rows = (self.row(1), self.row(2), self.row(3))
+        cache = porkyhud._ProcessSearchCache()
+        cache.filter(rows, "worker")
+        cache.filter(rows[2:], "")
+        self.assertEqual(set(cache._texts), {cache._key(rows[2])})
+        cache.filter((), "worker")
+        self.assertEqual(cache._texts, {})
+        with mock.patch.object(porkyhud, "_process_search_text") as prepare:
+            self.assertEqual(cache.filter(rows, ""), rows)
+            prepare.assert_not_called()
+        self.assertEqual(cache._texts, {})
+
+    def test_invalid_queries_do_not_change_prepared_fields(self):
+        rows = (self.row(),)
+        cache = porkyhud._ProcessSearchCache()
+        cache.filter(rows, "worker")
+        prepared = cache._texts
+        for query in (None, "x" * (porkyhud.SEARCH_QUERY_LIMIT + 1)):
+            with self.subTest(query_type=type(query).__name__), self.assertRaises(ValueError):
+                cache.filter(rows, query)
+            self.assertIs(cache._texts, prepared)
+
+
 if __name__ == "__main__":
     unittest.main()
