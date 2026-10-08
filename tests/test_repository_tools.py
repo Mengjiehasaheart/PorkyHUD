@@ -123,17 +123,17 @@ class RepositoryValidatorTests(unittest.TestCase):
 
     def test_inventory_and_map_report_both_mismatch_directions(self) -> None:
         validator = self.validator()
-        self.repo.write("AGENTS.md", agent_map("AGENTS.md", "gone.py"))
+        self.repo.write("CONTRIBUTING.md", agent_map("CONTRIBUTING.md", "gone.py"))
         self.repo.write("new source.py")
         self.assertEqual(
             validator.tracked_files(self.repo.root),
-            ("AGENTS.md", "new source.py"),
+            ("CONTRIBUTING.md", "new source.py"),
         )
         self.assertEqual(
             validator.validate_tracked_map(self.repo.root),
             [
-                "AGENTS map path is not tracked: gone.py",
-                "tracked file missing from AGENTS map: new source.py",
+                "contributor map path is not tracked: gone.py",
+                "tracked file missing from contributor map: new source.py",
             ],
         )
 
@@ -177,13 +177,13 @@ class RepositoryValidatorTests(unittest.TestCase):
             "        return self.field\n"
         )
         self.repo.write("module.py", source)
-        agents = agent_map("AGENTS.md", "module.py")
+        agents = agent_map("CONTRIBUTING.md", "module.py")
         agents = agents.replace(
             "## Next section",
             "Anchors: `module.py::VALUE`, `module.py::Outer.method`, "
             "and `module.py::Outer.field`.\n\n## Next section",
         )
-        self.repo.write("AGENTS.md", agents)
+        self.repo.write("CONTRIBUTING.md", agents)
         self.assertEqual(
             validator.symbol_anchors(agents),
             (
@@ -194,7 +194,7 @@ class RepositoryValidatorTests(unittest.TestCase):
         )
         self.assertEqual(validator.validate_symbol_anchors(self.repo.root), [])
         self.repo.write(
-            "AGENTS.md",
+            "CONTRIBUTING.md",
             agents.replace("Outer.method", "Outer.missing"),
         )
         self.assertEqual(
@@ -294,7 +294,7 @@ class RepositoryValidatorTests(unittest.TestCase):
         )
 
     def test_cli_has_deterministic_private_streams_and_usage_exit(self) -> None:
-        self.repo.write("AGENTS.md", agent_map("AGENTS.md", "missing.py"))
+        self.repo.write("CONTRIBUTING.md", agent_map("CONTRIBUTING.md", "missing.py"))
         validator_path = TOOLS / "validate_docs.py"
         result = subprocess.run(
             [sys.executable, str(validator_path), "--root", str(self.repo.root)],
@@ -314,7 +314,7 @@ class RepositoryValidatorTests(unittest.TestCase):
         self.assertEqual(usage.returncode, 2)
 
     def test_cli_diagnostics_never_echo_absolute_or_control_link_text(self) -> None:
-        self.repo.write("AGENTS.md", agent_map("AGENTS.md", "README.md"))
+        self.repo.write("CONTRIBUTING.md", agent_map("CONTRIBUTING.md", "README.md"))
         self.repo.write(
             "README.md",
             "[absolute](/Users/alice/private) [control](bad\x1btarget)\n",
@@ -803,8 +803,8 @@ class DemoRendererTests(unittest.TestCase):
                             "compressed", "Cache", "IOPS", "Network ↓", "CPU 60s"):
                 self.assertIn(reading, html_text)
             self.assertIn("TOP PROCESSES · CPU", html_text)
-            self.assertIn("1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit", html_text)
-            self.assertIn("Tab/Shift-Tab", html_text)
+            self.assertIn("d tools · Tab views · / find · Enter inspect · h help · q quit", html_text)
+            self.assertIn("Enter inspect", html_text)
             self.assertIn("/ search", html_text)
             self.assertIn("refresh", html_text)
             self.assertNotIn('class="navigation"', html_text)

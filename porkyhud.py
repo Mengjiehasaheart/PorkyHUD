@@ -42,6 +42,12 @@ from porkyhud_insights import (
     vm_counters_from_mapping,
 )
 from porkyhud_visual import render_mascot, wordmark_lines
+from porkyhud_tools.cli import add_arguments as add_tool_arguments, validate_arguments as validate_tool_arguments, handle as handle_tool_cli
+from porkyhud_tools.bridge import live_sample, snapshot_sample, process_projection, system_projection
+from porkyhud_tools.controller import Workbench, parse_watch_rule
+from porkyhud_tools.service import TOOLS
+from porkyhud_tools.model import ToolReport
+from porkyhud_tools.observations import ChangeTracker, replay_report, inventory_keys
 from porkyhud_inventory import (
     InventoryResult, NetworkInventory, InventoryStatus, ProbeResult,
     InventoryObservation, observe_inventory,
@@ -108,7 +114,7 @@ STEADY_STATE_COMMAND_ALLOWANCES: Mapping[str, int] = MappingProxyType({
     "powermetrics": 4,
 })
 RETRY_LAUNCH_RESERVE = 12
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 COPYRIGHT_TEXT = "Copyright (c) DMS"
 HISTORY_SECONDS = 60
 LAYOUTS = ["balanced", "compute", "thermals", "io", "processes", "insights", "devices", "network", "connections", "system", "cinema"]
@@ -253,6 +259,15 @@ class HudConfig:
     search_editing: bool = False
     searches: dict[str, str] = field(default_factory=dict)
     connection_filter: str = "all"
+    menu_query: str = ""
+    menu_search: bool = False
+    workspace_settings: dict = field(default_factory=dict)
+    record_path: str = ""
+    record_processes: bool = False
+    initial_watches: list[str] = field(default_factory=list)
+    process_cursor: int = 0
+    selected_pid: Optional[int] = None
+    inventory_cursor: int = 0
     message: str = ""
     message_until: float = 0.0
 
@@ -310,6 +325,7 @@ def select_mode(config: HudConfig, mode: str, height: int, width: int) -> str:
         )
     config.layout_index = LAYOUTS.index(mode)
     config.search_editing = False
+    config.inventory_cursor = 0
     return "%s selected" % _mode_copy_name(mode)
 
 
@@ -460,6 +476,9 @@ class ProcessRow:
     stat: str
     etime: str
     command: str
+    ppid: int = 0
+    rss_bytes: Optional[int] = None
+    start_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -4562,6 +4581,27 @@ def parse_process_rows(raw: str) -> tuple[ProcessRow, ...]:
     return tuple(rows)
 
 
+def parse_extended_process_rows(raw: str) -> tuple[ProcessRow, ...]:
+    """Parse identity and resident memory in the existing single process probe."""
+    projected, metadata = [], []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.strip().split(None, 12)
+        if len(parts) != 13:
+            raise ValueError("malformed extended process row")
+        ppid, rss = int(parts[5]), int(parts[6])
+        started = " ".join(parts[7:12])
+        datetime.strptime(started, "%a %b %d %H:%M:%S %Y")
+        if ppid < 0 or rss < 0:
+            raise ValueError("invalid extended process reading")
+        projected.append(" ".join(parts[:5]) + " " + parts[12])
+        metadata.append((ppid, rss * 1024, started))
+    rows = parse_process_rows("\n".join(projected))
+    return tuple(replace(row, ppid=ppid, rss_bytes=rss, start_id=started)
+                 for row, (ppid, rss, started) in zip(rows, metadata))
+
+
 def display_cell_width(text: str) -> int:
     """Measure terminal cells conservatively without treating combining marks as columns."""
 
@@ -4755,7 +4795,7 @@ class GPUProcessSampler:
 
 def collect_process_rows() -> AdapterResult[tuple[ProcessRow, ...]]:
     command = run_structured_command(
-        ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
+        ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,ppid=,rss=,lstart=,command="],
         category="process-table", timeout_s=2.0,
         stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
     )
@@ -4763,7 +4803,7 @@ def collect_process_rows() -> AdapterResult[tuple[ProcessRow, ...]]:
         return AdapterResult(None, command.started_mono_s, command.completed_mono_s,
                              command.completed_at_utc, command.outcome, command.failure)
     try:
-        rows = parse_process_rows(command.stdout)
+        rows = parse_extended_process_rows(command.stdout)
     except ValueError:
         return _process_evidence_error(command, command.stdout)
     return AdapterResult(rows, command.started_mono_s, command.completed_mono_s,
@@ -6831,6 +6871,7 @@ def draw_process_panel(
     sort_mode: str,
     title: Optional[str] = None,
     *, empty_message: str = "collecting processes...", identity_only: bool = False,
+    selected_pid: Optional[int] = None,
 ) -> None:
     panel_title = title or "PROCESS GRID sort=%s" % sort_mode
     draw_box(screen, y, x, h, w, panel_title, color_pair(PAIR_STRUCTURE))
@@ -6877,7 +6918,7 @@ def draw_process_panel(
                 row.pid, row.cpu, row.mem, gpu, row.stat, row.etime,
                 visible_command(command, command_width),
             )
-        attr = color_pair(PAIR_PRIMARY)
+        attr = color_pair(PAIR_PRIMARY) | (curses.A_REVERSE if row.pid == selected_pid else 0)
         _rect_add(screen, line_y, x + 1, line, w - 2, attr)
 
     first = min(len(rows), scroll + 1) if rows else 0
@@ -7119,7 +7160,7 @@ def draw_overview_body(
         effective = _clamped_process_scroll(rows, process_h, scroll)
         draw_process_panel(screen, y + metric_h, 1, process_h, width - 2,
                            rows, effective, sort_mode, title, empty_message=empty_message,
-                           identity_only=True)
+                           identity_only=True, selected_pid=config.selected_pid if config else None)
         return effective
     available = width - 4
     left_w, center_w = available // 3, available // 3
@@ -7160,7 +7201,7 @@ def draw_overview_body(
     effective = _clamped_process_scroll(rows, remaining, scroll)
     draw_process_panel(screen, y, right_x, remaining, right_w,
                        rows, effective, sort_mode, title, empty_message=empty_message,
-                       identity_only=True)
+                       identity_only=True, selected_pid=config.selected_pid if config else None)
     return effective
 
 
@@ -7226,7 +7267,69 @@ EXPLORE_OPTIONS = (
     ("network", "9", "Network", "Interfaces, addresses, route and DNS"),
     ("connections", "0", "TCP connections", "Listeners, peers and connection states"),
     ("system", "i", "This Mac", "Hardware, macOS and battery details"),
-)
+) + tuple(("tool:" + spec.key, "", spec.title, spec.group + " · " + spec.hint) for spec in TOOLS)
+
+
+def _tool_runner(cancel_event=None):
+    def run(argv, timeout_s):
+        result = run_structured_command(argv, category="tool", timeout_s=timeout_s,
+                                        stdout_limit=4 * 1024 * 1024, stderr_limit=16 * 1024,
+                                        cancel_event=cancel_event)
+        statuses = {AttemptOutcome.SUCCESS: InventoryStatus.LIVE,
+                    AttemptOutcome.TIMEOUT: InventoryStatus.TIMEOUT,
+                    AttemptOutcome.PERMISSION_DENIED: InventoryStatus.PERMISSION_DENIED,
+                    AttemptOutcome.MISSING_DEPENDENCY: InventoryStatus.MISSING,
+                    AttemptOutcome.UNSUPPORTED: InventoryStatus.UNSUPPORTED}
+        status = statuses.get(result.outcome, InventoryStatus.ERROR)
+        if result.failure is FailureCode.PERMISSION_DENIED or (
+                result.outcome is AttemptOutcome.COMMAND_ERROR
+                and re.search(r"permission denied|operation not permitted|must be root",
+                              result.stderr, re.IGNORECASE)):
+            status = InventoryStatus.PERMISSION_DENIED
+        if (argv and os.path.basename(argv[0]) in ("lsof", "ps") and result.returncode == 1
+                and not result.stdout and not result.stderr and result.outcome is AttemptOutcome.COMMAND_ERROR):
+            status = InventoryStatus.LIVE
+        return ProbeResult(result.stdout if status is InventoryStatus.LIVE else "", status,
+                           "" if status is InventoryStatus.LIVE else "Tool reading unavailable")
+    return run
+
+
+def _explore_indices(config):
+    terms = config.menu_query.casefold().split()
+    return [index for index, option in enumerate(EXPLORE_OPTIONS)
+            if all(term in " ".join(option).casefold() for term in terms)]
+
+
+def draw_workbench(screen, workbench):
+    height, width = screen.getmaxyx()
+    x, y, w, h = 2, 2, width - 4, height - 4
+    fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
+    mode = getattr(workbench, "time_mode", "REPLAY") if workbench.replay is not None else "PAUSED" if workbench.paused else "LIVE"
+    title = (workbench.report.tool.replace("-", " ") if workbench.report else "Tools") + " · " + mode
+    draw_box(screen, y, x, h, w, title.upper(), color_pair(PAIR_STRUCTURE))
+    lines = []
+    for line in workbench.lines():
+        projected = semantic_text(line, unicode_ok())
+        while display_cell_width(projected) > w - 4:
+            segment = truncate_display_cells(projected, w - 6)
+            if not segment:
+                break
+            lines.append(segment)
+            projected = "  " + projected[len(segment):]
+        lines.append(projected)
+    page = max(1, h - 5)
+    workbench.scroll = max(0, min(workbench.scroll, max(0, len(lines) - page)))
+    if workbench.report:
+        _rect_add(screen, y + 1, x + 2, workbench.report.status, w - 4, color_pair(PAIR_INFO) | curses.A_BOLD)
+    for index, line in enumerate(lines[workbench.scroll:workbench.scroll + page]):
+        _rect_add(screen, y + 2 + index, x + 2, semantic_text(line, unicode_ok()), w - 4, color_pair(PAIR_PRIMARY))
+    footer = ("Enter run · Esc back" if workbench.editing else
+              "←/→ time · PgUp/PgDn scroll · Esc quit" if getattr(workbench, "standalone", False) else
+              "←/→ time · PgUp/PgDn scroll · Esc LIVE" if workbench.replay is not None else
+              "arrows scroll · r job · o workload · v trends · Esc LIVE" if workbench.pinned_pid else
+              "arrows scroll · Space pause display · Esc LIVE")
+    _rect_add(screen, y + h - 2, x + 2, footer, w - 4, color_pair(PAIR_SECONDARY))
+
 def _inventory_probe(argv: Sequence[str], *, timeout_s: float,
                      max_output_bytes: int,
                      cancel_event: Optional[threading.Event] = None) -> ProbeResult:
@@ -7262,37 +7365,41 @@ INVENTORY_COLLECTORS = {
 }
 
 
-def inventory_lines(mode: str, result: Any) -> list[str]:
+def inventory_line_groups(mode: str, result: Any) -> list[tuple[Optional[int], str]]:
     """Readable row projection over structured, privacy-limited native facts."""
 
     if mode == "devices":
-        return ["%s · %s" % (item.kind, item.name) +
+        return [(index, "%s · %s" % (item.kind, item.name) +
                 (" | " + " · ".join(value for value in
                  (item.vendor, item.product_id, item.speed, item.parent, item.port) if value)
-                 if any((item.vendor, item.product_id, item.speed, item.parent, item.port)) else "")
-                for item in result.items]
+                 if any((item.vendor, item.product_id, item.speed, item.parent, item.port)) else ""))
+                for index, item in enumerate(result.items)]
     if mode == "network":
-        lines = ["IPv4 default route · %s · interface %s [%s]" %
+        lines = [(None, "IPv4 default route · %s · interface %s [%s]" %
                  (result.gateway or "unknown", result.default_interface or "unknown",
-                  result.route_status.value),
-                 "DNS · %s [%s]" % (", ".join(result.dns_servers) or "none reported",
-                                    result.dns_status.value),
-                 "Hardware port mapping [%s]" % result.hardware_status.value, ""]
-        for item in result.items:
-            lines.append("%s · %s · %s · MTU %s" %
+                  result.route_status.value)),
+                 (None, "DNS · %s [%s]" % (", ".join(result.dns_servers) or "none reported",
+                                    result.dns_status.value)),
+                 (None, "Hardware port mapping [%s]" % result.hardware_status.value), (None, "")]
+        for index, item in enumerate(result.items):
+            lines.append((index, "%s · %s · %s · MTU %s" %
                          (item.name, " · ".join(value for value in (item.hardware_port, item.medium) if value) or "interface",
-                          item.state, item.mtu if item.mtu is not None else "unknown"))
+                          item.state, item.mtu if item.mtu is not None else "unknown")))
             addresses = ["IPv4 " + value for value in item.ipv4]
             addresses += ["IPv6 " + value for value in item.ipv6]
             if item.mac:
                 addresses.append("MAC " + item.mac)
-            lines.append("  " + (" · ".join(addresses) or "No addresses reported"))
+            lines.append((index, "  " + (" · ".join(addresses) or "No addresses reported")))
         return lines
     if mode == "connections":
-        return ["%-12s %s  →  %s · Rx/Tx queue bytes %s/%s" %
-                (item.state, item.local, item.remote, item.recv_queue, item.send_queue)
-                for item in result.items]
+        return [(index, "%-12s %s  →  %s · Rx/Tx queue bytes %s/%s" %
+                (item.state, item.local, item.remote, item.recv_queue, item.send_queue))
+                for index, item in enumerate(result.items)]
     raise ValueError("unknown inventory view")
+
+
+def inventory_lines(mode: str, result: Any) -> list[str]:
+    return [line for _owner, line in inventory_line_groups(mode, result)]
 
 
 def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
@@ -7303,7 +7410,7 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
              "connections": "TCP CONNECTIONS"}[mode]
     draw_box(screen, y, 1, h, width - 2, title, color_pair(PAIR_STRUCTURE))
     if result is None:
-        lines = ["ERROR · collection unavailable" if error else "CHECKING · collecting bounded macOS inventory"]
+        lines = [(None, "ERROR · collection unavailable" if error else "CHECKING · collecting bounded macOS inventory")]
         status = "ERROR" if error else "CHECKING"
     else:
         query = config.search_query if config is not None else ""
@@ -7312,15 +7419,17 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
         summary = summarize_inventory(result)
         status = "ERROR" if error else ("STALE" if age_s > 30.0 and
                  result.status is InventoryStatus.LIVE else result.status.value)
-        lines = inventory_lines(mode, filtered)
+        lines = inventory_line_groups(mode, filtered)
+        if config is not None:
+            config.inventory_cursor = max(0, min(config.inventory_cursor, len(filtered.items) - 1))
         if not lines:
             if result.status is not InventoryStatus.LIVE and not retained:
                 lines = []
             else:
-                lines = ["No matches · / edit search · Esc clear" if query or connection_state != "all"
-                         else result.detail or "No matching records reported"]
+                lines = [(None, "No matches · / edit search · Esc clear" if query or connection_state != "all"
+                         else result.detail or "No matching records reported")]
         if result.status is not InventoryStatus.LIVE:
-            lines.insert(0, result.detail or "Inventory unavailable")
+            lines.insert(0, (None, result.detail or "Inventory unavailable"))
         if mode == "connections":
             totals = "%d/%d matches · totals: %d listeners · %d connected · %d other" % (
                 len(filtered.items), summary.total_count, summary.listeners,
@@ -7346,20 +7455,29 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
               width - 6, color_pair(PAIR_INFO))
     # Wrap at display-cell boundaries so narrow viewports retain every field.
     wrapped = []
-    for line in lines:
+    for owner, line in lines:
         projected = semantic_text(line, unicode_ok())
         while display_cell_width(projected) > width - 6:
             segment = truncate_display_cells(projected, width - 8)
             if not segment:
                 break
-            wrapped.append(segment)
+            wrapped.append((owner, segment))
             projected = "  " + projected[len(segment):]
-        wrapped.append(projected)
+        wrapped.append((owner, projected))
     lines = wrapped
     available = max(0, h - 6)
     effective = max(0, min(scroll, max(0, len(lines) - available)))
-    for index, line in enumerate(lines[effective:effective + available]):
-        _body_add(screen, y + 3 + index, 3, line, width - 6, color_pair(PAIR_PRIMARY))
+    selected_lines = [index for index, (owner, _line) in enumerate(lines)
+                      if config is not None and owner == config.inventory_cursor]
+    if selected_lines and available:
+        if selected_lines[0] < effective:
+            effective = selected_lines[0]
+        elif selected_lines[-1] >= effective + available:
+            effective = min(selected_lines[0], selected_lines[-1] - available + 1)
+    for index, (owner, line) in enumerate(lines[effective:effective + available]):
+        selected = config is not None and owner == config.inventory_cursor
+        _body_add(screen, y + 3 + index, 3, line, width - 6,
+                  color_pair(PAIR_PRIMARY) | (curses.A_REVERSE if selected else 0))
     note = ("Protected sockets may be hidden" if mode == "connections" else
             "No connectivity test or network changes" if mode == "network" else
             "Reported topology · serial numbers omitted")
@@ -7372,18 +7490,26 @@ def draw_inventory_body(screen: curses.window, mode: str, y: int, h: int,
 
 def draw_explore_menu(screen: curses.window, config: HudConfig) -> None:
     height, width = screen.getmaxyx()
-    w, h = min(70, width - 6), len(EXPLORE_OPTIONS) + 5
-    y, x = max(3, (height - h) // 2), (width - w) // 2
+    w, h = min(90, width - 6), min(height - 4, len(EXPLORE_OPTIONS) + 5)
+    y, x = max(2, (height - h) // 2), (width - w) // 2
     fill_rect(screen, y, x, h, w, color_pair(PAIR_PRIMARY))
     draw_box(screen, y, x, h, w, "ALL TOOLS", color_pair(PAIR_STRUCTURE))
-    for index, (_mode, key, label, description) in enumerate(EXPLORE_OPTIONS):
-        selected = index == config.menu_index
-        _rect_add(screen, y + 2 + index, x + 3,
+    indices = _explore_indices(config)
+    page = max(1, h - 5)
+    selected_position = indices.index(config.menu_index) if config.menu_index in indices else 0
+    start = max(0, min(selected_position - page + 1, max(0, len(indices) - page)))
+    _rect_add(screen, y + 1, x + 3, "Find: " + config.menu_query + ("_" if config.menu_search else "") if config.menu_query or config.menu_search else "Monitor · Inspect · Sessions · Workspaces · Share", w - 6, color_pair(PAIR_SECONDARY))
+    for visible_index, index in enumerate(indices[start:start + page]):
+        _mode, key, label, description = EXPLORE_OPTIONS[index]
+        selected = index == indices[selected_position]
+        _rect_add(screen, y + 2 + visible_index, x + 3,
                   (("› " if unicode_ok() else "> ") if selected else "  ") + key + "  " +
                   "%-21s %s" % (label, description), w - 6,
                   color_pair(PAIR_INFO if selected else PAIR_PRIMARY) |
                   (curses.A_BOLD if selected else 0))
-    _rect_add(screen, y + h - 2, x + 3, "↑/↓ select · Enter open · 1–0/i jump · Esc close", w - 6,
+    if not indices:
+        _rect_add(screen, y + 3, x + 3, "No matching tools · / edit query · Ctrl+U clear", w - 6, color_pair(PAIR_SECONDARY))
+    _rect_add(screen, y + h - 2, x + 3, "↑/↓ select · / find tool · Enter open · Esc close", w - 6,
               color_pair(PAIR_SECONDARY))
 
 
@@ -7491,7 +7617,7 @@ def draw_mode_body(
         effective = _clamped_process_scroll(row_values, operational_h, scroll)
         draw_process_panel(screen, operational_y, right_x, operational_h,
                            right_w, row_values, effective, sort_mode,
-                           empty_message=empty_processes)
+                           empty_message=empty_processes, selected_pid=config.selected_pid if config else None)
         return effective
 
     gap = 1
@@ -7513,7 +7639,7 @@ def draw_mode_body(
                           memory_values, history, operational_phase)
         effective = _clamped_process_scroll(row_values, body_h, scroll)
         draw_process_panel(screen, body_y, right_x, body_h, right_w, row_values,
-                           effective, "CPU", "TOP CPU", empty_message=empty_processes)
+                           effective, "CPU", "TOP CPU", empty_message=empty_processes, selected_pid=config.selected_pid if config else None)
         return effective
     if mode == "thermals":
         draw_thermal_panel(screen, body_y, left_x, body_h, left_w,
@@ -7527,7 +7653,7 @@ def draw_mode_body(
         return 0
     effective = _clamped_process_scroll(row_values, body_h, scroll)
     draw_process_panel(screen, body_y, 1, body_h, body_w, row_values,
-                       effective, sort_mode, empty_message=empty_processes)
+                       effective, sort_mode, empty_message=empty_processes, selected_pid=config.selected_pid if config else None)
     return effective
 
 
@@ -7545,7 +7671,7 @@ def shortcut_status(width: int, config: Optional[HudConfig] = None) -> str:
     elif config is not None and config.layout_name == "connections":
         text = "Tab · d tools · / find · f %s · Esc clear · r refresh · q quit" % config.connection_filter
     else:
-        text = "1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit"
+        text = "d tools · Tab views · / find · Enter inspect · h help · q quit"
     return semantic_text(text, unicode_ok())
 
 
@@ -7570,6 +7696,7 @@ def draw_help_overlay(screen: curses.window, config: HudConfig, sensor: SensorIn
         "1–0 / i       choose view · d all tools",
         "/             find processes or inventory",
         "Enter / Esc   apply / clear search",
+        "Enter         inspect selected process or inventory",
         "Backspace/Ctrl-U edit / erase query",
         "f             TCP: all / listeners / established / other",
         "arrows/j/k    scroll processes or inventory",
@@ -7773,9 +7900,12 @@ def hud(screen: curses.window, config: Optional[HudConfig] = None) -> None:
 
     coordinators: list[LiveHealthCoordinator] = []
     inventory_jobs: list[tuple[AsyncPoller, threading.Event]] = []
+    tool_sessions: list[Workbench] = []
     try:
-        _hud_impl(screen, coordinators, config, inventory_jobs)
+        _hud_impl(screen, coordinators, config, inventory_jobs, tool_sessions)
     finally:
+        for workbench in tool_sessions:
+            workbench.close()
         for _poller, cancellation in inventory_jobs:
             cancellation.set()
         try:
@@ -7792,6 +7922,7 @@ def _hud_impl(
     screen: curses.window, coordinators: list[LiveHealthCoordinator],
     initial_config: Optional[HudConfig] = None,
     inventory_jobs: Optional[list[tuple[AsyncPoller, threading.Event]]] = None,
+    tool_sessions: Optional[list[Workbench]] = None,
 ) -> None:
     try:
         curses.curs_set(0)
@@ -7839,7 +7970,7 @@ def _hud_impl(
     scroll = 0
     sensor = default_sensor_info()
     latest_thermal: list[Optional[OsThermalState]] = [None]
-    activity = DiskActivity()
+    activity = DiskActivity(source="unavailable")
     memory_poller = AsyncPoller(MEMORY_DETAIL_REFRESH_SECONDS, memory_detail, mem)
     swap_poller = AsyncPoller(SWAP_REFRESH_SECONDS, swap_stats)
     network_poller = AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes)
@@ -7882,6 +8013,43 @@ def _hud_impl(
     searched_query: Optional[str] = None
     matching_rows: tuple[ProcessRow, ...] = ()
     process_search_cache = _ProcessSearchCache()
+    tool_sessions = tool_sessions if tool_sessions is not None else []
+    def capture_settings():
+        result = {"mode": config.layout_name, "theme": config.theme_name.lower().replace(" ", "-"),
+                  "style": config.visual_style, "motion": ("off", "calm", "vivid")[config.animation_mode],
+                  "no_intro": not config.intro_enabled, "sort": sort_mode,
+                  "searches": dict(config.searches), "state": config.connection_filter,
+                  "watches": [asdict(rule) for rule in workbench.watch_rules]}
+        if workbench.pinned_pid and workbench.pinned_start_id:
+            result.update(pinned_pid=workbench.pinned_pid, pinned_start_id=workbench.pinned_start_id)
+        return result
+    def apply_settings(settings):
+        nonlocal sort_mode, rows_sort_mode, scroll
+        settings = settings.get("settings", settings)
+        apply_workspace(config, settings)
+        sort_mode = {"cpu": "CPU", "memory": "MEM", "gpu": "GPU"}.get(settings.get("sort", "CPU"), settings.get("sort", "CPU"))
+        rows_sort_mode, scroll = "", 0
+        init_colors(config.theme_index)
+        apply_dark_screen(screen)
+    workbench = Workbench(_tool_runner, capture_settings, apply_settings, config.record_processes)
+    tool_sessions.append(workbench)
+    if config.workspace_settings:
+        apply_settings(config.workspace_settings)
+        workbench.restore_watches(config.workspace_settings)
+    if config.record_path:
+        workbench.open("record", config.record_path)
+    for rule in config.initial_watches:
+        workbench.watch_rules.append(parse_watch_rule(rule))
+    if config.initial_watches:
+        from porkyhud_tools.profiles import WatchEngine
+        workbench.watches = WatchEngine(tuple(workbench.watch_rules))
+    last_tool_observation = None
+    normalized_rows = ()
+    normalized_raw = None
+    change_tracker = ChangeTracker()
+    pending_events = []
+    observed_inventory_key = None
+    last_battery_identity = None
 
     def quit_hud() -> None:
         # The outer hud() finally owns the single aggregate close.
@@ -7890,12 +8058,38 @@ def _hud_impl(
     while True:
         now = time.monotonic()
         height, width = screen.getmaxyx()
-        key = read_hud_key(screen, config.search_editing)
+        key = read_hud_key(screen, config.search_editing or config.menu_search or workbench.visible)
         ui_changed = False
+        workbench.poll()
+        if workbench.handle_key(key):
+            ui_changed = key != -1
+            key = -1
+        if config.show_menu and config.menu_search and key != -1:
+            code = ord(key) if isinstance(key, str) else key
+            if code in (10, 13, curses.KEY_ENTER):
+                config.menu_search = False
+            elif code == 27:
+                config.menu_query, config.menu_search = "", False
+            elif code in (8, 127, curses.KEY_BACKSPACE):
+                config.menu_query = config.menu_query[:-1]
+            elif code == 21:
+                config.menu_query = ""
+            elif isinstance(key, str) and key.isprintable() and len(config.menu_query) < 80:
+                config.menu_query += key
+            elif type(code) is int and 32 <= code < 127 and len(config.menu_query) < 80:
+                config.menu_query += chr(code)
+            indices = _explore_indices(config)
+            if indices:
+                config.menu_index = indices[0]
+            ui_changed, key = True, -1
         if edit_search(config, key):
             scroll = 0
+            config.process_cursor, config.selected_pid = 0, None
+            config.inventory_cursor = 0
             ui_changed = True
             key = -1
+        if isinstance(key, str):
+            key = ord(key)
         elif (key == 27 and config.search_query
               and not config.show_help and not config.show_menu):
             config.searches.pop(config.layout_name, None)
@@ -7918,14 +8112,30 @@ def _hud_impl(
         if not controls_enabled and key != 27:
             key = -1
         if config.show_menu:
+            indices = _explore_indices(config)
+            if indices and config.menu_index not in indices:
+                config.menu_index = indices[0]
+            position = indices.index(config.menu_index) if config.menu_index in indices else 0
             if key in (27, ord("d"), ord("D"), ord("h"), ord("?")):
                 config.show_menu = False
             elif key in (curses.KEY_DOWN, ord("j")):
-                config.menu_index = (config.menu_index + 1) % len(EXPLORE_OPTIONS)
+                if indices:
+                    config.menu_index = indices[(position + 1) % len(indices)]
             elif key in (curses.KEY_UP, ord("k")):
-                config.menu_index = (config.menu_index - 1) % len(EXPLORE_OPTIONS)
+                if indices:
+                    config.menu_index = indices[(position - 1) % len(indices)]
+            elif key == ord("/"):
+                config.menu_search = True
             elif key in (10, 13, curses.KEY_ENTER):
-                message = select_mode(config, EXPLORE_OPTIONS[config.menu_index][0], height, width)
+                selected_mode = EXPLORE_OPTIONS[config.menu_index][0] if indices else ""
+                if selected_mode.startswith("tool:"):
+                    workbench.open(selected_mode[5:])
+                    config.show_menu = False
+                    message = "Tool opened"
+                elif selected_mode:
+                    message = select_mode(config, selected_mode, height, width)
+                else:
+                    message = "No matching tools"
                 set_message(config, message)
                 if message.endswith(" selected"):
                     config.show_menu = False
@@ -7948,6 +8158,22 @@ def _hud_impl(
             config.show_menu = True
             config.menu_index = next(index for index, option in enumerate(EXPLORE_OPTIONS)
                                      if option[0] == config.layout_name)
+            ui_changed = True
+        elif key in (10, 13, curses.KEY_ENTER) and config.layout_name in ("balanced", "compute", "processes", "cinema"):
+            visible_rows = process_search_cache.filter(cpu_rows if config.layout_name == "compute" else rows, config.search_query)
+            if visible_rows:
+                selected_row = next((row for row in visible_rows if row.pid == config.selected_pid), visible_rows[max(0, min(config.process_cursor, len(visible_rows) - 1))])
+                workbench.open("process", str(selected_row.pid))
+            ui_changed = True
+        elif key in (10, 13, curses.KEY_ENTER) and inventory is not None and config.layout_name in INVENTORY_COLLECTORS:
+            selected_items = filter_inventory(inventory, config.search_query, connection_state=config.connection_filter if config.layout_name == "connections" else "all").items
+            if selected_items:
+                selected = selected_items[max(0, min(config.inventory_cursor, len(selected_items) - 1))]
+                values = asdict(selected)
+                workbench.visible = True
+                workbench.report = ToolReport("Details", "LOCAL", "Selected " + config.layout_name,
+                                               ("Field", "Value"), tuple((k, str(v)) for k, v in values.items()), data=values)
+                workbench.revision += 1
             ui_changed = True
         elif key in (ord("h"), ord("H"), ord("?")):
             config.show_help = True
@@ -8005,25 +8231,42 @@ def _hud_impl(
             sort_mode = sort_modes[(sort_modes.index(sort_mode) + 1) % len(sort_modes)]
             rows_sort_mode = ""
             scroll = 0
+            config.process_cursor, config.selected_pid = 0, None
             set_message(config, f"process sort: {sort_mode}")
             ui_changed = True
         elif key in (curses.KEY_DOWN, ord("j")):
             scroll += 1
+            config.process_cursor += 1
+            config.inventory_cursor += 1
+            config.selected_pid = None
             ui_changed = True
         elif key in (curses.KEY_UP, ord("k")):
             scroll -= 1
+            config.process_cursor = max(0, config.process_cursor - 1)
+            config.inventory_cursor = max(0, config.inventory_cursor - 1)
+            config.selected_pid = None
             ui_changed = True
         elif key == curses.KEY_NPAGE:
             scroll += 10
+            config.process_cursor += 10
+            config.inventory_cursor += 10
+            config.selected_pid = None
             ui_changed = True
         elif key == curses.KEY_PPAGE:
             scroll -= 10
+            config.process_cursor = max(0, config.process_cursor - 10)
+            config.inventory_cursor = max(0, config.inventory_cursor - 10)
+            config.selected_pid = None
             ui_changed = True
         elif key == curses.KEY_HOME:
             scroll = 0
+            config.process_cursor, config.selected_pid = 0, None
+            config.inventory_cursor = 0
             ui_changed = True
         elif key == curses.KEY_END:
             scroll = 10**9
+            config.process_cursor, config.selected_pid = 10**9, None
+            config.inventory_cursor = 10**9
             ui_changed = True
         elif key in (ord("r"), ord("R")):
             force_live = True
@@ -8125,13 +8368,15 @@ def _hud_impl(
             net_down = net_up = -1.0
             descriptive_revision += 1
         battery_poller.tick(now, force_battery)
-        sampled_battery, _battery_age, _battery_error = battery_poller.snapshot(now)
+        battery_sample = battery_poller.sample_snapshot(now)
+        sampled_battery, _battery_age, _battery_error = battery_sample.value, battery_sample.age_s, battery_sample.error
         if sampled_battery is not None and sampled_battery != battery:
             battery = sampled_battery
             descriptive_revision += 1
 
         sensor_poller.tick(now, force_sensor)
-        sampled_sensor, sensor_age, _sensor_error = sensor_poller.snapshot(now)
+        sensor_sample = sensor_poller.sample_snapshot(now)
+        sampled_sensor, sensor_age, _sensor_error = sensor_sample.value, sensor_sample.age_s, sensor_sample.error
         if sampled_sensor is not None:
             candidate_sensor = replace(sampled_sensor, sensor_sample_age_s=sensor_age)
             if (replace(candidate_sensor, sensor_sample_age_s=0.0)
@@ -8141,7 +8386,8 @@ def _hud_impl(
             coordinator.set_system_gpu_percent(sensor.gpu_active_percent)
 
         disk_activity_poller.tick(now, force_disk_activity)
-        sampled_activity, activity_age, _activity_error = disk_activity_poller.snapshot(now)
+        activity_sample = disk_activity_poller.sample_snapshot(now)
+        sampled_activity, activity_age, _activity_error = activity_sample.value, activity_sample.age_s, activity_sample.error
         if sampled_activity is not None:
             candidate_activity = replace(sampled_activity, sample_age=activity_age)
             if (replace(candidate_activity, sample_age=0.0)
@@ -8189,6 +8435,11 @@ def _hud_impl(
             if inventory_key != inventory_render_key:
                 inventory_render_key = inventory_key
                 descriptive_revision += 1
+            if observed_inventory_key != inventory_render_key and inventory is not None:
+                observed_inventory_key = inventory_render_key
+                record_keys = inventory_keys(mode, inventory.items)
+                pending_events.extend(change_tracker.update(mode, record_keys, complete=inventory.complete,
+                                      status=inventory.status.value, timestamp=utc_now().isoformat()))
         force_inventory = False
 
         network_bps = (
@@ -8213,6 +8464,40 @@ def _hud_impl(
             completed = max(0.0, frame.captured_mono_s - age)
             if not cpu_samples or completed > cpu_samples[-1][0]:
                 cpu_samples.append((completed, frame.cpu_percent))
+        if raw_rows is not normalized_raw:
+            normalized_raw = raw_rows
+            normalized_rows = process_projection(cpu_rows, process_identity)
+        process_view = frame.source_views[SourceId.PROCESS_TABLE]
+        tool_rows = normalized_rows if process_view.status is SourceViewStatus.LIVE else ()
+        workbench.rows = tool_rows
+        statuses = {"memory.stats": "CHECKING" if memory_sample.revision == 0 else "ERROR" if memory_sample.error else "STALE" if memory_sample.age_s > 6 else "LIVE",
+                    "network.totals": "CHECKING" if network_sample.revision == 0 else "ERROR" if network_sample.error else "STALE" if network_sample.age_s > 5 else "LIVE",
+                    "battery": "CHECKING" if battery_sample.revision == 0 else "ERROR" if _battery_error else "STALE" if _battery_age > 45 else "LIVE",
+                    "sensors": "CHECKING" if sensor_sample.revision == 0 else "ERROR" if _sensor_error else "STALE" if sensor_age > 45 else "LIVE",
+                    "disk.activity": "CHECKING" if activity_sample.revision == 0 else "ERROR" if _activity_error else "STALE" if activity_age > 12 else "LIVE"}
+        descriptive_revisions = {"memory.stats": memory_sample_revision, "network.totals": network_sample_revision,
+                                 "battery": battery_sample.revision, "sensors": sensor_sample.revision,
+                                 "disk.activity": activity_sample.revision}
+        observation_key = tool_observation_key(frame, descriptive_revisions, statuses)
+        if observation_key != last_tool_observation:
+            last_tool_observation = observation_key
+            battery_identity = (battery.present, battery.external_connected, battery.is_charging)
+            if last_battery_identity is not None and battery_identity != last_battery_identity and not _battery_error:
+                pending_events.append({"timestamp": utc_now().isoformat(), "kind": "power", "label": "Charging or power source changed"})
+            last_battery_identity = battery_identity if not _battery_error else None
+            revisions = {key.value: view.last_valid_revision or 0 for key, view in frame.source_views.items()}
+            revisions.update(descriptive_revisions)
+            ages = {key.value: view.age_s or 0 for key, view in frame.source_views.items()}
+            ages.update({"memory.stats": memory_sample.age_s, "battery": _battery_age,
+                         "network.totals": network_sample.age_s, "sensors": sensor_age, "disk.activity": activity_age})
+            sample = live_sample(frame, mem, battery, sensor, activity, net_down, net_up,
+                                 max(0.0, now - intro_started), statuses=statuses, revisions=revisions, ages=ages)
+            sample["system"] = system_projection(static, mem)
+            sample["process_source"] = {"status": process_view.status.value,
+                                        "revision": process_view.last_valid_revision or 0,
+                                        "age_s": process_view.age_s or 0}
+            sample["events"], pending_events = pending_events[:128], []
+            workbench.observe(sample, tool_rows, observed_mono_s=now)
         force_live = False
         force_memory = False
         force_swap = False
@@ -8239,6 +8524,7 @@ def _hud_impl(
             config.theme_index, config.animation_mode, config.layout_index,
             config.show_help, config.show_menu, config.menu_index, config.visual_style, intro_active, active_message, sort_mode, scroll,
             config.search_editing, config.search_query, config.connection_filter,
+            config.menu_query, config.menu_search, workbench.revision,
         )
         render_age_key = _render_age_key(frame, sensor, activity, now)
         should_render = (
@@ -8294,6 +8580,12 @@ def _hud_impl(
                 if body_rows is not searched_rows or config.search_query != searched_query:
                     searched_rows, searched_query = body_rows, config.search_query
                     matching_rows = process_search_cache.filter(body_rows, searched_query)
+                if config.layout_name in ("balanced", "compute", "processes", "cinema") and matching_rows:
+                    if config.selected_pid is not None:
+                        config.process_cursor = next((index for index, row in enumerate(matching_rows) if row.pid == config.selected_pid), config.process_cursor)
+                    config.process_cursor = max(0, min(config.process_cursor, len(matching_rows) - 1))
+                    config.selected_pid = matching_rows[config.process_cursor].pid
+                    scroll = config.process_cursor
                 render_static = dict(static)
                 if "boot_seconds" in static:
                     render_static["uptime_seconds"] = uptime_at_start + max(0, int(now - uptime_clock_start))
@@ -8309,8 +8601,16 @@ def _hud_impl(
                     draw_explore_menu(screen, config)
                 if config.show_help:
                     draw_help_overlay(screen, config, sensor)
+                if workbench.visible:
+                    draw_workbench(screen, workbench)
 
                 status = shortcut_status(width, config)
+                if workbench.notices:
+                    status = "PERSONAL WATCH · " + str(workbench.notices[0].get("message", "Watch active")) + " · d tools"
+                elif workbench.recording is not None:
+                    status = "RECORDING · d tools to stop · " + status
+                elif workbench.profile_name:
+                    status = workbench.profile_name + " · " + status
                 if config.message and now < config.message_until and not config.search_editing and not config.search_query:
                     status = semantic_text(config.message + " · q quit", unicode_ok())
                 safe_add(
@@ -8875,6 +9175,186 @@ def print_text_snapshot(snapshot: dict[str, Any]) -> None:
         print(f"  {row['pid']:>6} CPU {row['cpu']:5.1f}% MEM {row['mem']:4.1f}% GPU {gpu_text}  {visible_command(row['command'], 72)}")
 
 
+def apply_workspace(config: HudConfig, settings: Mapping[str, Any]) -> None:
+    mode = settings.get("mode")
+    if mode in LAYOUTS:
+        config.layout_index = LAYOUTS.index(mode)
+    theme = settings.get("theme")
+    if theme:
+        config.theme_index = next(index for index, item in enumerate(THEMES)
+                                  if item["name"].lower().replace(" ", "-") == theme)
+    if settings.get("style"):
+        config.visual_style = settings["style"]
+    if settings.get("motion"):
+        config.animation_mode = ("off", "calm", "vivid").index(settings["motion"])
+    if "no_intro" in settings:
+        config.intro_enabled = not settings["no_intro"]
+    if "searches" in settings:
+        config.searches = dict(settings["searches"])
+    if settings.get("search"):
+        config.searches[config.layout_name] = settings["search"]
+    config.connection_filter = settings.get("state", config.connection_filter)
+
+
+class TerminationSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def install_terminal_signal_handlers() -> dict[int, Any]:
+    def terminate(signum: int, _frame: Any) -> None:
+        raise TerminationSignal(signum)
+    previous = {}
+    for name in ("SIGHUP", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            try:
+                previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, terminate)
+            except (OSError, RuntimeError, ValueError):
+                previous.pop(signum, None)
+    return previous
+
+
+def restore_terminal_signal_handlers(previous: Mapping[int, Any]) -> None:
+    for signum, handler in previous.items():
+        try:
+            signal.signal(signum, handler)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
+def _run_replay(session):
+    """Replay starts no telemetry adapters, discovery, or pollers."""
+    if terminal_ui_problem():
+        return False
+    from types import SimpleNamespace
+    def render(screen):
+        init_colors(3)
+        screen.keypad(True)
+        screen.timeout(100)
+        index = 0
+        scroll = 0
+        while True:
+            report = replay_report(session, index)
+            state = SimpleNamespace(report=report, replay=session, paused=False, scroll=scroll,
+                                    editing=False, pinned_pid=None, lines=report.lines, standalone=True)
+            screen.erase()
+            if min(screen.getmaxyx()) < 8:
+                safe_add(screen, 0, 0, "Enlarge terminal · q quit")
+            else:
+                draw_workbench(screen, state)
+                scroll = state.scroll
+            screen.refresh()
+            key = screen.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return
+            if key in (curses.KEY_RIGHT, curses.KEY_DOWN, ord("j"), ord(" ")):
+                index = min(len(session.get("samples", ())) - 1, index + 1)
+                scroll = 0
+            elif key in (curses.KEY_LEFT, curses.KEY_UP, ord("k")):
+                index = max(0, index - 1)
+                scroll = 0
+            elif key == curses.KEY_HOME:
+                index, scroll = 0, 0
+            elif key == curses.KEY_END:
+                index, scroll = max(0, len(session.get("samples", ())) - 1), 0
+            elif key == curses.KEY_NPAGE:
+                scroll += 10
+            elif key == curses.KEY_PPAGE:
+                scroll = max(0, scroll - 10)
+    previous_handlers = install_terminal_signal_handlers()
+    try:
+        enforce_dark_terminal()
+        curses.wrapper(render)
+    except KeyboardInterrupt:
+        pass
+    except TerminationSignal as exc:
+        raise SystemExit(128 + exc.signum)
+    finally:
+        if os.environ.get("NO_COLOR") is None:
+            restore_terminal_colors()
+        restore_terminal_signal_handlers(previous_handlers)
+    return True
+
+
+def tool_observation_key(frame, revisions, statuses):
+    """Emit cached frames on successful samples and on unavailable transitions."""
+    return (tuple((key.value, view.last_valid_revision, view.status.value)
+                  for key, view in frame.source_views.items()),
+            tuple(sorted(revisions.items())), tuple(sorted(statuses.items())))
+
+
+def _record_stream(duration, include_processes=False):
+    """Headless session adapter over the existing live collector contracts."""
+    coordinator = LiveHealthCoordinator()
+    pollers = {"memory": AsyncPoller(MEMORY_DETAIL_REFRESH_SECONDS, memory_detail),
+               "battery": AsyncPoller(BATTERY_REFRESH_SECONDS, battery_info, _checking_battery()),
+               "network": AsyncPoller(NETWORK_REFRESH_SECONDS, network_bytes),
+               "activity": AsyncPoller(DISK_ACTIVITY_REFRESH_SECONDS, disk_activity),
+               "sensors": AsyncPoller(OPTIONAL_SENSOR_REFRESH_SECONDS, sensor_info)}
+    start = time.monotonic()
+    previous_observation, network_revision, baseline = None, 0, None
+    network_rates = (None, None)
+    try:
+        while time.monotonic() - start <= duration:
+            now = time.monotonic()
+            coordinator.observe_time(now, utc_now())
+            frame = coordinator.tick(now)
+            samples = {}
+            for name, poller in pollers.items():
+                poller.tick(now)
+                samples[name] = poller.sample_snapshot(now)
+            net = samples["network"]
+            if net.error:
+                baseline, network_rates = None, (None, None)
+            if net.revision != network_revision:
+                network_revision = net.revision
+                if net.error or net.value is None:
+                    baseline, network_rates = None, (None, None)
+                else:
+                    baseline, rates = _network_rate_update(baseline, net.value, net.completed_mono_s)
+                    network_rates = rates or (None, None)
+            names = {"memory": "memory.stats", "battery": "battery", "network": "network.totals", "activity": "disk.activity", "sensors": "sensors"}
+            budgets = {"memory": 6, "battery": 45, "network": 5, "activity": 12, "sensors": 45}
+            statuses = {names[name]: "CHECKING" if sample.revision == 0 else "ERROR" if sample.error else "STALE" if sample.age_s > budgets[name] else "LIVE" for name, sample in samples.items()}
+            revisions = {key.value: view.last_valid_revision or 0 for key, view in frame.source_views.items()}
+            revisions.update({names[name]: sample.revision for name, sample in samples.items()})
+            observation_key = tool_observation_key(frame, revisions, statuses)
+            if observation_key != previous_observation:
+                previous_observation = observation_key
+                ages = {key.value: view.age_s or 0 for key, view in frame.source_views.items()}
+                ages.update({names[name]: sample.age_s for name, sample in samples.items()})
+                result = live_sample(frame, samples["memory"].value or {}, samples["battery"].value or _checking_battery(),
+                                     samples["sensors"].value or default_sensor_info(), samples["activity"].value or DiskActivity(source="unavailable"),
+                                     *network_rates, now - start, statuses=statuses,
+                                     revisions=revisions, ages=ages)
+                process_view = frame.source_views[SourceId.PROCESS_TABLE]
+                result["process_source"] = {"status": process_view.status.value,
+                                           "revision": process_view.last_valid_revision or 0,
+                                           "age_s": process_view.age_s or 0}
+                if include_processes:
+                    process_rows = sort_process_rows(coordinator.process_rows(now), "CPU") if process_view.status is SourceViewStatus.LIVE else ()
+                    result["processes"] = list(process_projection(process_rows[:64], process_identity))
+                    result["processes_complete"], result["processes_truncated"] = False, len(process_rows) > 64
+                yield result
+            time.sleep(0.05)
+    finally:
+        try:
+            coordinator.close()
+        finally:
+            for poller in pollers.values():
+                poller.close(1.5)
+
+
+def _checking_battery():
+    return BatteryInfo(percent=None, present=False, source="Power", state="checking", remaining="checking",
+                       external_connected=False, is_charging=False, fully_charged=False,
+                       cycle_count=None, design_cycles=None, health_percent=None, temp_c=None,
+                       virtual_temp_c=None, voltage_v=None, amperage_a=None, charger_watts=None, charger_name="")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="PorkyHUD macOS system monitor and tools.",
@@ -8923,6 +9403,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="TCP state filter; selects Connections unless a mode is specified")
     parser.add_argument("--no-intro", action="store_true",
                         help="skip the brief launch flourish")
+    add_tool_arguments(parser)
     args = parser.parse_args(argv)
     if args.setup_sensors:
         return install_sensor_access()
@@ -8930,6 +9411,57 @@ def main(argv: list[str] | None = None) -> int:
         return remove_sensor_access()
     if args.sensor_access_status:
         return print_sensor_access_status()
+    validate_tool_arguments(args, parser)
+    profile_settings = {}
+    if args.workspace:
+        from porkyhud_tools.profiles import load_profile
+        try:
+            profile_settings = load_profile(args.workspace)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc) if isinstance(exc, ValueError) else "Workspace could not be loaded")
+    initial_config = HudConfig(intro_enabled=not args.no_intro and args.motion != "off")
+    apply_workspace(initial_config, profile_settings)
+    if args.mode:
+        initial_config.layout_index = LAYOUTS.index("balanced" if args.mode == "overview" else args.mode)
+    elif args.state is not None:
+        initial_config.layout_index = LAYOUTS.index("connections")
+    if args.theme:
+        initial_config.theme_index = next(index for index, item in enumerate(THEMES) if item["name"].lower().replace(" ", "-") == args.theme)
+    if args.style:
+        initial_config.visual_style = args.style
+    if args.motion:
+        initial_config.animation_mode = ("off", "calm", "vivid").index(args.motion)
+    if args.no_intro or args.motion == "off":
+        initial_config.intro_enabled = False
+    if args.search:
+        initial_config.searches[initial_config.layout_name] = args.search
+    if args.state:
+        initial_config.connection_filter = args.state
+    try:
+        parsed_watches = [parse_watch_rule(value) for value in args.watch]
+    except ValueError as exc:
+        parser.error(str(exc))
+    settings = {**profile_settings, "mode": initial_config.layout_name,
+                "theme": initial_config.theme_name.lower().replace(" ", "-"), "style": initial_config.visual_style,
+                "motion": ("off", "calm", "vivid")[initial_config.animation_mode], "no_intro": not initial_config.intro_enabled,
+                "searches": dict(initial_config.searches), "state": initial_config.connection_filter,
+                "watches": profile_settings.get("watches", []) + [asdict(rule) for rule in parsed_watches]}
+    def support_sample():
+        snapshot = collect_snapshot()
+        sample = snapshot_sample(snapshot)
+        if args.include_processes:
+            sample["processes"] = [{"pid": row["pid"], "start_id": row.get("start_id") or None,
+                                   "ppid": row.get("ppid", 0), "name": process_identity(row["command"]),
+                                   "cpu_pct": row["cpu"], "rss_bytes": row.get("rss_bytes"), "state": row["stat"]}
+                                  for row in snapshot.get("processes", ())]
+            sample["processes_complete"], sample["processes_truncated"] = False, True
+        return sample
+    tool_exit = handle_tool_cli(args, runner=_tool_runner(),
+                               process_rows=lambda: process_projection(collect_process_rows().value or (), process_identity),
+                               capture_sample=support_sample, record_stream=lambda duration: (_record_stream(duration, include_processes=True) if args.include_processes else _record_stream(duration)),
+                               replay_ui=_run_replay, settings=settings)
+    if tool_exit is not None:
+        return tool_exit
     if args.state is not None:
         if args.inspect and args.inspect != "connections":
             parser.error("--state applies to --inspect connections")
@@ -8979,47 +9511,19 @@ def main(argv: list[str] | None = None) -> int:
         print("Use `porkyhud --snapshot` or run it from a full terminal.", file=sys.stderr)
         return 2
 
-    class TerminationSignal(BaseException):
-        def __init__(self, signum: int) -> None:
-            super().__init__(signum)
-            self.signum = signum
-
-    def terminate(signum: int, _frame: Any) -> None:
-        raise TerminationSignal(signum)
-
     previous_signal_handlers: dict[int, Any] = {}
     manage_terminal_colors = False
     try:
-        for signal_name in ("SIGHUP", "SIGTERM"):
-            signum = getattr(signal, signal_name, None)
-            if signum is None:
-                continue
-            try:
-                previous_signal_handlers[signum] = signal.getsignal(signum)
-                signal.signal(signum, terminate)
-            except (OSError, RuntimeError, ValueError):
-                previous_signal_handlers.pop(signum, None)
-
+        previous_signal_handlers = install_terminal_signal_handlers()
         manage_terminal_colors = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
         enforce_dark_terminal()
-        if any((args.theme, args.style, args.motion, args.mode, args.no_intro, args.search, args.state)):
-            config = HudConfig(intro_enabled=not args.no_intro and args.motion != "off")
-            if args.theme:
-                config.theme_index = next(index for index, theme in enumerate(THEMES)
-                                          if theme["name"].lower().replace(" ", "-") == args.theme)
-            if args.style:
-                config.visual_style = args.style
-            if args.motion:
-                config.animation_mode = ("off", "calm", "vivid").index(args.motion)
-            if args.mode:
-                config.layout_index = LAYOUTS.index("balanced" if args.mode == "overview" else args.mode)
-            elif args.state is not None:
-                config.layout_index = LAYOUTS.index("connections")
-            if args.search:
-                config.searches[config.layout_name] = args.search
-            if args.state is not None:
-                config.connection_filter = args.state
-            curses.wrapper(lambda screen: hud(screen, config))
+        if any((args.theme, args.style, args.motion, args.mode, args.no_intro, args.search, args.state, args.workspace, args.watch, args.record)):
+            if args.state is not None and not args.mode:
+                initial_config.layout_index = LAYOUTS.index("connections")
+            initial_config.workspace_settings = {**settings, "mode": initial_config.layout_name}
+            initial_config.record_path = args.record or ""
+            initial_config.record_processes = args.include_processes
+            curses.wrapper(lambda screen: hud(screen, initial_config))
         else:
             curses.wrapper(hud)
         return 0
@@ -9033,11 +9537,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if manage_terminal_colors:
             restore_terminal_colors()
-        for signum, previous_handler in previous_signal_handlers.items():
-            try:
-                signal.signal(signum, previous_handler)
-            except (OSError, RuntimeError, ValueError):
-                pass
+        restore_terminal_signal_handlers(previous_signal_handlers)
 
 
 if __name__ == "__main__":

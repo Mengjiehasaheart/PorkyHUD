@@ -114,7 +114,7 @@ def tracked_files(root: Path) -> Tuple[str, ...]:
 
 
 def mapped_files(agent_text: str) -> Tuple[str, ...]:
-    """Parse the strict body of AGENTS.md's canonical tracked-file table."""
+    """Parse the strict body of CONTRIBUTING.md's canonical tracked-file table."""
 
     lines = agent_text.splitlines()
     headings = [index for index, line in enumerate(lines) if line == MAP_HEADING]
@@ -187,13 +187,13 @@ def validate_tracked_map(root: Path) -> List[str]:
     """Report inventory/map mismatches in deterministic order."""
 
     inventory = set(tracked_files(root))
-    mapped = set(mapped_files(_read_text(root, "AGENTS.md")))
+    mapped = set(mapped_files(_read_text(root, "CONTRIBUTING.md")))
     errors = [
-        "AGENTS map path is not tracked: %s" % path
+        "contributor map path is not tracked: %s" % path
         for path in sorted(mapped - inventory)
     ]
     errors.extend(
-        "tracked file missing from AGENTS map: %s" % path
+        "tracked file missing from contributor map: %s" % path
         for path in sorted(inventory - mapped)
     )
     return sorted(errors)
@@ -257,9 +257,9 @@ def _python_symbols(source: str, path: str) -> set[str]:
 
 
 def validate_symbol_anchors(root: Path) -> List[str]:
-    """Validate mapped-path existence and AGENTS-only Python AST anchors."""
+    """Validate mapped-path existence and contributor Python AST anchors."""
 
-    agents = _read_text(root, "AGENTS.md")
+    agents = _read_text(root, "CONTRIBUTING.md")
     errors: List[str] = []
     for path in mapped_files(agents):
         exact, mismatch = _exact_path_status(root, path)

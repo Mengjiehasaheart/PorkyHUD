@@ -4074,7 +4074,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
             "1": ("1 OVERVIEW", "MEMORY", "Overview"),
             "2": ("2 COMPUTE", "TOP CPU", "Compute"),
             "3": ("3 THERMALS", "FANS + TEMP SENSORS", "Thermals"),
-            "4": ("4 I/O", "disk live", "I/O"),
+            "4": ("4 I/O", "disk activity unavailable", "I/O"),
             "5": ("5 PROCESSES", "PROCESS GRID sort=CPU", "Processes"),
         }
         for key, (mode_label, body_signature, display_name) in expected.items():
@@ -5166,7 +5166,7 @@ class LayoutAndRenderingTests(unittest.TestCase):
         self.assertIn("TOP PROCESSES", screen.text())
         self.assertEqual(
             screen.row(23).strip(),
-            "1-5 views | d all tools | Tab/Shift-Tab | / find | h help | q quit",
+            "d tools | Tab views | / find | Enter inspect | h help | q quit",
         )
 
     def test_pure_frame_projection_10k_mean_is_under_five_milliseconds(self) -> None:
@@ -5232,12 +5232,12 @@ class LayoutAndRenderingTests(unittest.TestCase):
         with mock.patch.object(porkyhud, "unicode_ok", return_value=True):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit",
+                "d tools · Tab views · / find · Enter inspect · h help · q quit",
             )
         with mock.patch.object(porkyhud, "unicode_ok", return_value=False):
             self.assertEqual(
                 porkyhud.shortcut_status(76),
-                "1-5 views | d all tools | Tab/Shift-Tab | / find | h help | q quit",
+                "d tools | Tab views | / find | Enter inspect | h help | q quit",
             )
         for total in range(6, 24):
             system_height, power_height = porkyhud.compact_top_heights(total)
@@ -5452,8 +5452,8 @@ class ProcessEvidenceTests(unittest.TestCase):
     """Process and AGX evidence contracts keep absence distinct from unknown."""
 
     PS_FIXTURE = (
-        "  42 80.0 2.0 R 00:10 /Applications/Xcode.app/Contents/MacOS/Xcode --token secret\n"
-        "   7  4.0 1.5 S 01:02 /usr/bin/worker --mode test\n"
+        "  42 80.0 2.0 R 00:10 1 4096 Thu Oct 8 10:00:00 2026 /Applications/Xcode.app/Contents/MacOS/Xcode --token secret\n"
+        "   7  4.0 1.5 S 01:02 1 2048 Thu Oct 8 10:00:00 2026 /usr/bin/worker --mode test\n"
     )
     AGX_FIRST = """
 +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1, !registered, !matched, active, busy 0, retain 5>
@@ -5507,7 +5507,7 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.assertEqual([row.pid for row in result.value or ()], [42, 7])
         self.assertTrue(all(row.gpu is None for row in result.value or ()))
         command.assert_called_once_with(
-            ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,command="],
+            ["/bin/ps", "-axo", "pid=,pcpu=,pmem=,stat=,etime=,ppid=,rss=,lstart=,command="],
             category="process-table", timeout_s=2.0,
             stdout_limit=8 * 1024 * 1024, stderr_limit=64 * 1024,
         )
@@ -6847,8 +6847,8 @@ Pages occupied by compressor: 0.
 
     def test_process_collection_and_sorting_are_separate_and_stable(self) -> None:
         raw = """
-          10  12.5  1.2 R  00:01 /usr/bin/alpha --token hidden
-          20   5.0  9.5 S  01:02 /usr/bin/beta --mode worker
+          10  12.5  1.2 R  00:01 1 4096 Thu Oct 8 10:00:00 2026 /usr/bin/alpha --token hidden
+          20   5.0  9.5 S  01:02 1 2048 Thu Oct 8 10:00:00 2026 /usr/bin/beta --mode worker
         """
         result = porkyhud.CommandResult(
             "process-table", raw, "", 0, 10.0, 10.2,

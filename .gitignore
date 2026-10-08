@@ -5,6 +5,10 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+AGENTS.md
+**/AGENTS.md
+.porkyhud/
+*.porky-session.jsonl
 assets/demo-frames/
 tools/*
 !tools/validate_docs.py

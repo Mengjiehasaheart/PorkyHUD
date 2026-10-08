@@ -148,7 +148,7 @@ class ExploreFlowTests(DashboardHarness):
     def test_menu_opens_selected_view_with_arrows_and_enter(self):
         for keys, expected in (
             ([ord("d"), porkyhud.curses.KEY_DOWN, 10, ord("q")], "compute"),
-            ([ord("d"), porkyhud.curses.KEY_UP, 13, ord("q")], "system"),
+            ([ord("d"), ord("i"), -1, ord("q")], "system"),
         ):
             with self.subTest(mode=expected):
                 screen, config, coordinator, _pollers, captured, _body = self.run_dashboard(keys)
@@ -559,7 +559,7 @@ class InventoryShutdownTests(unittest.TestCase):
         coordinator = mock.Mock()
         coordinator.close.side_effect = RuntimeError("coordinator cleanup fixture")
 
-        def populated_impl(_screen, coordinators, _config, inventory_jobs):
+        def populated_impl(_screen, coordinators, _config, inventory_jobs, tool_sessions):
             coordinators.append(coordinator)
             inventory_jobs.extend((Poller(), event) for event in cancellations)
 

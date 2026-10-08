@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "porkyhud"
-version = "0.2.1"
+version = "0.3.0"
 description = "Terminal-first Apple Silicon system HUD for macOS."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -51,3 +51,4 @@ porkhud = "porkyhud:main"
 
 [tool.setuptools]
 py-modules = ["porkyhud", "porkyhud_core", "porkyhud_insights", "porkyhud_visual", "porkyhud_inventory"]
+packages = ["porkyhud_tools"]

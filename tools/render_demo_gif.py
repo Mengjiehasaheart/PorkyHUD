@@ -226,7 +226,7 @@ def render_html(frame: int, frames: int) -> str:
     <div class="workload-note">10 processes · 1–10 · ↑↓/Pg scroll · m sort · / search</div>
   </section>
   <footer class="footer">
-    <span>1–5 views · d all tools · Tab/Shift-Tab · / find · h help · q quit</span>
+    <span>d tools · Tab views · / find · Enter inspect · h help · q quit</span>
   </footer>
 </main>
 </body>
@@ -343,10 +343,10 @@ def render(root: Path, output: str, frames: int, fps: int) -> Path:
                 "-i", os.fspath(temp / "frame-%03d.png"),
                 "-vf",
                 "fps=%d,scale=%d:-1:flags=lanczos,split[s0][s1];"
-                "[s0]palettegen=max_colors=128:stats_mode=diff[p];"
+                "[s0]palettegen=max_colors=128:reserve_transparent=0:stats_mode=full[p];"
                 "[s1][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle"
                 % (fps, WIDTH),
-                "-loop", "0", os.fspath(encoded),
+                "-gifflags", "0", "-loop", "0", os.fspath(encoded),
             ],
             60.0,
             "ffmpeg GIF encode",

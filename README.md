@@ -1,6 +1,6 @@
 # PorkyHUD
 
-PorkyHUD is a dependency-free terminal dashboard for Apple Silicon Macs. Watch CPU, memory, temperatures, battery, storage, network traffic, and active processes together, then explore your devices, network settings, and TCP connections. Its health summary uses four specific checks: sustained CPU use, macOS memory pressure, macOS thermal warnings, and writable storage headroom.
+PorkyHUD is a dependency-free terminal dashboard and inspection toolkit for Apple Silicon Macs. Watch your system together, inspect workloads and port owners, explore storage and sleep requests, record sessions, and compare runs. Its health summary uses four specific checks: sustained CPU use, macOS memory pressure, macOS thermal warnings, and writable storage headroom.
 
 <p align="center">
   <img src="assets/porkyhud-demo.gif" alt="PorkyHUD dashboard with fixed synthetic readings" width="960">
@@ -25,7 +25,14 @@ The latest published Homebrew formula may lag this source checkout. The checkout
 instructions below match the behavior documented on this page; verify the formula's
 published version before expecting the features shown here.
 
-Installed packages from version 0.2.1 also provide `porkhud` as an alias for `porkyhud`.
+Installed packages also provide `porkhud` as an alias for `porkyhud`.
+
+To install the current checkout into your Python environment:
+
+```bash
+python3 -m pip install .
+porkyhud
+```
 
 Optional one-time advanced sensor setup:
 
@@ -68,7 +75,7 @@ Fonts and text size belong to your terminal profile. Use a monospace font with B
 
 ## Explore your Mac
 
-Press `Tab` to move to the next view, `Shift+Tab` to go back, or `d` to open the view menu. The footer shows available views and relevant tools. Use arrows and Enter in the menu, or select a view directly:
+Press `Tab` to move to the next view, `Shift+Tab` to go back, or `d` to open All Tools. Press `/` in the menu to find a tool, Enter to apply the query, then Enter to open it. The menu scrolls to fit your terminal. The footer shows relevant controls. Select a view directly:
 
 | Key | View | What it reports |
 | --- | --- | --- |
@@ -82,7 +89,7 @@ Press `/` to search processes or Devices, Network, and Connections. Type a query
 
 Scroll long lists with arrows, PageUp/PageDown, or Home/End. `r` refreshes the selected view and live readings. Discovery runs only while its view is selected: connections refresh every 10 seconds; devices and network every 30 seconds. The dashboard stays responsive during discovery.
 
-These are local, read-only observations. PorkyHUD does not scan remote hosts, identify a service from its port, test Internet reachability, or change devices, routes or firewall rules. Link speed and topology appear only when macOS exposes them. TCP visibility can be partial, especially for protected processes; lists cap at 128 records and explicitly show truncation. A displayed peer is an observed socket endpoint, not proof of a server's identity or availability.
+These views are passive local observations. Link speed and topology appear only when macOS exposes them. TCP visibility can be partial, especially for protected processes; lists cap at 128 records and explicitly show truncation. A peer endpoint does not establish a server's identity or availability. Optional network tests below run only when explicitly selected. PorkyHUD does not change devices, routes or firewall rules.
 
 Use the same views from scripts or a terminal without curses:
 
@@ -99,6 +106,77 @@ porkyhud --mode system
 `--search TEXT` starts with a search filter and also works with `--inspect`. `--state all|listeners|established|other` filters TCP connections: it selects that live view unless an incompatible `--mode` is explicitly supplied, and works with `--inspect connections`. Snapshot reports without `--inspect` reject these filters.
 
 Inventory JSON is unversioned. `--inspect` chooses the report; `--json` chooses its format. The report includes a `summary` of the original returned records and a `filter` section with the query, selected TCP group, and matching/returned counts; completeness and truncation still describe collection. Sensor setup/status/removal flags retain precedence over reports. Device serial numbers and process commands are omitted from inventories, but friendly device names, IP/MAC addresses and remote endpoints can be sensitive. Review reports before sharing them.
+
+## Professional tools
+
+All Tools groups inspection, sessions, workspaces and sharing alongside the existing views. Arrows highlight a process or inventory entry; Enter opens its details. `Esc` returns to the dashboard; collection continues while a detail panel is open or its display is paused.
+
+| Tool | Useful details |
+| --- | --- |
+| Process details | Fresh process identity, parent, state, visible open files and sockets. File paths are shortened; protected resources may be hidden. |
+| Workload explorer | Parent/child grouping, observed CPU sum and summed resident memory. Shared pages can be counted more than once. |
+| Port owner | Visible local TCP and UDP owners and bind addresses. An empty result does not establish that a port is free. |
+| Network checks | Explicit target, DNS resolution, route, TCP timing and verified TLS status/certificate dates. One bounded test; no host scanning. |
+| Network quality | An explicitly started traffic test using macOS `networkQuality`, reporting throughput and responsiveness when exposed. The HUD requires typing `START`. |
+| Interface counters | Per-interface bytes and available packet error/drop counters. Local errors are separate from end-to-end packet loss. |
+| Storage map | Disks, reported APFS physical stores, shared containers, volumes and bounded snapshot discovery. Snapshot presence does not establish reclaimable bytes. |
+| Folder size and growth | Largest children and logical size inside one chosen folder. Repeat the same scan in the HUD to compare growth. Symlinks and other volumes are excluded. |
+| Sleep requests | Visible processes requesting wakefulness, request duration and reported reason. |
+| Power timeline | Observed charging/source changes, battery levels and available measured power/temperature ranges. |
+| Watch a local job | Pin an existing process tree, follow its readings and optionally read a small progress JSON file. Exited does not mean successful. |
+
+Pinned process details offer `o` for workload, `v` for retained process trends and `r` for job details. Job/workload views update from the existing process table while selected. Start identity prevents joining different observed processes that reuse an ID; macOS `ps` reports start time with one-second precision.
+
+```bash
+porkyhud --tool process --target 12345
+porkyhud --tool workload --target 12345 --json
+porkyhud --tool port --target 3000
+porkyhud --tool diagnose --target example.com:443
+porkyhud --tool interfaces
+porkyhud --tool storage
+porkyhud --tool folder --target ./my-project --json
+porkyhud --tool sleep
+porkyhud --tool job --target 12345 --progress-file ./progress.json
+```
+
+Use an actual PID from Processes. A progress file can contain `{"current":25,"total":100,"status":"processing"}`; PorkyHUD displays reported counters without predicting completion time. Files must be regular and at most 64 KiB.
+
+Folder scans run in a cancellable worker, with a 10-second, 100,000-entry and depth limit checked between filesystem calls. A filesystem call can itself stall. Partial scans retain visited counts and their stopping reason. Nothing is deleted.
+
+Apple describes [process hierarchy](https://support.apple.com/guide/activity-monitor/actmntr1001/mac), [sleep requests](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheAppLevel.html) and [network responsiveness testing](https://developer.apple.com/videos/play/wwdc2022/10078/).
+
+## Sessions and workspaces
+
+Session timeline keeps up to 600 recent frames and 16 MiB in memory, using existing collector completions. It shows current readings, distinct-sample means/peaks, units, status and changes. Left arrow opens historical frames; arrows move through time. `Space` pauses the displayed summary while collection continues, and `Esc` returns to LIVE.
+
+Bookmarks label builds, analyses or slowdowns. Device, interface and connection changes are recorded while those inventories are selected and return complete readings. Failed/partial discovery starts a new baseline; it does not invent a disconnection. Charging changes use the existing battery source.
+
+Start and stop a disk recording from All Tools, or use:
+
+```bash
+porkyhud --record ./build.porky-session.jsonl
+porkyhud --record ./analysis.porky-session.jsonl --duration 60
+porkyhud --replay ./analysis.porky-session.jsonl
+porkyhud --compare ./before.porky-session.jsonl ./after.porky-session.jsonl
+porkyhud --export ./support.json
+```
+
+Recordings cap at 64 MiB and 20,000 samples. A bounded writer queue keeps disk writes off the HUD; skipped records, limits and write failures are visible. Replay starts no collectors: arrows move through time, PageUp/PageDown scroll details, and `Esc` closes standalone replay. Damaged/incomplete recordings retain explicit coverage. Comparisons report observed duration, sample counts, means/peaks and available configuration differences; they do not establish that workloads or conditions were identical.
+
+Disk recordings and support exports omit process rows, host names, commands, addresses and paths by default. `--include-processes` explicitly includes selected process IDs, start times and shortened names in a local recording/export; commands remain excluded. The in-memory timeline keeps up to 32 busy processes plus a pinned process, with partial coverage marked. Failed or stale process refreshes leave a gap; trends count each successful process-table revision once.
+
+Save presentation preferences and independent watches:
+
+```bash
+porkyhud --save-workspace research --mode processes --search Python --theme graphite
+porkyhud --workspace research
+porkyhud --list-workspaces
+porkyhud --watch 'memory_used_bytes > 8000000000 for 30'
+```
+
+Explicit launch flags override saved preferences. All Tools can save/load a workspace, add a watch, or reset to Overview and clear pins/watches. Up to 16 personal watches show separate notices; they never change system health thresholds. Missing, stale or repeated source readings do not fabricate sustained duration. Workspace JSON lives in `~/.config/porkyhud/profiles`, with owner-only file permissions.
+
+New tool, recording and support formats use `schema_version: 1`. Additive optional fields may appear within v1; incompatible meanings require a new version. Legacy snapshot and inventory JSON below retain their existing unversioned contracts.
 
 ## Understanding status
 
@@ -139,11 +217,11 @@ Missing readings prevent `NORMAL` but cannot hide a confirmed warning. Previous 
 | `1`–`5` | Select Overview, Compute, Thermals, I/O, or Processes directly. |
 | `6` | Select Cinema when the terminal is at least 118×34. |
 | `Tab` / `Shift+Tab` | Move to the next or previous supported view. |
-| `d` | Open or close the view menu; arrows and Enter select a view. |
+| `d` | Open or close All Tools; `/` finds a tool, arrows and Enter select it. |
 | `7` / `8` / `9` / `0` | Select Insights, Devices, Network, or Connections. |
 | `i` | Select This Mac. |
 | `/` | Search in Overview, Compute, Processes, Cinema, Devices, Network, or Connections. |
-| `Enter` / `Backspace` / `Ctrl+U` | Keep a search filter, erase one character, or clear the text while editing. |
+| `Enter` / `Backspace` / `Ctrl+U` | Inspect the selection; while editing, apply a search, erase a character, or clear text. |
 | `f` | Cycle connection filters: all, listeners, established, other. |
 | `l` | Cycle only modes supported by the current terminal size. |
 | `h` or `?` | Show or hide current shortcut help. |
@@ -173,6 +251,8 @@ For diagnostics and future adapters:
 The snapshot schema is currently unversioned and is not a stable external API. It includes the machine hostname, process IDs, and sanitized process commands. Known secret-bearing flag values are redacted, but arbitrary positional arguments and unknown flag conventions may remain: process commands are sanitized, not guaranteed private. Review output before sharing it.
 
 Snapshot collection is separate from the live HUD and cannot complete the sustained CPU history required for a global `NORMAL` conclusion. Raw command stderr and privileged command details are not included. The `memory_activity` section contains recognized cumulative VM counters with explicit page units; rates are `null` with `LIVE_ONLY` status because a snapshot has no live delta window.
+
+For aggregate sharing, prefer `--export FILE`; it uses the separate versioned, private-default projection described above.
 
 ## Advanced sensor access
 
@@ -226,6 +306,8 @@ For a source checkout:
 ```bash
 chmod +x PorkyHUD.command porkyhud.py
 ```
+
+Development structure and validation are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <p align="center">
   <sub><em>Visit <a href="https://drmatchastudio.com">DMS</a>.</em></sub>

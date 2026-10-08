@@ -23,6 +23,7 @@ jobs:
         run: >-
           python -m py_compile
           porkyhud.py porkyhud_core.py porkyhud_insights.py porkyhud_visual.py porkyhud_inventory.py
+          porkyhud_tools/*.py
           tools/validate_docs.py tools/render_demo_gif.py tools/measure_release.py
           tests/test_repository_tools.py
       - name: Test
@@ -51,6 +52,9 @@ jobs:
           required = {"porkyhud.py", "porkyhud_core.py", "porkyhud_insights.py", "porkyhud_visual.py", "porkyhud_inventory.py"}
           if not required.issubset(names):
               raise SystemExit("wheel is missing a production module")
+          tool_modules = {str(path) for path in Path("porkyhud_tools").glob("*.py")}
+          if not tool_modules.issubset(names):
+              raise SystemExit("wheel is missing an optional tool module")
           if any(name.startswith(("tools/", "tests/")) for name in names):
               raise SystemExit("wheel contains source-tree repository tools or tests")
           PY
@@ -60,5 +64,5 @@ jobs:
           python -m pip install --no-deps --target "$package_target" dist/*.whl
           (
             cd "$outside_checkout"
-            PYTHONPATH="$package_target" python -c 'import porkyhud, porkyhud_core, porkyhud_insights, porkyhud_visual, porkyhud_inventory'
+            PYTHONPATH="$package_target" python -c 'import porkyhud, porkyhud_core, porkyhud_insights, porkyhud_visual, porkyhud_inventory, porkyhud_tools.controller, porkyhud_tools.network, porkyhud_tools.sessions'
           )
